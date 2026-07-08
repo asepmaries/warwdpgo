@@ -11,8 +11,16 @@ log() {
 ensure_termux_packages() {
   if command -v pkg >/dev/null 2>&1; then
     log "Install paket Termux"
-    pkg update -y
-    pkg install -y golang git nano ca-certificates
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get \
+      -o Dpkg::Options::="--force-confold" \
+      -o Dpkg::Options::="--force-confdef" \
+      -y -f install
+    apt-get \
+      -o Dpkg::Options::="--force-confold" \
+      -o Dpkg::Options::="--force-confdef" \
+      install -y golang git nano ca-certificates
   else
     log "pkg tidak ditemukan; lewati install paket otomatis"
   fi
