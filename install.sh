@@ -8,11 +8,8 @@ log() {
   printf '\n==> %s\n' "$*"
 }
 
-log "Update dan upgrade Termux"
-apt update -y && apt upgrade -y
-
-log "Install PHP"
-pkg install php -y
+log "Update, upgrade, dan install PHP"
+apt update && DEBIAN_FRONTEND=noninteractive apt -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade && apt install -y php
 
 if [ ! -d /sdcard ]; then
   log "Aktifkan izin storage Termux"
