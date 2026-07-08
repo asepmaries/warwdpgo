@@ -2,182 +2,62 @@
 set -Eeuo pipefail
 
 ARCHIVE_URL="https://github.com/asepmaries/warwdpgo/archive/refs/heads/main.tar.gz"
-APP_DIR="${HOME}/wdp"
-SDCARD_DIR="/sdcard/wdp"
+APP_DIR="/sdcard/wdp"
 
 log() {
   printf '\n==> %s\n' "$*"
 }
 
-ensure_termux_packages() {
-  if command -v pkg >/dev/null 2>&1; then
-    log "Install paket Termux"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get \
-      -o Dpkg::Options::="--force-confold" \
-      -o Dpkg::Options::="--force-confdef" \
-      install -y liblz4 openssl libssh2 curl ca-certificates tar php nano python
-    apt-get \
-      -o Dpkg::Options::="--force-confold" \
-      -o Dpkg::Options::="--force-confdef" \
-      upgrade -y
-  else
-    log "pkg tidak ditemukan; lewati install paket otomatis"
-  fi
-}
+log "Update dan upgrade Termux"
+apt update -y && apt upgrade -y
 
-ensure_sdcard_access() {
-  if [ ! -d /sdcard ]; then
-    log "/sdcard tidak ditemukan, lewati mirror storage"
-    SDCARD_DIR=""
-    return
-  fi
+log "Install PHP"
+pkg install php -y
 
-  if ! mkdir -p "$SDCARD_DIR" 2>/dev/null; then
-    log "Tidak bisa menulis ke /sdcard/wdp"
-    if command -v termux-setup-storage >/dev/null 2>&1; then
-      printf '%s\n' 'Jika muncul izin storage Android, pilih Allow.'
-      termux-setup-storage || true
-      sleep 2
-    fi
-  fi
+if [ ! -d /sdcard ]; then
+  log "Aktifkan izin storage Termux"
+  termux-setup-storage || true
+  sleep 2
+fi
 
-  if ! mkdir -p "$SDCARD_DIR" 2>/dev/null; then
-    log "Storage belum diizinkan, mirror /sdcard/wdp dilewati"
-    SDCARD_DIR=""
-  fi
-}
+log "Siapkan folder $APP_DIR"
+mkdir -p "$APP_DIR"
 
-sync_repo() {
-  log "Download repo ke $APP_DIR"
+tmp_dir="$(mktemp -d)"
+archive_file="${tmp_dir}/warwdpgo.tar.gz"
+extract_dir="${tmp_dir}/extract"
+mkdir -p "$extract_dir"
 
-  tmp_dir="$(mktemp -d)"
-  archive_file="${tmp_dir}/warwdpgo.tar.gz"
-  extract_dir="${tmp_dir}/extract"
-  mkdir -p "$extract_dir"
+log "Download file pendukung"
+curl -fL "$ARCHIVE_URL" -o "$archive_file"
+tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1
 
-  download_archive "$ARCHIVE_URL" "$archive_file"
-  tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1
+cp -f "$extract_dir/war.php" "$APP_DIR/"
+cp -f "$extract_dir/install.sh" "$APP_DIR/"
+cp -f "$extract_dir/reload.txt" "$APP_DIR/"
+cp -f "$extract_dir/lead.txt" "$APP_DIR/"
+cp -f "$extract_dir/target_srv.txt" "$APP_DIR/"
+cp -f "$extract_dir/waktu.txt" "$APP_DIR/"
+cp -f "$extract_dir/user_server_wdp.txt" "$APP_DIR/"
 
-  mkdir -p "$APP_DIR"
-  cp -f "$extract_dir/war.php" "$APP_DIR/"
-  cp -f "$extract_dir/install.sh" "$APP_DIR/"
+rm -rf "$tmp_dir"
 
-  [ -f "$APP_DIR/user_server_wdp.txt" ] || cp -f "$extract_dir/user_server_wdp.txt" "$APP_DIR/"
-  [ -f "$APP_DIR/waktu.txt" ] || cp -f "$extract_dir/waktu.txt" "$APP_DIR/"
-  [ -f "$APP_DIR/lead.txt" ] || cp -f "$extract_dir/lead.txt" "$APP_DIR/"
-  [ -f "$APP_DIR/target_srv.txt" ] || cp -f "$extract_dir/target_srv.txt" "$APP_DIR/"
-  [ -f "$APP_DIR/reload.txt" ] || cp -f "$extract_dir/reload.txt" "$APP_DIR/"
-
-  rm -rf "$tmp_dir"
-}
-
-download_archive() {
-  url="$1"
-  output="$2"
-
-  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
-    curl -fL "$url" -o "$output"
-    return
-  fi
-
-  if command -v wget >/dev/null 2>&1 && wget --version >/dev/null 2>&1; then
-    wget -O "$output" "$url"
-    return
-  fi
-
-  if command -v python >/dev/null 2>&1; then
-    python - "$url" "$output" <<'PY'
-import sys
-import urllib.request
-
-url, output = sys.argv[1], sys.argv[2]
-with urllib.request.urlopen(url) as response, open(output, "wb") as f:
-    f.write(response.read())
-PY
-    return
-  fi
-
-  printf '%s\n' "Tidak ada downloader yang bisa dipakai: curl/wget/python gagal." >&2
-  exit 1
-}
-
-prepare_local_files() {
-  cd "$APP_DIR"
-
-  [ -f user_server_wdp.txt ] || : > user_server_wdp.txt
-  [ -f waktu.txt ] || : > waktu.txt
-  [ -f lead.txt ] || : > lead.txt
-  [ -f target_srv.txt ] || : > target_srv.txt
-  [ -f reload.txt ] || : > reload.txt
-
-  if ! php -m | grep -qi '^curl$'; then
-    printf '%s\n' "PHP extension curl belum aktif. Coba jalankan: pkg reinstall php" >&2
-  fi
-
-  sync_sdcard_mirror
-}
-
-sync_sdcard_mirror() {
-  if [ -z "${SDCARD_DIR:-}" ]; then
-    return
-  fi
-
-  log "Mirror file ke $SDCARD_DIR"
-  mkdir -p "$SDCARD_DIR"
-  cp -f war.php install.sh "$SDCARD_DIR/"
-  cp -f user_server_wdp.txt waktu.txt lead.txt target_srv.txt reload.txt "$SDCARD_DIR/"
-  cat > "$SDCARD_DIR/SALIN-BALIK-KE-TERMUX.txt" <<EOF_MIRROR
-Folder ini hanya mirror agar mudah edit lewat file manager Android.
-Jalankan script utama dari Termux internal agar file runtime stabil.
-
-Setelah edit file di /sdcard/wdp, salin balik:
-  cp /sdcard/wdp/user_server_wdp.txt ~/wdp/
-  cp /sdcard/wdp/waktu.txt ~/wdp/
-  cp /sdcard/wdp/lead.txt ~/wdp/
-  cp /sdcard/wdp/target_srv.txt ~/wdp/
-  cp /sdcard/wdp/reload.txt ~/wdp/
-
-Lalu jalankan:
-  cd ~/wdp
-  php war.php
-EOF_MIRROR
-}
-
-enter_app_dir() {
-  cd "$APP_DIR"
-
-  if [ -r /dev/tty ]; then
-    printf '\n%s\n' "Terminal dialihkan ke: $APP_DIR"
-    exec bash -i < /dev/tty
-  fi
-}
-
-ensure_termux_packages
-ensure_sdcard_access
-sync_repo
-prepare_local_files
+cd "$APP_DIR"
 
 cat <<EOF
 
 ============================================================
-WAR WDP GO siap.
+WAR PHP siap di $APP_DIR
 
-Masuk folder:
-  cd $APP_DIR
-
-Isi waktu dan user:
+Edit:
   nano waktu.txt
   nano user_server_wdp.txt
 
 Jalankan:
   php war.php
-
-Catatan:
-  Jalankan PHP dari $APP_DIR, bukan dari /sdcard.
-  Mirror untuk edit file ada di ${SDCARD_DIR:-tidak aktif}.
 ============================================================
 EOF
 
-enter_app_dir
+if [ -r /dev/tty ]; then
+  exec bash -i < /dev/tty
+fi
