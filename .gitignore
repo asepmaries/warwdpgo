@@ -1,11 +1,3 @@
-# Local input files
-user_server_wdp.txt
-waktu.txt
-lead.txt
-target_srv.txt
-target_arr.txt
-reload.txt
-
 # Runtime output files
 loghasil.txt
 deeplinks.txt

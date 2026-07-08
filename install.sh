@@ -33,9 +33,9 @@ prepare_local_files() {
   cd "$APP_DIR"
 
   [ -f user_server_wdp.txt ] || : > user_server_wdp.txt
-  [ -f waktu.txt ] || printf '12:00\n' > waktu.txt
-  [ -f lead.txt ] || printf -- '-80\n' > lead.txt
-  [ -f target_srv.txt ] || printf '5\n' > target_srv.txt
+  [ -f waktu.txt ] || : > waktu.txt
+  [ -f lead.txt ] || : > lead.txt
+  [ -f target_srv.txt ] || : > target_srv.txt
   [ -f reload.txt ] || : > reload.txt
 
   log "Download dependency Go"
@@ -55,9 +55,6 @@ Masuk folder:
   cd ~/warwdpgo
 
 Isi waktu dan user:
-  bash input.sh
-
-Atau edit manual:
   nano waktu.txt
   nano user_server_wdp.txt
 
@@ -65,7 +62,6 @@ Jalankan:
   go run war.go
 
 Catatan:
-  reload.txt dibuat lokal dan tidak diupload ke GitHub.
-  Jika script meminta captcha/reload, isi reload.txt di HP sebelum run.
+  File input sudah tersedia di folder repo.
 ============================================================
 EOF
