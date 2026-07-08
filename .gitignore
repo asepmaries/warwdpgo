@@ -3,6 +3,7 @@ loghasil.txt
 deeplinks.txt
 order_ids.txt
 transaksi_url.txt
+captcha_token.txt
 
 # Build output
 war

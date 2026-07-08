@@ -17,7 +17,7 @@ ensure_termux_packages() {
     apt-get \
       -o Dpkg::Options::="--force-confold" \
       -o Dpkg::Options::="--force-confdef" \
-      install -y liblz4 openssl libssh2 curl ca-certificates tar golang nano python
+      install -y liblz4 openssl libssh2 curl ca-certificates tar php nano python
     apt-get \
       -o Dpkg::Options::="--force-confold" \
       -o Dpkg::Options::="--force-confdef" \
@@ -61,9 +61,7 @@ sync_repo() {
   tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1
 
   mkdir -p "$APP_DIR"
-  cp -f "$extract_dir/war.go" "$APP_DIR/"
-  cp -f "$extract_dir/go.mod" "$APP_DIR/"
-  cp -f "$extract_dir/go.sum" "$APP_DIR/"
+  cp -f "$extract_dir/war.php" "$APP_DIR/"
   cp -f "$extract_dir/install.sh" "$APP_DIR/"
 
   [ -f "$APP_DIR/user_server_wdp.txt" ] || cp -f "$extract_dir/user_server_wdp.txt" "$APP_DIR/"
@@ -114,8 +112,9 @@ prepare_local_files() {
   [ -f target_srv.txt ] || : > target_srv.txt
   [ -f reload.txt ] || : > reload.txt
 
-  log "Download dependency Go"
-  go mod tidy
+  if ! php -m | grep -qi '^curl$'; then
+    printf '%s\n' "PHP extension curl belum aktif. Coba jalankan: pkg reinstall php" >&2
+  fi
 
   sync_sdcard_mirror
 }
@@ -127,11 +126,11 @@ sync_sdcard_mirror() {
 
   log "Mirror file ke $SDCARD_DIR"
   mkdir -p "$SDCARD_DIR"
-  cp -f war.go go.mod go.sum install.sh "$SDCARD_DIR/"
+  cp -f war.php install.sh "$SDCARD_DIR/"
   cp -f user_server_wdp.txt waktu.txt lead.txt target_srv.txt reload.txt "$SDCARD_DIR/"
   cat > "$SDCARD_DIR/SALIN-BALIK-KE-TERMUX.txt" <<EOF_MIRROR
 Folder ini hanya mirror agar mudah edit lewat file manager Android.
-Go tidak bisa stabil dijalankan langsung dari /sdcard.
+Jalankan script utama dari Termux internal agar file runtime stabil.
 
 Setelah edit file di /sdcard/wdp, salin balik:
   cp /sdcard/wdp/user_server_wdp.txt ~/wdp/
@@ -142,7 +141,7 @@ Setelah edit file di /sdcard/wdp, salin balik:
 
 Lalu jalankan:
   cd ~/wdp
-  go run war.go
+  php war.php
 EOF_MIRROR
 }
 
@@ -173,10 +172,10 @@ Isi waktu dan user:
   nano user_server_wdp.txt
 
 Jalankan:
-  go run war.go
+  php war.php
 
 Catatan:
-  Jalankan Go dari $APP_DIR, bukan dari /sdcard.
+  Jalankan PHP dari $APP_DIR, bukan dari /sdcard.
   Mirror untuk edit file ada di ${SDCARD_DIR:-tidak aktif}.
 ============================================================
 EOF
