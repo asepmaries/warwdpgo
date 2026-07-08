@@ -16,7 +16,7 @@ ensure_termux_packages() {
     apt-get \
       -o Dpkg::Options::="--force-confold" \
       -o Dpkg::Options::="--force-confdef" \
-      install -y openssl ca-certificates || true
+      install -y openssl libssh2 ca-certificates || true
     apt-get \
       -o Dpkg::Options::="--force-confold" \
       -o Dpkg::Options::="--force-confdef" \
@@ -24,7 +24,11 @@ ensure_termux_packages() {
     apt-get \
       -o Dpkg::Options::="--force-confold" \
       -o Dpkg::Options::="--force-confdef" \
-      install -y openssl ca-certificates curl tar golang nano
+      install -y --reinstall openssl libssh2 curl ca-certificates
+    apt-get \
+      -o Dpkg::Options::="--force-confold" \
+      -o Dpkg::Options::="--force-confdef" \
+      install -y tar golang nano python
   else
     log "pkg tidak ditemukan; lewati install paket otomatis"
   fi
@@ -61,7 +65,7 @@ sync_repo() {
   extract_dir="${tmp_dir}/extract"
   mkdir -p "$extract_dir"
 
-  curl -fL "$ARCHIVE_URL" -o "$archive_file"
+  download_archive "$ARCHIVE_URL" "$archive_file"
   tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1
 
   mkdir -p "$APP_DIR"
@@ -77,6 +81,36 @@ sync_repo() {
   [ -f "$APP_DIR/reload.txt" ] || cp -f "$extract_dir/reload.txt" "$APP_DIR/"
 
   rm -rf "$tmp_dir"
+}
+
+download_archive() {
+  url="$1"
+  output="$2"
+
+  if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then
+    curl -fL "$url" -o "$output"
+    return
+  fi
+
+  if command -v wget >/dev/null 2>&1 && wget --version >/dev/null 2>&1; then
+    wget -O "$output" "$url"
+    return
+  fi
+
+  if command -v python >/dev/null 2>&1; then
+    python - "$url" "$output" <<'PY'
+import sys
+import urllib.request
+
+url, output = sys.argv[1], sys.argv[2]
+with urllib.request.urlopen(url) as response, open(output, "wb") as f:
+    f.write(response.read())
+PY
+    return
+  fi
+
+  printf '%s\n' "Tidak ada downloader yang bisa dipakai: curl/wget/python gagal." >&2
+  exit 1
 }
 
 prepare_local_files() {
