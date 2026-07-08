@@ -158,6 +158,15 @@ Lalu jalankan:
 EOF_MIRROR
 }
 
+enter_app_dir() {
+  cd "$APP_DIR"
+
+  if [ -r /dev/tty ]; then
+    printf '\n%s\n' "Terminal dialihkan ke: $APP_DIR"
+    exec bash -i < /dev/tty
+  fi
+}
+
 ensure_termux_packages
 ensure_sdcard_access
 sync_repo
@@ -183,3 +192,5 @@ Catatan:
   Mirror untuk edit file ada di ${SDCARD_DIR:-tidak aktif}.
 ============================================================
 EOF
+
+enter_app_dir
