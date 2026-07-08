@@ -1,10 +1,10 @@
 <?php
 // ======================================================================
-// GOPAY MLBB WDP - WAR EDITION (Fixed Lead + Adaptive Retry)
+// GOPAY MLBB WDP - WAR EDITION (Dynamic Lead + Adaptive Retry)
 //
 // Strategi:
-//  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
-//    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
+//  - Lead time otomatis: target_srv - (RTT efektif / 2).
+//    lead.txt hanya fallback kalau RTT warm-up tidak tersedia.
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
 //  - Warm-up tunggal T-1.5s (4 paralel) untuk warm TLS pool sebelum burst.
 //  - Salvo pertama biasanya "voucher not available" -> retry SECEPATNYA.
@@ -63,23 +63,29 @@ register_shutdown_function(function () use (&$LOG_FH) {
 // ----------------------------------------------------------------------
 // KONFIGURASI WAR
 // ----------------------------------------------------------------------
-// Lead time dibaca dari lead.txt (per-VPS). Format: 1 angka dalam ms.
+// Lead fallback dibaca dari lead.txt (per-VPS). Format: 1 angka dalam ms.
 // Konvensi: NEGATIF = fire SEBELUM war start (duluan).
 //           POSITIF = fire SETELAH war start (telat).
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
 const MINI_PROBE2_LEAD_MS    = 1500;         // Warm-up T-1.5s sebelum burst (warm TLS pool).
-const MINI_PROBE2_PARALLEL   = 2;            // 4 paralel supaya semua koneksi salvo warm.
+const MINI_PROBE2_PARALLEL   = 5;            // Samakan dengan MAX_USERS supaya semua koneksi warm.
 const MAX_RETRY_PER_USER     = 9;
 const MAX_TOTAL_INQUIRIES    = 10;            // Hard cap: 11 inquiry call dalam 1 menit → HTTP 429.
-const MAX_USERS              = 2;             // Max user per VPS (2 = aman, hindari salvo terlalu lebar).
+const MAX_USERS              = 5;             // Max user per VPS, sama seperti war.go.
 const TREAT_STOP_AS_RETRY    = false;         // PROD: out of stock → STOP global (hemat sisa kuota).
 const INQUIRY_CONNECT_TO_MS  = 2200;
 const INQUIRY_TIMEOUT_MS    = 5200;
 const PAYMENT_CONNECT_TO_MS = 2200;
 const PAYMENT_TIMEOUT_MS    = 5200;
+const TARGET_SRV_MS_DEFAULT = 5.0;            // Target arrival server, ms setelah T=0.
+const FINE_TUNE_START_BEFORE_MS = 12000;      // Mulai probe RTT sebelum warm-up T-1.5s.
+const FINE_TUNE_PROBE_INTERVAL_MS = 1000;
+const FINE_TUNE_PROBE_COUNT = 8;
 
 $WARMUP_MEDIAN_RTT_MS = null;             // Diisi dari miniProbe2ReWarm; dipakai untuk estimasi one-way.
+$WARMUP_MIN_RTT_MS    = null;             // RTT minimum warm-up; dipakai untuk dynamic lead.
+$FINE_TUNE_RTTS_MS    = [];               // RTT probe H-12..H-5; fallback kalau warm-up spike.
 
 // Pola pesan error dari endpoint inquiry
 const STOP_PATTERNS       = ['out of stock', 'sold out', 'kuota habis', 'voucher habis', 'stok habis', 'sudah habis'];
@@ -90,8 +96,101 @@ const RETRY_PATTERNS      = ['not available', 'not yet', 'belum dimulai', 'belum
 // ----------------------------------------------------------------------
 // TIMING DARI waktu.txt
 // ----------------------------------------------------------------------
-function waitForExactBurstTime(int $leadMs, ?callable $beforeBurst = null): bool {
-    global $WAR_START_WALL_US;
+function readTargetSrvMs(): float {
+    foreach (['target_srv.txt', 'target_arr.txt'] as $name) {
+        $path = __DIR__ . '/' . $name;
+        if (!file_exists($path)) {
+            continue;
+        }
+        $raw = trim((string) file_get_contents($path));
+        if (is_numeric($raw)) {
+            return (float) $raw;
+        }
+    }
+    return TARGET_SRV_MS_DEFAULT;
+}
+
+function avgRtt(array $rtts): float {
+    if (empty($rtts)) return 0.0;
+    return array_sum($rtts) / count($rtts);
+}
+
+function effectiveLeadRTT(): array {
+    global $WARMUP_MIN_RTT_MS, $WARMUP_MEDIAN_RTT_MS, $FINE_TUNE_RTTS_MS;
+
+    if ($WARMUP_MIN_RTT_MS === null || $WARMUP_MIN_RTT_MS <= 0) {
+        if ($WARMUP_MEDIAN_RTT_MS !== null && $WARMUP_MEDIAN_RTT_MS > 0) {
+            return [(float) $WARMUP_MEDIAN_RTT_MS, false];
+        }
+        return [0.0, false];
+    }
+
+    $fineTuneAvg = avgRtt($FINE_TUNE_RTTS_MS);
+    if ($fineTuneAvg > 0 && $WARMUP_MIN_RTT_MS > $fineTuneAvg) {
+        return [$fineTuneAvg, true];
+    }
+    return [(float) $WARMUP_MIN_RTT_MS, false];
+}
+
+function resolveLeadMs(int $fallbackLeadMs, float $targetSrvMs): int {
+    global $WARMUP_MIN_RTT_MS;
+
+    [$leadRTT, $usedFineTuneAvg] = effectiveLeadRTT();
+    $owEst = $leadRTT / 2.0;
+    if ($owEst <= 0) {
+        echo "[LEAD] Warm-up RTT tidak tersedia -> pakai lead.txt: {$fallbackLeadMs}ms\n";
+        return $fallbackLeadMs;
+    }
+
+    $dynamic = (int) round($targetSrvMs - $owEst);
+    if ($usedFineTuneAvg) {
+        echo sprintf(
+            "[LEAD] Dynamic: target_srv=%+.0fms | RTT_min=%.0fms > tune_avg=%.0fms -> pakai tune_avg | ow_est=%.0fms -> lead=%+dms\n",
+            $targetSrvMs,
+            (float) $WARMUP_MIN_RTT_MS,
+            $leadRTT,
+            $owEst,
+            $dynamic
+        );
+    } else {
+        echo sprintf(
+            "[LEAD] Dynamic: target_srv=%+.0fms | RTT_min=%.0fms | ow_est=%.0fms -> lead=%+dms\n",
+            $targetSrvMs,
+            (float) $WARMUP_MIN_RTT_MS,
+            $owEst,
+            $dynamic
+        );
+    }
+    echo "[LEAD] (lead.txt={$fallbackLeadMs}ms hanya dipakai sebagai fallback)\n";
+    return $dynamic;
+}
+
+function addMilliseconds(DateTimeImmutable $dt, int $ms): DateTimeImmutable {
+    if ($ms === 0) return $dt;
+    $sign = $ms > 0 ? '+' : '-';
+    return $dt->modify($sign . abs($ms) . ' milliseconds');
+}
+
+function dateTimeWallUs(DateTimeInterface $dt): int {
+    return ((int) $dt->format('U')) * 1_000_000 + (int) $dt->format('u');
+}
+
+function waitUntilWallUs(int $targetWallUs): void {
+    $remainingNs = max(0, (int) round(($targetWallUs - (microtime(true) * 1_000_000)) * 1000));
+    $targetMono = hrtime(true) + $remainingNs;
+    while (true) {
+        $remaining = $targetMono - hrtime(true);
+        if ($remaining <= 0) return;
+        $remainingUs = intdiv($remaining, 1000);
+        if ($remainingUs > 25000) usleep(12000);
+        elseif ($remainingUs > 10000) usleep(4000);
+        elseif ($remainingUs > 4000) usleep(1500);
+        else continue;
+    }
+}
+
+function waitForExactBurstTime(int $fallbackLeadMs, array $sampleOrder, string $captchaToken, ?callable $beforeBurst = null): bool {
+    global $WAR_START_WALL_US, $FINE_TUNE_RTTS_MS;
     $file = 'waktu.txt';
     if (!file_exists($file)) die("❌ File 'waktu.txt' tidak ditemukan!\n");
     $content = trim(file_get_contents($file));
@@ -99,60 +198,68 @@ function waitForExactBurstTime(int $leadMs, ?callable $beforeBurst = null): bool
         die("❌ Format waktu.txt salah! Gunakan HH:MM atau HH:MM:SS\n");
     }
     $hour = (int)$m[1]; $minute = (int)$m[2]; $second = isset($m[3]) ? (int)$m[3] : 0;
-    $target = new DateTime('now');
-    $target->setTime($hour, $minute, $second, 0);
-    if ($target < new DateTime('now')) $target->modify('+1 day');
-    // Simpan war start absolut (T=0) sebelum dimodify untuk lead
-    $WAR_START_WALL_US = $target->getTimestamp() * 1_000_000 + ((int) $target->format('v')) * 1000;
-    $target->modify($leadMs >= 0 ? "-{$leadMs} milliseconds" : "+" . abs($leadMs) . " milliseconds");
-    $leadDescription = $leadMs >= 0
-        ? "T-" . $leadMs . "ms (sebelum war)"
-        : "T+" . abs($leadMs) . "ms (setelah war start)";
-    echo "⏰ Target burst dari waktu.txt: {$content}.000 WIB\n";
-    echo "⚡ Lead time eksekusi       : {$leadDescription}\n";
-    echo "⚡ Burst dieksekusi pada    : " . $target->format('Y-m-d H:i:s') . sprintf('.%03d', (int) $target->format('v')) . " WIB\n";
-    echo "Menunggu waktu tepat...\n\n";
-    $targetTimestamp = $target->getTimestamp();
-    $targetWallMicro = $targetTimestamp * 1_000_000;
-    // FIX: getTimestamp() ter-floor ke detik. Tambahkan komponen milidetik via format('v').
-    $targetWallMicro += ((int) $target->format('v')) * 1000;
-    $diff = $targetTimestamp - time();
-    if ($diff > 15) {
-        sleep($diff - 12);
-        echo "Masuk fase fine tuning (last 12 detik)...\n";
-    } elseif ($diff > 6) {
-        sleep($diff - 6);
+
+    $now = new DateTimeImmutable('now');
+    $target = $now->setTime($hour, $minute, $second, 0);
+    if ($target < $now) $target = $target->modify('+1 day');
+
+    $WAR_START_WALL_US = dateTimeWallUs($target);
+    $targetSrvMs = readTargetSrvMs();
+    $FINE_TUNE_RTTS_MS = [];
+
+    echo "[TIME] Target burst (T=0): " . $target->format('H:i:s.v') . " WIB | target_srv: "
+       . sprintf('%+.0fms', $targetSrvMs) . " | lead.txt fallback: {$fallbackLeadMs}ms\n";
+
+    $warmupAt = addMilliseconds($target, -MINI_PROBE2_LEAD_MS);
+    $warmupAtUs = dateTimeWallUs($warmupAt);
+    $untilWarmupMs = ($warmupAtUs - (microtime(true) * 1_000_000)) / 1000;
+    if ($untilWarmupMs > 15000) {
+        usleep((int) (($untilWarmupMs - FINE_TUNE_START_BEFORE_MS) * 1000));
+        echo "Masuk fase fine tuning (H-12s -> H-5s, " . FINE_TUNE_PROBE_COUNT . "x @ 1/detik)...\n";
+        doFineTuneProbes($sampleOrder, $captchaToken);
+    } elseif ($untilWarmupMs > 6000) {
+        usleep((int) (($untilWarmupMs - 6000) * 1000));
         echo "Masuk fase fine tuning...\n";
     }
-    $remainingNs = max(0, (int) round(($targetWallMicro - (microtime(true) * 1_000_000)) * 1000));
-    $targetMono = hrtime(true) + $remainingNs;
-    $warmupTriggered = false;
-    while (true) {
-        $remaining = $targetMono - hrtime(true);
-        if ($remaining <= 0) {
-            echo "🚀 BURST START! [" . formatMicrotimeNow() . "] MULAI FULL FLOW!\n\n";
-            return true;
+
+    waitUntilWallUs($warmupAtUs);
+
+    if ($beforeBurst !== null) {
+        $remainingToTargetMs = (dateTimeWallUs($target) - (microtime(true) * 1_000_000)) / 1000;
+        $budgetMs = min(MINI_PROBE2_LEAD_MS - 200, (int) $remainingToTargetMs - 200);
+        if ($budgetMs >= 150) {
+            $beforeBurst($budgetMs);
+        } else {
+            echo "[WARM-UP] Skip - sisa waktu terlalu mepet, jaga burst tetap on-time\n";
         }
-        $remainingUs = intdiv($remaining, 1000);
-        if (!$warmupTriggered && $beforeBurst !== null && $remainingUs <= MINI_PROBE2_LEAD_MS * 1000) {
-            $warmupTriggered = true;
-            // CRITICAL: warm-up tidak boleh menunda burst. Hitung budget = sisa waktu ke
-            // burst dikurangi safety margin 200ms. Warm-up curl di-cut kalau lewat budget,
-            // supaya VPS dengan koneksi cold/lambat tetap fire burst ON-TIME.
-            // (Bukti war 30 Mei: warm-up 2000ms → burst telat 500ms → zonk total.)
-            $budgetMs = intdiv($remainingUs, 1000) - 200;
-            if ($budgetMs >= 150) {
-                $beforeBurst($budgetMs);
-            } else {
-                echo "[WARM-UP] Skip — sisa waktu ke burst < 350ms (jaga burst tetap on-time)\n";
-            }
-            continue;
-        }
-        if ($remainingUs > 25000) usleep(12000);
-        elseif ($remainingUs > 10000) usleep(4000);
-        elseif ($remainingUs > 4000) usleep(1500);
-        else continue;
     }
+
+    $leadMs = resolveLeadMs($fallbackLeadMs, $targetSrvMs);
+    $execTarget = addMilliseconds($target, $leadMs);
+    if (dateTimeWallUs($execTarget) < (int) round(microtime(true) * 1_000_000)) {
+        echo "[LEAD] Dynamic lead {$leadMs}ms membuat exec di masa lalu -> fallback lead.txt {$fallbackLeadMs}ms\n";
+        $leadMs = $fallbackLeadMs;
+        $execTarget = addMilliseconds($target, $leadMs);
+    }
+
+    [$leadRTT] = effectiveLeadRTT();
+    $owEst = $leadRTT / 2.0;
+    if ($owEst > 0) {
+        $estSrv = $leadMs + $owEst;
+        echo sprintf(
+            "[TIME] Lead: %+dms | Exec: %s WIB | estimasi srv: %+.0fms\n",
+            $leadMs,
+            $execTarget->format('H:i:s.v'),
+            $estSrv
+        );
+    } else {
+        echo sprintf("[TIME] Lead: %+dms | Exec: %s WIB\n", $leadMs, $execTarget->format('H:i:s.v'));
+    }
+
+    waitUntilWallUs(dateTimeWallUs($execTarget));
+    echo "[BURST] START! [" . formatMicrotimeNow() . "] MULAI FULL FLOW!\n\n";
+    return true;
+
 }
 
 // ----------------------------------------------------------------------
@@ -408,6 +515,62 @@ function miniProbe2ReWarm(array $sampleOrder, string $captchaToken, int $maxMs =
     }
     curl_multi_close($mh);
     return $rttMs;
+}
+
+function runInquiryProbe(array $sampleOrder, string $captchaToken, int $timeoutMs = INQUIRY_TIMEOUT_MS): array {
+    $headers = buildInquiryHeaders($captchaToken);
+    $body    = buildInquiryBody($sampleOrder);
+    $ch = createCurlSession();
+    $started = microtime(true);
+    configureCurlHandle(
+        $ch,
+        'https://gopay.co.id/games/v1/order/inquiry',
+        'POST',
+        $headers,
+        $body,
+        ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => $timeoutMs]
+    );
+    $resp = @curl_exec($ch);
+    $info = curl_getinfo($ch);
+    $code = (int) ($info['http_code'] ?? 0);
+    $errno = curl_errno($ch);
+    $err = curl_error($ch);
+    $totalMs = curlTimingMs($ch, $info, 'CURLINFO_TOTAL_TIME_T', 'total_time');
+    $elapsedMs = (microtime(true) - $started) * 1000;
+    curl_close($ch);
+
+    $payload = is_string($resp) && $resp !== '' ? decodeResponseBody($resp) : null;
+    $errText = $payload ? extractApiErrorMessage($payload) : ($errno ? "cURL[$errno] $err" : '');
+    $verdict = classifyInquiryResponse($code, $errText, $payload);
+
+    return [
+        'rtt' => (float) ($totalMs ?? $elapsedMs),
+        'http' => $code,
+        'status' => $verdict['status'],
+    ];
+}
+
+function doFineTuneProbes(array $sampleOrder, string $captchaToken): void {
+    global $FINE_TUNE_RTTS_MS;
+
+    echo "[FINE-TUNE] Probe RTT " . FINE_TUNE_PROBE_COUNT . "x @ 1 req/detik...\n";
+    $FINE_TUNE_RTTS_MS = [];
+    for ($i = 1; $i <= FINE_TUNE_PROBE_COUNT; $i++) {
+        if ($i > 1) {
+            usleep(FINE_TUNE_PROBE_INTERVAL_MS * 1000);
+        }
+        $probe = runInquiryProbe($sampleOrder, $captchaToken);
+        if ($probe['rtt'] > 0) {
+            $FINE_TUNE_RTTS_MS[] = $probe['rtt'];
+        }
+        echo sprintf(
+            "  fine-tune #%d | rtt %.0fms | HTTP %d | %s\n",
+            $i,
+            $probe['rtt'],
+            $probe['http'],
+            $probe['status']
+        );
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -1087,31 +1250,30 @@ function gpyPay(): void {
     }
 
     echo "✅ Loaded " . count($orders) . " order (max " . MAX_USERS . ")\n";
-    echo "🔧 Fixed lead from lead.txt"
+    echo "🔧 Dynamic lead"
        . " | MAX_RETRY_PER_USER=" . MAX_RETRY_PER_USER
        . " | MAX_TOTAL_INQUIRIES=" . MAX_TOTAL_INQUIRIES . "\n\n";
 
     // Captcha 1× di-fetch saat script start
     $captchaToken = getFreshCaptchaToken();
 
-    // Lead time dibaca dari lead.txt. Konvensi:
+    // Lead fallback dibaca dari lead.txt. Konvensi:
     //   NEGATIF di lead.txt = fire SEBELUM war start (duluan).
     //   POSITIF di lead.txt = fire SETELAH war start (telat).
     //   0 atau file tidak ada = tepat di war start.
-    // Internal `waitForExactBurstTime` pakai konvensi terbalik (positif = sebelum war),
-    // jadi negate.
+    // Konvensi sama seperti Go: negatif = fire sebelum war, positif = setelah war.
     $leadFile = __DIR__ . '/lead.txt';
     if (file_exists($leadFile)) {
         $offsetMs = (int) trim(file_get_contents($leadFile));
     } else {
         $offsetMs = BURST_LEAD_MS_DEFAULT;
     }
-    $burstLeadMs = -$offsetMs;
+    $burstLeadMs = $offsetMs;
 
     if ($offsetMs > 0)      $desc = "+{$offsetMs}ms (setelah war)";
     elseif ($offsetMs < 0)  $desc = "{$offsetMs}ms (sebelum war)";
     else                    $desc = "0ms (tepat di war)";
-    echo "⚡ Lead offset: {$desc} (dari " . (file_exists($leadFile) ? "lead.txt" : "default") . ")\n\n";
+    echo "⚡ Lead fallback: {$desc} (dari " . (file_exists($leadFile) ? "lead.txt" : "default") . ")\n\n";
 
     // ===================== PRE-WAR (T-60s) =====================
     // 60 detik sebelum war: tes koneksi langsung ke API gopay dengan voucher
@@ -1123,15 +1285,19 @@ function gpyPay(): void {
 
     // Tunggu dan fire — mini-probe2 T-1.5s untuk warm TLS pool sebelum burst.
     // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
-    waitForExactBurstTime($burstLeadMs, static function (int $budgetMs = 1200) use ($orders, $captchaToken): void {
-        global $WARMUP_MEDIAN_RTT_MS;
+    waitForExactBurstTime($burstLeadMs, $orders[0], $captchaToken, static function (int $budgetMs = 1200) use ($orders, $captchaToken): void {
+        global $WARMUP_MEDIAN_RTT_MS, $WARMUP_MIN_RTT_MS;
         echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000) . "s re-warm TLS pool ("
            . MINI_PROBE2_PARALLEL . " call paralel, budget {$budgetMs}ms)...\n";
         $rtts = miniProbe2ReWarm($orders[0], $captchaToken, $budgetMs);
         if (!empty($rtts)) {
+            sort($rtts);
+            $min = $rtts[0];
             $median = percentile($rtts, 0.5);
             $WARMUP_MEDIAN_RTT_MS = $median;
+            $WARMUP_MIN_RTT_MS = $min;
             echo "[WARM-UP] RTT: " . implode('ms, ', array_map(fn($v) => number_format($v, 0), $rtts)) . "ms"
+               . " | min: " . number_format($min, 0) . "ms"
                . " | median: " . number_format($median, 0) . "ms\n";
         } else {
             echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
