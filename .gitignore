@@ -1,0 +1,22 @@
+# Local input files
+user_server_wdp.txt
+waktu.txt
+lead.txt
+target_srv.txt
+target_arr.txt
+reload.txt
+
+# Runtime output files
+loghasil.txt
+deeplinks.txt
+order_ids.txt
+transaksi_url.txt
+
+# Build output
+war
+war.exe
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
