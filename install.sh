@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 
 ARCHIVE_URL="https://github.com/asepmaries/warwdpgo/archive/refs/heads/main.tar.gz"
-APP_DIR="/sdcard/wdp"
+APP_DIR="${HOME}/wdp"
+SDCARD_DIR="/sdcard/wdp"
 
 log() {
   printf '\n==> %s\n' "$*"
@@ -40,12 +41,12 @@ ensure_termux_packages() {
 
 ensure_sdcard_access() {
   if [ ! -d /sdcard ]; then
-    log "/sdcard tidak ditemukan, fallback ke ${HOME}/wdp"
-    APP_DIR="${HOME}/wdp"
+    log "/sdcard tidak ditemukan, lewati mirror storage"
+    SDCARD_DIR=""
     return
   fi
 
-  if ! mkdir -p "$APP_DIR" 2>/dev/null; then
+  if ! mkdir -p "$SDCARD_DIR" 2>/dev/null; then
     log "Tidak bisa menulis ke /sdcard/wdp"
     if command -v termux-setup-storage >/dev/null 2>&1; then
       printf '%s\n' 'Jika muncul izin storage Android, pilih Allow.'
@@ -54,10 +55,9 @@ ensure_sdcard_access() {
     fi
   fi
 
-  if ! mkdir -p "$APP_DIR" 2>/dev/null; then
-    log "Storage belum diizinkan, fallback ke ${HOME}/wdp"
-    APP_DIR="${HOME}/wdp"
-    mkdir -p "$APP_DIR"
+  if ! mkdir -p "$SDCARD_DIR" 2>/dev/null; then
+    log "Storage belum diizinkan, mirror /sdcard/wdp dilewati"
+    SDCARD_DIR=""
   fi
 }
 
@@ -128,6 +128,34 @@ prepare_local_files() {
 
   log "Download dependency Go"
   go mod tidy
+
+  sync_sdcard_mirror
+}
+
+sync_sdcard_mirror() {
+  if [ -z "${SDCARD_DIR:-}" ]; then
+    return
+  fi
+
+  log "Mirror file ke $SDCARD_DIR"
+  mkdir -p "$SDCARD_DIR"
+  cp -f war.go go.mod go.sum install.sh "$SDCARD_DIR/"
+  cp -f user_server_wdp.txt waktu.txt lead.txt target_srv.txt reload.txt "$SDCARD_DIR/"
+  cat > "$SDCARD_DIR/SALIN-BALIK-KE-TERMUX.txt" <<EOF_MIRROR
+Folder ini hanya mirror agar mudah edit lewat file manager Android.
+Go tidak bisa stabil dijalankan langsung dari /sdcard.
+
+Setelah edit file di /sdcard/wdp, salin balik:
+  cp /sdcard/wdp/user_server_wdp.txt ~/wdp/
+  cp /sdcard/wdp/waktu.txt ~/wdp/
+  cp /sdcard/wdp/lead.txt ~/wdp/
+  cp /sdcard/wdp/target_srv.txt ~/wdp/
+  cp /sdcard/wdp/reload.txt ~/wdp/
+
+Lalu jalankan:
+  cd ~/wdp
+  go run war.go
+EOF_MIRROR
 }
 
 ensure_termux_packages
@@ -151,7 +179,7 @@ Jalankan:
   go run war.go
 
 Catatan:
-  File input sudah tersedia di folder repo.
-  Kalau installer fallback karena izin storage, baca path yang tertulis di log.
+  Jalankan Go dari $APP_DIR, bukan dari /sdcard.
+  Mirror untuk edit file ada di ${SDCARD_DIR:-tidak aktif}.
 ============================================================
 EOF
