@@ -17,23 +17,11 @@ ensure_termux_packages() {
     apt-get \
       -o Dpkg::Options::="--force-confold" \
       -o Dpkg::Options::="--force-confdef" \
+      install -y liblz4 openssl libssh2 curl ca-certificates tar golang nano python
+    apt-get \
+      -o Dpkg::Options::="--force-confold" \
+      -o Dpkg::Options::="--force-confdef" \
       upgrade -y
-    apt-get \
-      -o Dpkg::Options::="--force-confold" \
-      -o Dpkg::Options::="--force-confdef" \
-      install -y openssl libssh2 ca-certificates || true
-    apt-get \
-      -o Dpkg::Options::="--force-confold" \
-      -o Dpkg::Options::="--force-confdef" \
-      -y -f install
-    apt-get \
-      -o Dpkg::Options::="--force-confold" \
-      -o Dpkg::Options::="--force-confdef" \
-      install -y --reinstall openssl libssh2 curl ca-certificates
-    apt-get \
-      -o Dpkg::Options::="--force-confold" \
-      -o Dpkg::Options::="--force-confdef" \
-      install -y tar golang nano python
   else
     log "pkg tidak ditemukan; lewati install paket otomatis"
   fi
