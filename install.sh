@@ -16,6 +16,10 @@ ensure_termux_packages() {
     apt-get \
       -o Dpkg::Options::="--force-confold" \
       -o Dpkg::Options::="--force-confdef" \
+      upgrade -y
+    apt-get \
+      -o Dpkg::Options::="--force-confold" \
+      -o Dpkg::Options::="--force-confdef" \
       install -y openssl libssh2 ca-certificates || true
     apt-get \
       -o Dpkg::Options::="--force-confold" \
