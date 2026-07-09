@@ -89,7 +89,8 @@ $FINE_TUNE_RTTS_MS    = [];               // RTT probe H-12..H-5; fallback kalau
 
 // Pola pesan error dari endpoint inquiry
 const STOP_PATTERNS       = ['out of stock', 'sold out', 'kuota habis', 'voucher habis', 'stok habis', 'sudah habis'];
-const SKIP_USER_PATTERNS  = ['reached the redeem limit', 'already redeemed', 'sudah pernah', 'role_null', 'role null', 'invalid user', 'user not found', 'user_not_found', 'act_subscrip_no_config', 'subscrip_no_config'];
+const SKIP_USER_PATTERNS  = ['reached the redeem limit', 'already redeemed', 'sudah pernah', 'act_subscrip_no_config', 'subscrip_no_config'];
+const INVALID_USER_PATTERNS = ['role_null', 'role null', 'Error_Role_Null', 'error_role_null', 'invalid user', 'user not found', 'user_not_found', 'Error_InvalidZoneId', 'invalid zone'];
 const REGION_BLOCK_PATTERNS = ['regional restrictions', 'region restriction', 'outside region', 'outside regional', 'di luar region', 'diluar region', 'luar region', 'luar zona promo', 'zona promo'];
 const RETRY_PATTERNS      = ['not available', 'not yet', 'belum dimulai', 'belum tersedia', 'tidak tersedia', 'try again', 'temporarily', 'service unavailable'];
 
@@ -644,7 +645,7 @@ function saveCaptchaToken(string $token, bool $quiet = false): void {
 
 // ----------------------------------------------------------------------
 // CLASSIFY RESPONSE INQUIRY
-// Return: ['status' => 'success'|'retry'|'stop'|'skip_user'|'region_block'|'unknown', 'orderId' => ?string]
+// Return: ['status' => 'success'|'retry'|'stop'|'skip_user'|'user_invalid'|'region_block'|'unknown', 'orderId' => ?string]
 // ----------------------------------------------------------------------
 function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload): array {
     if (($code === 200 || $code === 201) && is_array($payload)) {
@@ -659,6 +660,11 @@ function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload)
     foreach (STOP_PATTERNS as $p) {
         if ($msg !== '' && strpos($msg, $p) !== false) {
             return ['status' => 'stop', 'orderId' => null];
+        }
+    }
+    foreach (INVALID_USER_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'user_invalid', 'orderId' => null];
         }
     }
     foreach (SKIP_USER_PATTERNS as $p) {
@@ -944,6 +950,12 @@ function runAdaptiveInquiry(array $orders, string $captchaToken): array {
             if ($effectiveStatus === 'skip_user') {
                 echo "[$userKey] ⏭️  SKIP USER: sudah pernah claim, tidak retry.\n";
                 $skipUsers[$userKey] = true;
+                continue;
+            }
+
+            if ($effectiveStatus === 'user_invalid') {
+                echo "[$userKey] ❌ USER ID SALAH (Error_Role_Null / invalid role): tidak retry.\n";
+                // jangan masukkan ke skipUsers (limit), ini user ID bermasalah
                 continue;
             }
 
