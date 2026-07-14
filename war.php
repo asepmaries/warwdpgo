@@ -78,7 +78,7 @@ const INQUIRY_CONNECT_TO_MS  = 2200;
 const INQUIRY_TIMEOUT_MS    = 5200;
 const PAYMENT_CONNECT_TO_MS = 2200;
 const PAYMENT_TIMEOUT_MS    = 5200;
-const TARGET_SRV_MS_DEFAULT = 5.0;            // Target arrival server, ms setelah T=0.
+const TARGET_SRV_MS_DEFAULT = -10.0;            // Target arrival server, ms setelah T=0.
 const FINE_TUNE_START_BEFORE_MS = 12000;      // Mulai probe RTT sebelum warm-up T-1.5s.
 const FINE_TUNE_PROBE_INTERVAL_MS = 1000;
 const FINE_TUNE_PROBE_COUNT = 8;

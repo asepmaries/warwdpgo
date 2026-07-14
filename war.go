@@ -35,7 +35,7 @@ const (
 	INQUIRY_TIMEOUT_MS        = 5200
 	PAYMENT_TIMEOUT_MS        = 5200
 	PREWAR_TEST_COUNT         = 8
-	TARGET_SRV_MS_DEFAULT     = 1.0   // target srv (ms setelah T=0) untuk dynamic lead
+	TARGET_SRV_MS_DEFAULT     = -10.0   // target srv (ms setelah T=0) untuk dynamic lead
 	FINE_TUNE_START_BEFORE_MS = 12000 // H-12s: mulai fase fine-tune
 	FINE_TUNE_PROBE_INTERVAL  = 1000 * time.Millisecond
 	FINE_TUNE_PROBE_COUNT     = 8 // 8x @ 1/detik: H-12s → H-5s

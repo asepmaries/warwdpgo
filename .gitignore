@@ -1,15 +1,7 @@
-# Runtime output files
-loghasil.txt
-deeplinks.txt
-order_ids.txt
-transaksi_url.txt
-captcha_token.txt
-
-# Build output
-war
-war.exe
-
-# OS/editor noise
-.DS_Store
-Thumbs.db
-.vscode/
+venv/
+__pycache__/
+*.pyc
+.env
+data/orders.db
+.session_secret
+orderwdp.xlsx

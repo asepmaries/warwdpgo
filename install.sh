@@ -2,25 +2,29 @@
 # ======================================================================
 # WARWDPGO installer — auto detect Termux (Android) vs Linux/VPS
 #
-# Termux  : PHP + paket war di /sdcard/wdp  (seperti install lama)
-# Linux   : timezone WIB + NTP + PHP CLI + Golang (snap) + go mod + paket war
-#           (setara vpswar.php menu 25: Setup Golang + Upload Paket)
+# Termux  : PHP only di /sdcard/wdp  (tanpa Golang — seperti install awal)
+# Linux   : file di $HOME (root → /root), TANPA subfolder wdp
+#           + timezone WIB + NTP + Golang (snap) + go mod
+#           (PHP CLI sengaja TIDAK di-install di Linux untuk saat ini)
 #
 # Jalankan:
 #   bash install.sh              # full auto sesuai platform
 #   bash install.sh --menu       # pilih menu manual
 #   bash install.sh --update     # update file saja (tanpa reinstall Go/PHP)
-#   bash install.sh --go-only    # Linux: setup Golang saja
+#   bash install.sh --go-only    # Linux: setup Golang + go mod saja
 #   APP_DIR=/path bash install.sh
 # ======================================================================
 set -Eeuo pipefail
 
-ARCHIVE_URL="${ARCHIVE_URL:-https://github.com/asepmaries/warwdpgo/archive/refs/heads/main.tar.gz}"
+# Default: Cloudflare R2 public URL (bukan GitHub). Override: ARCHIVE_URL=... bash install.sh
+ARCHIVE_URL="${ARCHIVE_URL:-https://pub-453249fbfe80408a8bb5bf8cce54f391.r2.dev/warwdpgo/warwdpgo.tar.gz}"
 GO_MOD_NAME="${GO_MOD_NAME:-wdp-war}"
 FASTHTTP_PKG="github.com/valyala/fasthttp"
 
-# File yang selalu di-sync dari repo (script + installer)
-CORE_FILES=(war.go war.php install.sh)
+# File yang selalu di-sync dari paket
+# - Termux memakai war.php; war.go/go.mod ikut di-copy tapi tidak dijalankan di Android
+# - Linux memakai war.go (+ go.mod/go.sum) dan war.php cadangan
+CORE_FILES=(war.go war.php install.sh go.mod go.sum)
 
 # Config: jangan di-overwrite kalau sudah ada isi (kecuali --force)
 CONFIG_FILES=(waktu.txt user_server_wdp.txt lead.txt reload.txt target_srv.txt)
@@ -89,9 +93,11 @@ detect_platform() {
 
 default_app_dir() {
   if [ "$IS_TERMUX" -eq 1 ]; then
+    # Termux/Android: PHP di storage (seperti install awal)
     printf '%s' "/sdcard/wdp"
   else
-    printf '%s' "${HOME:-/root}/wdp"
+    # Linux/VPS: langsung di home user (root → /root), tanpa subfolder wdp
+    printf '%s' "${HOME:-/root}"
   fi
 }
 
@@ -112,14 +118,14 @@ Usage: bash install.sh [options]
 
   (default)     Full install otomatis sesuai platform
   --menu, -m    Tampilkan menu pilihan
-  --update, -u  Update file dari GitHub saja
+  --update, -u  Update file dari ARCHIVE_URL saja
   --go-only     Linux only: timezone + NTP + Golang + go mod
   --force, -f   Overwrite config (waktu.txt, user_server_wdp.txt, dll.)
-  --app-dir DIR Folder instalasi (default Termux:/sdcard/wdp Linux:~/wdp)
+  --app-dir DIR Folder instalasi (default Termux:/sdcard/wdp Linux:\$HOME)
   --help, -h    Bantuan
 
 Env:
-  ARCHIVE_URL   URL tarball GitHub (default: warwdpgo main)
+  ARCHIVE_URL   URL tarball (default: Cloudflare R2 warwdpgo/warwdpgo.tar.gz)
   APP_DIR       Sama seperti --app-dir
 EOF
         exit 0
@@ -145,13 +151,29 @@ download_package() {
   extract_dir="${tmp_dir}/extract"
   mkdir -p "$extract_dir"
 
-  log "Download paket dari GitHub"
+  log "Download paket dari Cloudflare R2 / ARCHIVE_URL"
   printf '    URL: %s\n' "$ARCHIVE_URL"
   curl -fL --retry 3 --retry-delay 2 "$ARCHIVE_URL" -o "$archive_file" \
     || die "Gagal download: $ARCHIVE_URL"
 
-  tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1 \
-    || die "Gagal extract tarball"
+  # R2 archive: warwdpgo/... ; GitHub archive: warwdpgo-main/...
+  # Coba strip 1 level dulu; fallback extract flat.
+  if ! tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1 2>/dev/null; then
+    tar -xzf "$archive_file" -C "$extract_dir" || die "Gagal extract tarball"
+  fi
+  # Kalau strip menghasilkan folder kosong tapi ada subdir, ambil isinya
+  if [ ! -f "$extract_dir/war.php" ] && [ ! -f "$extract_dir/war.go" ]; then
+    sub="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1 || true)"
+    if [ -n "$sub" ] && [ -d "$sub" ]; then
+      # pindahkan isi subdir ke extract_dir
+      shopt -s dotglob 2>/dev/null || true
+      mv "$sub"/* "$extract_dir"/ 2>/dev/null || true
+      rmdir "$sub" 2>/dev/null || true
+    fi
+  fi
+  if [ ! -f "$extract_dir/war.php" ] && [ ! -f "$extract_dir/war.go" ] && [ ! -f "$extract_dir/install.sh" ]; then
+    die "Tarball tidak berisi file war (war.php / war.go / install.sh)"
+  fi
 
   # Ekspor path extract untuk caller (via global)
   EXTRACT_DIR="$extract_dir"
@@ -231,8 +253,7 @@ setup_termux_storage() {
 }
 
 install_termux_php() {
-  log "Termux: update paket + install PHP"
-  # Termux pakai apt; noninteractive bila tersedia
+  log "Termux: update paket + install PHP (tanpa Golang)"
   if command -v apt >/dev/null 2>&1; then
     apt update
     DEBIAN_FRONTEND=noninteractive apt -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade || true
@@ -254,7 +275,11 @@ do_install_termux() {
   cat <<EOF
 
 ============================================================
-✓ TERMUX siap — WAR PHP di $APP_DIR
+✓ TERMUX/Android siap — WAR PHP di $APP_DIR
+
+Yang terpasang:
+  • PHP + curl + tar
+  • war.php + config (Golang tidak dipakai di Android)
 
 Edit config:
   nano $APP_DIR/waktu.txt
@@ -312,135 +337,233 @@ linux_apt_base() {
   ok "Paket dasar terpasang"
 }
 
-linux_install_golang() {
-  log "Linux: install Golang via snap (go --classic)"
-  ensure_path_snap
+# Go resmi ke /usr/local/go — terlihat semua user (root + macbook/ubuntu).
+# Lebih andal daripada snap (idcloud sering: snap list kosong / /snap/bin hilang).
+GO_OFFICIAL_VERSION="${GO_OFFICIAL_VERSION:-1.22.12}"
 
-  if command -v go >/dev/null 2>&1; then
-    ok "Go sudah ada: $(go version 2>/dev/null || true)"
-    return 0
+linux_install_golang_official() {
+  local ver="$GO_OFFICIAL_VERSION"
+  local arch tarball url
+  case "$(uname -m 2>/dev/null || echo x86_64)" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) arch=amd64 ;;
+  esac
+  tarball="go${ver}.linux-${arch}.tar.gz"
+  url="https://go.dev/dl/${tarball}"
+
+  log "Linux: install Go ${ver} resmi → /usr/local/go"
+  need_cmd curl
+  curl -fsSL --retry 3 "$url" -o "/tmp/${tarball}" || die "Gagal download $url"
+  run_root rm -rf /usr/local/go
+  run_root tar -C /usr/local -xzf "/tmp/${tarball}" || die "Gagal extract Go tarball"
+  rm -f "/tmp/${tarball}" 2>/dev/null || true
+  export PATH="/usr/local/go/bin:/snap/bin:$PATH"
+  hash -r 2>/dev/null || true
+  command -v go >/dev/null 2>&1 || [ -x /usr/local/go/bin/go ] || die "go tidak ada setelah install resmi"
+  # pastikan `go` di PATH
+  if ! command -v go >/dev/null 2>&1 && [ -x /usr/local/go/bin/go ]; then
+    export PATH="/usr/local/go/bin:$PATH"
   fi
+  ok "Go resmi: $(/usr/local/go/bin/go version 2>/dev/null || go version)"
+}
 
-  # Pastikan snapd jalan
+linux_install_golang_snap() {
+  log "Linux: coba Golang via snap (go --classic)"
+  ensure_path_snap
   if command -v systemctl >/dev/null 2>&1; then
     run_root systemctl enable --now snapd.socket 2>/dev/null || true
     run_root systemctl start snapd 2>/dev/null || true
-    # symlink klasik /snap pada beberapa distro
     if [ ! -e /snap ] && [ -d /var/lib/snapd/snap ]; then
       run_root ln -sfn /var/lib/snapd/snap /snap 2>/dev/null || true
     fi
     sleep 2
   fi
-
-  if ! command -v snap >/dev/null 2>&1; then
-    die "snap tidak tersedia. Install: apt install snapd, lalu jalankan ulang."
-  fi
-
-  # Retry snap (kadang butuh waktu setelah enable snapd)
+  command -v snap >/dev/null 2>&1 || return 1
   local attempt
-  for attempt in 1 2 3 4 5; do
+  for attempt in 1 2 3; do
     if run_root snap install go --classic; then
-      break
+      ensure_path_snap
+      hash -r 2>/dev/null || true
+      if command -v go >/dev/null 2>&1 || [ -x /snap/bin/go ]; then
+        export PATH="/snap/bin:$PATH"
+        ok "Go snap: $(go version 2>/dev/null || /snap/bin/go version)"
+        return 0
+      fi
     fi
-    if [ "$attempt" -eq 5 ]; then
-      die "Gagal: snap install go --classic"
-    fi
-    warn "snap install gagal (attempt $attempt/5), tunggu 5s..."
-    sleep 5
+    sleep 3
   done
-
-  ensure_path_snap
-  hash -r 2>/dev/null || true
-
-  if ! command -v go >/dev/null 2>&1; then
-    # path penuh
-    if [ -x /snap/bin/go ]; then
-      export PATH="/snap/bin:$PATH"
-    else
-      die "go terpasang tapi tidak ada di PATH. Tambahkan /snap/bin ke PATH."
-    fi
-  fi
-
-  go version >/dev/null 2>&1 || die "go version gagal setelah install"
-  ok "Go: $(go version)"
+  return 1
 }
 
-linux_go_mod_setup() {
-  log "Linux: go mod init + get fasthttp di $APP_DIR"
-  need_cmd go
+linux_install_golang() {
+  export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+
+  if command -v go >/dev/null 2>&1 || [ -x /usr/local/go/bin/go ] || [ -x /snap/bin/go ]; then
+    export PATH="/usr/local/go/bin:/snap/bin:$PATH"
+    ok "Go sudah ada: $(go version 2>/dev/null || /usr/local/go/bin/go version 2>/dev/null || /snap/bin/go version)"
+    return 0
+  fi
+
+  # Utama: tarball resmi (semua user bisa pakai /usr/local/go/bin/go)
+  if linux_install_golang_official; then
+    return 0
+  fi
+
+  # Cadangan: snap
+  if linux_install_golang_snap; then
+    return 0
+  fi
+
+  die "Gagal install Go (official tarball + snap)"
+}
+
+# GOPATH/GOMODCACHE HARUS di luar APP_DIR (folder yang berisi go.mod).
+# Kalau APP_DIR=/root dan GOPATH default=/root/go, go mod tidy mengira
+# cache adalah package modul → error "import path should not have @version".
+# Sama untuk APP_DIR=/home/ubuntu → jangan pakai /home/ubuntu/go.
+ensure_go_workspace() {
+  local uid
+  uid="$(id -u 2>/dev/null || echo 0)"
+  export GOPATH="${WDP_GOPATH:-/var/tmp/wdp-gopath-${uid}}"
+  export GOMODCACHE="${WDP_GOMODCACHE:-$GOPATH/pkg/mod}"
+  export GOCACHE="${WDP_GOCACHE:-$GOPATH/cache}"
+  mkdir -p "$GOMODCACHE" "$GOCACHE" 2>/dev/null || true
+  # Bersihkan cache salah tempat di dalam APP_DIR (dari install lama)
+  if [ -n "${APP_DIR:-}" ] && [ -d "$APP_DIR/go/pkg/mod" ]; then
+    warn "Menghapus GOPATH salah di $APP_DIR/go (di dalam modul)"
+    rm -rf "$APP_DIR/go" 2>/dev/null || true
+  fi
+}
+
+# Simpan env Go permanen supaya `go run` user tidak download ulang ke ~/go kosong
+install_go_env_file() {
+  ensure_go_workspace
+  local env_file="$APP_DIR/wdp-env.sh"
+  cat > "$env_file" <<EOF
+# Auto-generated by warwdpgo install.sh
+# source ini ATAU cukup jalankan: ./war
+export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\${PATH}"
+export GOPATH="${GOPATH}"
+export GOMODCACHE="${GOMODCACHE}"
+export GOCACHE="${GOCACHE}"
+export GO111MODULE=on
+EOF
+  chmod 644 "$env_file" 2>/dev/null || true
+  ok "Env Go: $env_file"
+
+  local rc line
+  line="[ -f \"$env_file\" ] && . \"$env_file\""
+  for rc in "${HOME}/.bashrc" "${HOME}/.profile"; do
+    if [ -w "$(dirname "$rc")" ] 2>/dev/null || [ -w "$HOME" ] 2>/dev/null; then
+      if [ -f "$rc" ] && grep -qF 'wdp-env.sh' "$rc" 2>/dev/null; then
+        continue
+      fi
+      printf '\n# WDP war Go workspace\n%s\n' "$line" >> "$rc" 2>/dev/null || true
+    fi
+  done
+}
+
+# Download SEMUA dependency + compile binary → jalan tanpa unduh GitHub lagi
+resolve_go_bin() {
+  if command -v go >/dev/null 2>&1; then
+    command -v go
+  elif [ -x /usr/local/go/bin/go ]; then
+    echo /usr/local/go/bin/go
+  elif [ -x /snap/bin/go ]; then
+    echo /snap/bin/go
+  else
+    return 1
+  fi
+}
+
+prebuild_war_binary() {
+  log "Prebuild war (go mod download + go build) — biar tidak download saat jalan"
+  export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  local gobin
+  gobin="$(resolve_go_bin)" || die "perintah go tidak ditemukan untuk prebuild"
+  ensure_go_workspace
+  (
+    cd "$APP_DIR"
+    "$gobin" mod download || die "go mod download gagal"
+    "$gobin" mod tidy || warn "go mod tidy warning (lanjut build)"
+    # Binary siap pakai: ./war  (tanpa go run / tanpa jaringan)
+    "$gobin" build -o war war.go || die "go build war.go gagal"
+    chmod +x war 2>/dev/null || true
+  ) || die "Prebuild war gagal"
+  if [ -x "$APP_DIR/war" ] || [ -f "$APP_DIR/war" ]; then
+    ok "Binary siap: $APP_DIR/war ($(du -h "$APP_DIR/war" 2>/dev/null | awk '{print $1}' || echo '?'))"
+    ok "Jalankan: cd $APP_DIR && ./war"
+  else
+    die "Binary $APP_DIR/war tidak terbentuk"
+  fi
+}
+
+setup_go_mod() {
+  # Linux/VPS only — pastikan go.mod/go.sum + fasthttp siap untuk war.go
+  log "Setup Go module (go.mod + fasthttp) di $APP_DIR"
+  export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  local gobin
+  gobin="$(resolve_go_bin)" || die "perintah go tidak ditemukan"
   mkdir -p "$APP_DIR"
+  ensure_go_workspace
+  ok "GOPATH=$GOPATH (di luar APP_DIR)"
+  ok "go bin: $gobin"
   (
     cd "$APP_DIR"
     if [ ! -f go.mod ]; then
-      go mod init "$GO_MOD_NAME" 2>/dev/null || go mod init "$GO_MOD_NAME"
+      "$gobin" mod init "$GO_MOD_NAME" 2>/dev/null || "$gobin" mod init "$GO_MOD_NAME"
+      ok "go mod init $GO_MOD_NAME"
+    else
+      ok "go.mod sudah ada (dari paket)"
     fi
-    go get "$FASTHTTP_PKG"
-    # Kalau war.go sudah ada, tidy biar go.sum rapi
+    "$gobin" get "$FASTHTTP_PKG" || die "go get $FASTHTTP_PKG gagal (cek jaringan)"
     if [ -f war.go ]; then
-      go mod tidy 2>/dev/null || true
+      "$gobin" mod tidy || warn "go mod tidy gagal (boleh diulang manual)"
     fi
-  ) || die "Gagal go mod / go get"
-  ok "Modul Go siap ($GO_MOD_NAME + fasthttp)"
+    "$gobin" list -m all 2>/dev/null | head -n 5 | sed 's/^/    /' || true
+  ) || die "Gagal setup go.mod / go get"
+  ok "Modul Go siap ($GO_MOD_NAME + $FASTHTTP_PKG)"
+
+  install_go_env_file
+  prebuild_war_binary
 }
 
-linux_install_php() {
-  # PHP CLI wajib di Linux agar war.php bisa dipakai (selain Go)
-  if command -v php >/dev/null 2>&1; then
-    ok "PHP sudah ada: $(php -v 2>/dev/null | head -n1)"
-    # Pastikan ekstensi curl ada (war.php butuh curl_multi)
-    if php -m 2>/dev/null | grep -qi '^curl$'; then
-      ok "PHP ext curl: aktif"
-      return 0
-    fi
-    warn "PHP ext curl belum aktif — pasang ulang paket curl"
-  fi
-
-  log "Linux: install PHP CLI + curl"
-  if command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive run_root apt-get install -y php-cli php-curl \
-      || DEBIAN_FRONTEND=noninteractive run_root apt-get install -y php php-curl \
-      || die "Gagal install PHP CLI (php-cli / php-curl)"
-  elif command -v apt >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive run_root apt install -y php-cli php-curl \
-      || DEBIAN_FRONTEND=noninteractive run_root apt install -y php php-curl \
-      || die "Gagal install PHP CLI (php-cli / php-curl)"
-  else
-    die "Tidak bisa install PHP: apt tidak tersedia"
-  fi
-
-  command -v php >/dev/null 2>&1 || die "php tidak ada di PATH setelah install"
-  ok "PHP: $(php -v 2>/dev/null | head -n1)"
-  if php -m 2>/dev/null | grep -qi '^curl$'; then
-    ok "PHP ext curl: aktif"
-  else
-    warn "PHP ext curl tidak terdeteksi — war.php mungkin gagal (butuh curl)"
-  fi
-}
+# linux_install_php() — DINONAKTIFKAN sementara (Linux fokus Golang saja).
+# Aktifkan lagi di do_install_linux() jika war.php dibutuhkan di VPS.
 
 verify_golang_setup() {
-  ensure_path_snap
-  if go version >/dev/null 2>&1; then
-    ok "Verify: $(go version) → __WDP_GO_SETUP_OK__"
-    return 0
+  export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  local gobin
+  gobin="$(resolve_go_bin)" || die "Verify Go gagal: binary go tidak ada"
+  ok "Verify: $($gobin version) → __WDP_GO_SETUP_OK__"
+  if [ -f "$APP_DIR/war" ]; then
+    ok "Verify binary: $APP_DIR/war → __WDP_WAR_BIN_OK__"
+  else
+    warn "Binary ./war belum ada (prebuild gagal?)"
   fi
-  die "Verify Go gagal"
 }
 
 do_setup_golang_only() {
-  [ "$IS_LINUX" -eq 1 ] || die "--go-only hanya untuk Linux/VPS"
+  [ "$IS_LINUX" -eq 1 ] || die "--go-only hanya untuk Linux/VPS (Termux Android pakai PHP saja)"
   linux_apt_base
   linux_set_timezone_ntp
   linux_install_golang
-  linux_go_mod_setup
+  if [ ! -f "$APP_DIR/war.go" ]; then
+    download_package
+    install_files_from_extract "$EXTRACT_DIR"
+    cleanup_download
+  fi
+  setup_go_mod
   verify_golang_setup
   cat <<EOF
 
 ============================================================
 ✓ Golang setup selesai di $APP_DIR
 
-Jalankan war:
+Jalankan war (langsung, tanpa download):
   cd $APP_DIR
-  go run war.go
+  ./war
 ============================================================
 EOF
 }
@@ -448,48 +571,42 @@ EOF
 do_install_linux() {
   linux_apt_base
   linux_set_timezone_ntp
-  linux_install_php
+  # PHP CLI sengaja di-skip (fokus Golang di VPS)
   linux_install_golang
 
   download_package
   install_files_from_extract "$EXTRACT_DIR"
   cleanup_download
 
-  linux_go_mod_setup
+  setup_go_mod
   verify_golang_setup
 
   cat <<EOF
 
 ============================================================
-✓ LINUX/VPS siap — WAR di $APP_DIR
+✓ LINUX/VPS siap — WAR Golang di $APP_DIR
 
 Yang sudah dikonfigurasi:
   • apt update + paket dasar (curl, tar, snapd)
   • timezone Asia/Jakarta + NTP
-  • PHP CLI + php-curl (untuk war.php)
   • snap install go --classic
-  • go mod init $GO_MOD_NAME + go get $FASTHTTP_PKG
-  • file: war.go, war.php, config txt
+  • go mod download + go build → binary ./war
+  • env permanen: $APP_DIR/wdp-env.sh (+ ~/.bashrc)
 
 Edit config:
   nano $APP_DIR/waktu.txt
   nano $APP_DIR/user_server_wdp.txt
-  nano $APP_DIR/lead.txt          # fallback lead (ms), opsional
-  nano $APP_DIR/target_srv.txt    # target srv ms, opsional
 
-Jalankan (utama — Golang):
+Jalankan (disarankan — TANPA download GitHub):
   cd $APP_DIR
+  ./war
+
+Atau (butuh source env dulu):
+  . $APP_DIR/wdp-env.sh
   go run war.go
 
-Jalankan (PHP):
-  cd $APP_DIR
-  php war.php
-
-Update file dari GitHub:
+Update file dari Cloudflare R2:
   bash $APP_DIR/install.sh --update
-
-PATH Go (kalau 'go' tidak ketemu):
-  export PATH="/snap/bin:\$PATH"
 ============================================================
 EOF
 }
@@ -498,16 +615,20 @@ EOF
 # Update-only
 # ----------------------------------------------------------------------
 do_update_files() {
-  log "Mode update: sync file dari GitHub ke $APP_DIR"
+  log "Mode update: sync file dari ARCHIVE_URL ke $APP_DIR"
   download_package
   install_files_from_extract "$EXTRACT_DIR"
   cleanup_download
 
+  # Linux: refresh go mod bila go tersedia (Termux skip — PHP only)
   if [ "$IS_LINUX" -eq 1 ] && command -v go >/dev/null 2>&1; then
     ensure_path_snap
     (
       cd "$APP_DIR"
-      if [ -f war.go ]; then
+      if [ ! -f go.mod ]; then
+        go mod init "$GO_MOD_NAME" 2>/dev/null || true
+      fi
+      if [ -f war.go ] || [ -f go.mod ]; then
         go get "$FASTHTTP_PKG" 2>/dev/null || true
         go mod tidy 2>/dev/null || true
       fi
@@ -535,8 +656,8 @@ show_menu() {
   APP_DIR  : $APP_DIR
 ============================================================
   1) Full install otomatis (disarankan)
-  2) Update file dari GitHub saja
-  3) Setup Golang saja (Linux/VPS — timezone + NTP + snap go + mod)
+  2) Update file dari Cloudflare R2 saja
+  3) Setup Golang saja (Linux/VPS only)
   4) Force overwrite config + full install
   0) Keluar
 ============================================================
@@ -568,6 +689,8 @@ main() {
   detect_platform
 
   APP_DIR="${APP_DIR:-$(default_app_dir)}"
+  # Normalisasi trailing slash
+  APP_DIR="${APP_DIR%/}"
 
   log "Deteksi platform: $PLATFORM | APP_DIR=$APP_DIR | mode=$MODE"
 
