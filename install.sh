@@ -16,8 +16,8 @@
 # ======================================================================
 set -Eeuo pipefail
 
-# Default: Cloudflare R2 public URL (bukan GitHub). Override: ARCHIVE_URL=... bash install.sh
-ARCHIVE_URL="${ARCHIVE_URL:-https://pub-453249fbfe80408a8bb5bf8cce54f391.r2.dev/warwdpgo/warwdpgo.tar.gz}"
+# Default: arsip branch main dari GitHub. Override: ARCHIVE_URL=... bash install.sh
+ARCHIVE_URL="${ARCHIVE_URL:-https://github.com/asepmaries/warwdpgo/archive/refs/heads/main.tar.gz}"
 GO_MOD_NAME="${GO_MOD_NAME:-wdp-war}"
 FASTHTTP_PKG="github.com/valyala/fasthttp"
 
@@ -125,7 +125,7 @@ Usage: bash install.sh [options]
   --help, -h    Bantuan
 
 Env:
-  ARCHIVE_URL   URL tarball (default: Cloudflare R2 warwdpgo/warwdpgo.tar.gz)
+  ARCHIVE_URL   URL tarball (default: GitHub branch main)
   APP_DIR       Sama seperti --app-dir
 EOF
         exit 0
@@ -151,13 +151,13 @@ download_package() {
   extract_dir="${tmp_dir}/extract"
   mkdir -p "$extract_dir"
 
-  log "Download paket dari Cloudflare R2 / ARCHIVE_URL"
+  log "Download paket dari GitHub / ARCHIVE_URL"
   printf '    URL: %s\n' "$ARCHIVE_URL"
   curl -fL --retry 3 --retry-delay 2 "$ARCHIVE_URL" -o "$archive_file" \
     || die "Gagal download: $ARCHIVE_URL"
 
-  # R2 archive: warwdpgo/... ; GitHub archive: warwdpgo-main/...
-  # Coba strip 1 level dulu; fallback extract flat.
+  # GitHub archive: warwdpgo-main/...
+  # Coba strip 1 level dulu; fallback extract flat untuk URL override kustom.
   if ! tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1 2>/dev/null; then
     tar -xzf "$archive_file" -C "$extract_dir" || die "Gagal extract tarball"
   fi
@@ -605,7 +605,7 @@ Atau (butuh source env dulu):
   . $APP_DIR/wdp-env.sh
   go run war.go
 
-Update file dari Cloudflare R2:
+Update file dari GitHub:
   bash $APP_DIR/install.sh --update
 ============================================================
 EOF
@@ -656,7 +656,7 @@ show_menu() {
   APP_DIR  : $APP_DIR
 ============================================================
   1) Full install otomatis (disarankan)
-  2) Update file dari Cloudflare R2 saja
+  2) Update file dari GitHub saja
   3) Setup Golang saja (Linux/VPS only)
   4) Force overwrite config + full install
   0) Keluar
