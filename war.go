@@ -27,20 +27,15 @@ import (
 // ======================================================================
 
 const (
-	MAX_USERS              = 5
-	MAX_RETRY_PER_USER     = 10
-	MAX_TOTAL_INQUIRIES    = 16 // Batas total inquiry per VPS (jaga 429). Dinaikkan sedikit untuk memberi ruang STOP_GRACE.
-	STOP_GRACE_RETRIES     = 3  // FIX#1: setelah STOP GLOBAL, user yang BELUM menang/limit sendiri (mis. "not yet active") tetap boleh nembak N kali lagi — mereka sering yang datang paling awal.
-	PREBUILD_POOL_PER_USER = 4  // FIX#2: jumlah request pra-bangun per user (salvo #1 + beberapa retry cepat) agar refire tidak kena biaya build/crypto di hot path.
-	MINI_PROBE2_LEAD_MS    = 1500
-	MINI_PROBE2_PARALLEL   = 5 // Samakan dengan MAX_USERS supaya semua koneksi warm
-	INQUIRY_TIMEOUT_MS     = 5200
-	PAYMENT_TIMEOUT_MS     = 5200
-	PREWAR_TEST_COUNT      = 8
-	// FIX#3: dari analisa loghasil.txt, arrival pemenang bermedian ~+25ms & yang kalah ~+34ms,
-	// artinya ada keterlambatan sistematis. Default digeser lebih awal supaya mayoritas VPS
-	// mendarat di jendela menang (~+10..+20ms). Tetap bisa dioverride via target_srv.txt.
-	TARGET_SRV_MS_DEFAULT     = -15.0 // target srv (ms setelah T=0) untuk dynamic lead
+	MAX_USERS                 = 5
+	MAX_RETRY_PER_USER        = 10
+	MAX_TOTAL_INQUIRIES       = 12 // Turunkan agar aman dari 429 (maksimal ~10-12 inquiry total)
+	MINI_PROBE2_LEAD_MS       = 1500
+	MINI_PROBE2_PARALLEL      = 5 // Samakan dengan MAX_USERS supaya semua koneksi warm
+	INQUIRY_TIMEOUT_MS        = 5200
+	PAYMENT_TIMEOUT_MS        = 5200
+	PREWAR_TEST_COUNT         = 8
+	TARGET_SRV_MS_DEFAULT     = -10.0   // target srv (ms setelah T=0) untuk dynamic lead
 	FINE_TUNE_START_BEFORE_MS = 12000 // H-12s: mulai fase fine-tune
 	FINE_TUNE_PROBE_INTERVAL  = 1000 * time.Millisecond
 	FINE_TUNE_PROBE_COUNT     = 8 // 8x @ 1/detik: H-12s → H-5s
@@ -620,51 +615,36 @@ func fillInquiryRequest(req *fasthttp.Request, order Order, captchaToken string)
 	req.SetBody(buildInquiryBody(order))
 }
 
-// prebuiltReqs menyimpan POOL *fasthttp.Request siap-tembak per user.
-// FIX#2: dulu hanya 1 per user (cuma salvo #1). Sekarang PREBUILD_POOL_PER_USER
-// per user, sehingga retry cepat (mis. "not yet active") juga memakai request
-// pra-bangun — hot path retry murni Do(), tanpa biaya crypto/json/build header.
+// prebuiltReqs menyimpan satu *fasthttp.Request siap-tembak per user untuk SALVO #1.
+// Dibangun saat warmup (lihat prebuildInquiryRequests) sehingga di T=0 hot path
+// hanya menjalankan fastClient.Do() murni — tidak ada alokasi/crypto di jalur kritis.
 var (
-	prebuiltReqs   = make(map[string][]*fasthttp.Request)
+	prebuiltReqs   = make(map[string]*fasthttp.Request)
 	prebuiltReqsMu sync.Mutex
 )
 
 func orderKey(o Order) string { return o.UserID + "|" + o.ServerID }
 
-// prebuildInquiryRequests membangun POOL request untuk semua order memakai
+// prebuildInquiryRequests membangun request salvo-1 untuk semua order memakai
 // captcha final. Harus dipanggil SETELAH captcha terakhir di-refresh dan SEBELUM
 // burst (idealnya di dalam window warmup yang masih punya budget waktu).
 func prebuildInquiryRequests(orders []Order, captchaToken string) {
 	prebuiltReqsMu.Lock()
 	defer prebuiltReqsMu.Unlock()
 	for _, o := range orders {
-		pool := make([]*fasthttp.Request, 0, PREBUILD_POOL_PER_USER)
-		for i := 0; i < PREBUILD_POOL_PER_USER; i++ {
-			req := fasthttp.AcquireRequest()
-			fillInquiryRequest(req, o, captchaToken)
-			pool = append(pool, req)
-		}
-		prebuiltReqs[orderKey(o)] = pool
+		req := fasthttp.AcquireRequest()
+		fillInquiryRequest(req, o, captchaToken)
+		prebuiltReqs[orderKey(o)] = req
 	}
 }
 
-// takePrebuilt mengambil (pop) satu request pra-bangun dari pool user, atau nil bila habis.
-func takePrebuilt(order Order) *fasthttp.Request {
-	prebuiltReqsMu.Lock()
-	defer prebuiltReqsMu.Unlock()
-	pool := prebuiltReqs[orderKey(order)]
-	if len(pool) == 0 {
-		return nil
-	}
-	req := pool[len(pool)-1]
-	prebuiltReqs[orderKey(order)] = pool[:len(pool)-1]
-	return req
-}
-
-// doInquiryPrebuilt menembak memakai request pra-bangun (salvo #1 & retry cepat).
-// Mengembalikan ok=false jika pool user sudah habis (fallback ke doInquiry).
+// doInquiryPrebuilt menembak memakai request yang sudah dibangun sebelumnya (salvo #1).
+// Mengembalikan ok=false jika tidak ada prebuilt untuk order ini (fallback ke doInquiry).
 func doInquiryPrebuilt(order Order) (InquiryResult, bool) {
-	req := takePrebuilt(order)
+	prebuiltReqsMu.Lock()
+	req := prebuiltReqs[orderKey(order)]
+	delete(prebuiltReqs, orderKey(order)) // sekali pakai; retry berikutnya rebuild fresh
+	prebuiltReqsMu.Unlock()
 	if req == nil {
 		return InquiryResult{}, false
 	}
@@ -909,26 +889,9 @@ func runAdaptiveInquiry(orders []Order, captchaToken string) []SuccessEntry {
 			defer wg.Done()
 			k := key(order)
 
-			// FIX#1: hitungan "grace shots" — retry ekstra yang tetap diizinkan walau
-			// stopGlobal sudah nyala, khusus untuk user yang BELUM menang/limit/region
-			// sendiri. User yang datang paling awal (mis. "not yet active") sering baru
-			// aktif beberapa ms setelah salvo-1; dulu mereka ikut dibatalkan STOP GLOBAL.
-			graceShots := 0
-
 			for attempt := 1; attempt <= MAX_RETRY_PER_USER+1; attempt++ {
 				mu.Lock()
-				// Kondisi berhenti yang bersifat final untuk user INI.
-				selfDone := successMap[k] != (SuccessEntry{}) || skipUsers[k] || regionBlocked[k]
-				hardCap := totalInquiries >= MAX_TOTAL_INQUIRIES
-				skip := selfDone || hardCap
-				// FIX#1: stopGlobal hanya membatalkan bila jatah grace sudah habis.
-				if !skip && stopGlobal {
-					if graceShots >= STOP_GRACE_RETRIES {
-						skip = true
-					} else {
-						graceShots++
-					}
-				}
+				skip := stopGlobal || successMap[k] != (SuccessEntry{}) || skipUsers[k] || regionBlocked[k] || totalInquiries >= MAX_TOTAL_INQUIRIES
 				if !skip {
 					totalInquiries++
 				}
@@ -957,25 +920,18 @@ func runAdaptiveInquiry(orders []Order, captchaToken string) []SuccessEntry {
 						result = doInquiry(order, captchaToken, attempt)
 					}
 				} else {
-					// Retry: FIX#2 — coba pakai request pra-bangun dulu (hot path Do()
-					// murni) supaya refire "not yet active" secepat salvo-1. Fallback
-					// ke build fresh hanya bila pool user sudah habis.
+					// Retry: jalan secepatnya tanpa barrier, build request fresh.
 					fireTime = time.Now()
-					if r, ok := doInquiryPrebuilt(order); ok {
-						result = r
-					} else {
-						result = doInquiry(order, captchaToken, attempt)
-					}
+					result = doInquiry(order, captchaToken, attempt)
 				}
 
 				if processInquiryResult(order, k, attempt, fireTime, result) {
 					return
 				}
 
-				time.Sleep(1 * time.Millisecond) // FIX#4: refire lebih cepat (PHP style)
+				time.Sleep(3 * time.Millisecond) // refire sangat cepat (PHP style)
 			}
 		}(ord)
-
 	}
 
 	// Lepas barrier: tunggu kelima goroutine selesai build & siap, lalu close.
@@ -1364,8 +1320,7 @@ func main() {
 	waitForExactBurstTime(fallbackLeadMs, orders[0], captcha, func(budgetMs int) {
 		doWarmupProbes(orders[0], captcha, budgetMs)
 		prebuildInquiryRequests(orders, captcha)
-		logf("[PREBUILD] %d user × %d request pra-bangun siap (salvo-1 + retry cepat, hot path = Do() murni)\n", len(orders), PREBUILD_POOL_PER_USER)
-
+		logf("[PREBUILD] %d request salvo-1 siap (hot path = Do() murni)\n", len(orders))
 	})
 
 	logf("🔥 SALVO #1: tembak %d user paralel @ [%s]\n", len(orders), formatMicrotimeNow())
