@@ -22,8 +22,9 @@ GO_MOD_NAME="${GO_MOD_NAME:-wdp-war}"
 FASTHTTP_PKG="github.com/valyala/fasthttp"
 CHRONY_WAIT_TRIES="${CHRONY_WAIT_TRIES:-60}"
 CHRONY_MAX_CORRECTION="${CHRONY_MAX_CORRECTION:-0.005}"
-CHRONY_MAX_SKEW="${CHRONY_MAX_SKEW:-100}"
+CHRONY_MAX_SKEW="${CHRONY_MAX_SKEW:-0}"
 CHRONY_WAIT_INTERVAL="${CHRONY_WAIT_INTERVAL:-1}"
+CHRONY_REQUIRE_WAR_CLOCK_HEALTHY="${CHRONY_REQUIRE_WAR_CLOCK_HEALTHY:-0}"
 
 # File yang selalu di-sync dari paket
 # - Termux memakai war.php; war.go/go.mod ikut di-copy tapi tidak dijalankan di Android
@@ -133,8 +134,10 @@ Env:
   APP_DIR       Sama seperti --app-dir
   CHRONY_WAIT_TRIES       Jumlah cek sinkronisasi (default: 60)
   CHRONY_MAX_CORRECTION   Maksimum System time dalam detik (default: 0.005)
-  CHRONY_MAX_SKEW         Maksimum skew ppm (default: 100)
+  CHRONY_MAX_SKEW         Maksimum skew bootstrap ppm (default: 0 = tunggu correction saja)
   CHRONY_WAIT_INTERVAL    Interval cek detik (default: 1)
+  CHRONY_REQUIRE_WAR_CLOCK_HEALTHY
+                          1 = installer menunggu gate war ketat (default: 0)
 EOF
         exit 0
         ;;
@@ -341,7 +344,7 @@ linux_setup_timezone_chrony() {
     die "Tidak ada systemctl/service untuk menjalankan chronyd"
   fi
 
-  log "Chrony: online + burst + tunggu koreksi <= ${CHRONY_MAX_CORRECTION}s"
+  log "Chrony: online + burst + tunggu reference dan koreksi <= ${CHRONY_MAX_CORRECTION}s"
   run_root chronyc online >/dev/null || die "chronyc online gagal"
   # Bila offset awal besar, izinkan satu step pada update berikutnya. Ini aman
   # saat provisioning dan tidak dijalankan oleh war.go ketika countdown.
@@ -357,7 +360,7 @@ linux_setup_timezone_chrony() {
     "$CHRONY_WAIT_INTERVAL"; then
     run_root chronyc -n tracking 2>/dev/null | sed 's/^/    /' || true
     run_root chronyc -n sources -v 2>/dev/null | sed 's/^/    /' || true
-    die "Chrony belum sinkron: correction>${CHRONY_MAX_CORRECTION}s atau skew>${CHRONY_MAX_SKEW}ppm"
+    die "Chrony bootstrap belum sinkron: belum ada reference atau correction>${CHRONY_MAX_CORRECTION}s"
   fi
 
   run_root chronyc -n tracking | sed 's/^/    /' \
@@ -591,20 +594,32 @@ verify_golang_setup() {
   fi
 
   log "Verify clock contract dari binary war"
-  local clock_output
-  if ! clock_output="$(cd "$APP_DIR" && ./war --check-clock 2>&1)"; then
+  local clock_output clock_rc
+  clock_rc=0
+  clock_output="$(cd "$APP_DIR" && ./war --check-clock 2>&1)" || clock_rc=$?
+  if [ "$clock_rc" -ne 0 ]; then
     printf '%s\n' "$clock_output" | sed 's/^/    /'
-    die "Binary war menolak kesehatan clock VPS"
+    if [ "$clock_rc" -eq 78 ] \
+      && printf '%s' "$clock_output" | grep -q "__WDP_CLOCK_UNHEALTHY__"; then
+      printf '%s\n' "__WDP_CLOCK_SETTLING__ chronyd akan terus mengumpulkan sampel"
+      if [ "$CHRONY_REQUIRE_WAR_CLOCK_HEALTHY" = "1" ]; then
+        die "Clock belum memenuhi gate war ketat dan strict install diaktifkan"
+      fi
+      warn "Clock bootstrap sudah terkoreksi, tetapi skew/dispersion belum matang; installer lanjut, war tetap akan menolak sampai sehat"
+    else
+      die "war --check-clock gagal dengan exit ${clock_rc}"
+    fi
+  else
+    printf '%s\n' "$clock_output" | sed 's/^/    /'
+    case "$clock_output" in
+      *"__WDP_CLOCK_HEALTHY__"*)
+        ok "Clock runtime terverifikasi → __WDP_CLOCK_HEALTHY__"
+        ;;
+      *)
+        die "war --check-clock exit 0 tanpa marker sehat"
+        ;;
+    esac
   fi
-  printf '%s\n' "$clock_output" | sed 's/^/    /'
-  case "$clock_output" in
-    *"__WDP_CLOCK_HEALTHY__"*)
-      ok "Clock runtime terverifikasi → __WDP_CLOCK_HEALTHY__"
-      ;;
-    *)
-      die "war --check-clock tidak mengeluarkan marker sehat"
-      ;;
-  esac
   if command -v systemctl >/dev/null 2>&1 \
     && ! run_root systemctl is-active --quiet chrony.service 2>/dev/null; then
     die "chrony.service berhenti setelah setup"
@@ -633,7 +648,7 @@ Jalankan war (langsung, tanpa download):
   ./war
 ============================================================
 EOF
-  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-v1"
+  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-bootstrap-v1"
 }
 
 do_install_linux() {
@@ -657,8 +672,9 @@ do_install_linux() {
 Yang sudah dikonfigurasi:
   • apt update + paket dasar (curl, tar, snapd, chrony)
   • timezone Asia/Jakarta + Chrony (timesyncd dimatikan)
-  • waitsync correction <= ${CHRONY_MAX_CORRECTION}s, skew <= ${CHRONY_MAX_SKEW}ppm
-  • ./war --check-clock lulus
+  • bootstrap waitsync correction <= ${CHRONY_MAX_CORRECTION}s
+  • chronyd terus mematangkan skew/dispersion di background
+  • ./war --check-clock tetap menjadi gate ketat sebelum war
   • snap install go --classic
   • go mod download + go build → binary ./war
   • env permanen: $APP_DIR/wdp-env.sh (+ ~/.bashrc)
@@ -679,7 +695,7 @@ Update file dari GitHub:
   bash $APP_DIR/install.sh --update
 ============================================================
 EOF
-  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-v1"
+  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-bootstrap-v1"
 }
 
 # ----------------------------------------------------------------------
