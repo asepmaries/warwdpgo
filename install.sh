@@ -20,6 +20,10 @@ set -Eeuo pipefail
 ARCHIVE_URL="${ARCHIVE_URL:-https://github.com/asepmaries/warwdpgo/archive/refs/heads/main.tar.gz}"
 GO_MOD_NAME="${GO_MOD_NAME:-wdp-war}"
 FASTHTTP_PKG="github.com/valyala/fasthttp"
+CHRONY_WAIT_TRIES="${CHRONY_WAIT_TRIES:-60}"
+CHRONY_MAX_CORRECTION="${CHRONY_MAX_CORRECTION:-0.005}"
+CHRONY_MAX_SKEW="${CHRONY_MAX_SKEW:-100}"
+CHRONY_WAIT_INTERVAL="${CHRONY_WAIT_INTERVAL:-1}"
 
 # File yang selalu di-sync dari paket
 # - Termux memakai war.php; war.go/go.mod ikut di-copy tapi tidak dijalankan di Android
@@ -127,6 +131,10 @@ Usage: bash install.sh [options]
 Env:
   ARCHIVE_URL   URL tarball (default: GitHub branch main)
   APP_DIR       Sama seperti --app-dir
+  CHRONY_WAIT_TRIES       Jumlah cek sinkronisasi (default: 60)
+  CHRONY_MAX_CORRECTION   Maksimum System time dalam detik (default: 0.005)
+  CHRONY_MAX_SKEW         Maksimum skew ppm (default: 100)
+  CHRONY_WAIT_INTERVAL    Interval cek detik (default: 1)
 EOF
         exit 0
         ;;
@@ -298,25 +306,64 @@ EOF
 # ----------------------------------------------------------------------
 # LINUX / VPS (setara vpswar.php menu 25)
 # ----------------------------------------------------------------------
-linux_set_timezone_ntp() {
-  log "Linux: timezone Asia/Jakarta + NTP"
+linux_setup_timezone_chrony() {
+  log "Linux: timezone Asia/Jakarta + Chrony presisi"
+
+  # Timezone hanya mengubah representasi waktu. Sinkronisasi tetap berjalan
+  # terhadap UTC melalui chronyd.
   if command -v timedatectl >/dev/null 2>&1; then
     run_root timedatectl set-timezone Asia/Jakarta || warn "Gagal set timezone"
-    run_root timedatectl set-ntp true || warn "Gagal enable NTP"
-    timedatectl status 2>/dev/null | sed 's/^/    /' || true
-    ok "Timezone + NTP"
   else
-    # fallback tanpa systemd
     if [ -f /usr/share/zoneinfo/Asia/Jakarta ]; then
       run_root ln -sf /usr/share/zoneinfo/Asia/Jakarta /etc/localtime || true
       if [ -w /etc/timezone ] || [ "$(id -u)" -eq 0 ]; then
         echo "Asia/Jakarta" | run_root tee /etc/timezone >/dev/null || true
       fi
-      ok "Timezone di-set via /etc/localtime (tanpa timedatectl)"
     else
       warn "timedatectl & zoneinfo tidak tersedia — set timezone manual"
     fi
   fi
+
+  need_cmd chronyc
+
+  # Hanya satu daemon pengatur waktu. systemd-timesyncd dihentikan agar tidak
+  # bersaing dengan chronyd. Package chrony Ubuntu biasanya melakukan ini juga,
+  # tetapi installer memastikan ulang secara idempotent.
+  if command -v systemctl >/dev/null 2>&1; then
+    run_root systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
+    run_root systemctl enable --now chrony.service \
+      || die "Gagal enable/start chrony.service"
+    run_root systemctl is-active --quiet chrony.service \
+      || die "chrony.service tidak aktif"
+  elif command -v service >/dev/null 2>&1; then
+    run_root service chrony restart || die "Gagal restart service chrony"
+  else
+    die "Tidak ada systemctl/service untuk menjalankan chronyd"
+  fi
+
+  log "Chrony: online + burst + tunggu koreksi <= ${CHRONY_MAX_CORRECTION}s"
+  run_root chronyc online >/dev/null || die "chronyc online gagal"
+  # Bila offset awal besar, izinkan satu step pada update berikutnya. Ini aman
+  # saat provisioning dan tidak dijalankan oleh war.go ketika countdown.
+  run_root chronyc makestep 0.1 1 >/dev/null \
+    || warn "chronyc makestep policy gagal; lanjut ke waitsync"
+  run_root chronyc burst 4/4 >/dev/null \
+    || die "chronyc burst gagal"
+
+  if ! run_root chronyc waitsync \
+    "$CHRONY_WAIT_TRIES" \
+    "$CHRONY_MAX_CORRECTION" \
+    "$CHRONY_MAX_SKEW" \
+    "$CHRONY_WAIT_INTERVAL"; then
+    run_root chronyc -n tracking 2>/dev/null | sed 's/^/    /' || true
+    run_root chronyc -n sources -v 2>/dev/null | sed 's/^/    /' || true
+    die "Chrony belum sinkron: correction>${CHRONY_MAX_CORRECTION}s atau skew>${CHRONY_MAX_SKEW}ppm"
+  fi
+
+  run_root chronyc -n tracking | sed 's/^/    /' \
+    || die "Gagal membaca chronyc tracking"
+  timedatectl status 2>/dev/null | sed 's/^/    /' || true
+  ok "Timezone Asia/Jakarta + Chrony tersinkron"
 }
 
 linux_apt_base() {
@@ -324,17 +371,17 @@ linux_apt_base() {
   if command -v apt-get >/dev/null 2>&1; then
     run_root apt-get update -y
     DEBIAN_FRONTEND=noninteractive run_root apt-get install -y \
-      curl tar ca-certificates snapd \
+      curl tar ca-certificates snapd chrony \
       || die "Gagal apt install paket dasar"
   elif command -v apt >/dev/null 2>&1; then
     run_root apt update -y
     DEBIAN_FRONTEND=noninteractive run_root apt install -y \
-      curl tar ca-certificates snapd \
+      curl tar ca-certificates snapd chrony \
       || die "Gagal apt install paket dasar"
   else
     die "Sistem ini bukan Debian/Ubuntu (butuh apt). Install curl/tar/snapd manual."
   fi
-  ok "Paket dasar terpasang"
+  ok "Paket dasar + chrony terpasang"
 }
 
 # Go resmi ke /usr/local/go — terlihat semua user (root + macbook/ubuntu).
@@ -537,17 +584,37 @@ verify_golang_setup() {
   local gobin
   gobin="$(resolve_go_bin)" || die "Verify Go gagal: binary go tidak ada"
   ok "Verify: $($gobin version) → __WDP_GO_SETUP_OK__"
-  if [ -f "$APP_DIR/war" ]; then
+  if [ -x "$APP_DIR/war" ]; then
     ok "Verify binary: $APP_DIR/war → __WDP_WAR_BIN_OK__"
   else
-    warn "Binary ./war belum ada (prebuild gagal?)"
+    die "Binary ./war belum ada atau tidak executable setelah prebuild"
+  fi
+
+  log "Verify clock contract dari binary war"
+  local clock_output
+  if ! clock_output="$(cd "$APP_DIR" && ./war --check-clock 2>&1)"; then
+    printf '%s\n' "$clock_output" | sed 's/^/    /'
+    die "Binary war menolak kesehatan clock VPS"
+  fi
+  printf '%s\n' "$clock_output" | sed 's/^/    /'
+  case "$clock_output" in
+    *"__WDP_CLOCK_HEALTHY__"*)
+      ok "Clock runtime terverifikasi → __WDP_CLOCK_HEALTHY__"
+      ;;
+    *)
+      die "war --check-clock tidak mengeluarkan marker sehat"
+      ;;
+  esac
+  if command -v systemctl >/dev/null 2>&1 \
+    && ! run_root systemctl is-active --quiet chrony.service 2>/dev/null; then
+    die "chrony.service berhenti setelah setup"
   fi
 }
 
 do_setup_golang_only() {
   [ "$IS_LINUX" -eq 1 ] || die "--go-only hanya untuk Linux/VPS (Termux Android pakai PHP saja)"
   linux_apt_base
-  linux_set_timezone_ntp
+  linux_setup_timezone_chrony
   linux_install_golang
   if [ ! -f "$APP_DIR/war.go" ]; then
     download_package
@@ -566,11 +633,12 @@ Jalankan war (langsung, tanpa download):
   ./war
 ============================================================
 EOF
+  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-v1"
 }
 
 do_install_linux() {
   linux_apt_base
-  linux_set_timezone_ntp
+  linux_setup_timezone_chrony
   # PHP CLI sengaja di-skip (fokus Golang di VPS)
   linux_install_golang
 
@@ -587,8 +655,10 @@ do_install_linux() {
 ✓ LINUX/VPS siap — WAR Golang di $APP_DIR
 
 Yang sudah dikonfigurasi:
-  • apt update + paket dasar (curl, tar, snapd)
-  • timezone Asia/Jakarta + NTP
+  • apt update + paket dasar (curl, tar, snapd, chrony)
+  • timezone Asia/Jakarta + Chrony (timesyncd dimatikan)
+  • waitsync correction <= ${CHRONY_MAX_CORRECTION}s, skew <= ${CHRONY_MAX_SKEW}ppm
+  • ./war --check-clock lulus
   • snap install go --classic
   • go mod download + go build → binary ./war
   • env permanen: $APP_DIR/wdp-env.sh (+ ~/.bashrc)
@@ -609,6 +679,7 @@ Update file dari GitHub:
   bash $APP_DIR/install.sh --update
 ============================================================
 EOF
+  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-v1"
 }
 
 # ----------------------------------------------------------------------

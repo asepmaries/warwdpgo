@@ -2,43 +2,60 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
+	"runtime"
+	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/valyala/fasthttp"
 )
 
 // ======================================================================
 // GOPAY MLBB WDP - WAR EDITION (GOLANG + FASTHTTP)
-// Target: MAX 5 users | MAX 10 retry | Warm-up 5 paralel | Timing akurat (mirip PHP)
+// Target: 4 user berbeda | Single salvo tanpa retry | 4 dedicated TLS lanes
 // ======================================================================
 
 const (
-	MAX_USERS                 = 5
-	MAX_RETRY_PER_USER        = 10
-	MAX_TOTAL_INQUIRIES       = 12 // Turunkan agar aman dari 429 (maksimal ~10-12 inquiry total)
-	MINI_PROBE2_LEAD_MS       = 1500
-	MINI_PROBE2_PARALLEL      = 5 // Samakan dengan MAX_USERS supaya semua koneksi warm
-	INQUIRY_TIMEOUT_MS        = 5200
-	PAYMENT_TIMEOUT_MS        = 5200
-	PREWAR_TEST_COUNT         = 8
-	TARGET_SRV_MS_DEFAULT     = -12.0 // target srv (ms setelah T=0) untuk dynamic lead
-	FINE_TUNE_START_BEFORE_MS = 12000 // H-12s: mulai fase fine-tune
-	FINE_TUNE_PROBE_INTERVAL  = 1000 * time.Millisecond
-	FINE_TUNE_PROBE_COUNT     = 8 // 8x @ 1/detik: H-12s → H-5s
+	MAX_USERS                  = 4
+	CAPTCHA_LEAD               = 10 * time.Second
+	CAPTCHA_TIMEOUT            = 5 * time.Second
+	PRECONNECT_LEAD            = 5 * time.Second
+	PRECONNECT_TIMEOUT         = 1500 * time.Millisecond
+	PREBUILD_LEAD              = 2 * time.Second
+	ARM_LEAD                   = 500 * time.Millisecond
+	MAX_RELEASE_LATE           = 20 * time.Millisecond
+	INQUIRY_TIMEOUT_MS         = 5200
+	PAYMENT_TIMEOUT_MS         = 5200
+	TRANSACTION_POLL_TIMEOUT   = 15 * time.Second
+	CLOCK_WAIT_MAX             = 30 * time.Second
+	CLOCK_OFFSET_LIMIT_DEFAULT = 5.0
+	CLOCK_RMS_LIMIT_DEFAULT    = 10.0
+	CLOCK_BOUND_LIMIT_DEFAULT  = 50.0
+	CLOCK_SKEW_LIMIT_PPM       = 100.0
+	MIN_FIXED_LEAD_MS          = -499
+	MAX_FIXED_LEAD_MS          = 499
+	PROGRAM_VERSION            = "2026.07.21-timing-v3"
 )
 
 // Pola error (sama persis dengan PHP)
@@ -69,34 +86,12 @@ var (
 
 // Global state (thread-safe)
 var (
-	mu             sync.Mutex
-	stopGlobal     bool
-	totalInquiries int
-	successMap     = make(map[string]SuccessEntry)
-	skipUsers      = make(map[string]bool)
-	regionBlocked  = make(map[string]bool)
-	attempts       = make(map[string]int)
-	eventLog       []Event
+	mu         sync.Mutex
+	successMap = make(map[string]SuccessEntry)
 
-	// Untuk summary timing (mirip PHP)
-	attemptStats    []AttemptStat
-	warStartWall    time.Time // Waktu target asli dari waktu.txt (T=0 sebelum lead)
-	warmupMedianRTT float64   // Median RTT dari warm-up probe (info)
-	warmupMinRTT    float64   // RTT min dari warm-up H-1.5s (untuk lead/ow_est)
-	fineTuneRTTs    []float64 // RTT fine-tune H-12..H-5 (fallback lead jika warm-up min spike)
-
-	// Kalibrasi jam server: serverWallMs = localWallMs + serverClockOffsetMs.
-	// Positif = jam server LEBIH CEPAT dari jam VPS (VPS ketinggalan).
-	serverClockOffsetMs float64
-	serverClockKnown    bool
+	attemptStats []AttemptStat
+	warStartWall time.Time
 )
-
-// clockSample: satu observasi jam server (detik dari header Date) terhadap
-// jam VPS pada momen response kira-kira dibuat server (start + rtt/2).
-type clockSample struct {
-	localMs float64 // instant pembuatan response menurut jam VPS (ms epoch)
-	sec     int64   // detik epoch dari header Date server
-}
 
 type Order struct {
 	UserID   string
@@ -106,47 +101,368 @@ type Order struct {
 type SuccessEntry struct {
 	Order   Order
 	OrderID string
-}
-
-type Event struct {
-	TRelMs float64
-	Label  string
+	Lane    *inquiryLane
 }
 
 type InquiryResult struct {
-	Status   string
-	OrderID  string
-	ErrMsg   string
-	HTTPCode int
-	RTTMs    float64
-}
-
-// AttemptStat untuk analisis timing & kalibrasi lead
-type AttemptStat struct {
-	User       string
-	Try        int
-	RTTMs      float64
-	FireOffset float64 // relative to target burst (ms)
+	Status     string
+	OrderID    string
+	ErrMsg     string
 	HTTPCode   int
-	Verdict    string
+	RTTMs      float64
+	CallAt     time.Time
+	DoneAt     time.Time
+	Transport  TransportSnapshot
+	CFRay      string
+	Via        string
+	UpstreamMS string
+	RetryAfter string
+	RateRemain string
+	RateLimit  string
 }
 
-// ===================== FASTHTTP CLIENT (MAX PERFORMANCE) =====================
-var fastClient *fasthttp.Client
+type AttemptStat struct {
+	User            string
+	RTTMs           float64
+	FireOffset      float64
+	WriteOffset     float64
+	FirstByteOffset float64
+	TTFBMs          float64
+	HTTPCode        int
+	Verdict         string
+	Reused          bool
+	ColdDial        bool
+	LateBlocked     bool
+	BytesWritten    int64
+}
 
-func initFastHTTPClient() {
-	fastClient = &fasthttp.Client{
-		MaxConnsPerHost:               150,
-		MaxIdleConnDuration:           120 * time.Second,
+// ===================== DEDICATED FASTHTTP LANES =====================
+
+const (
+	lanePhaseIdle int32 = iota
+	lanePhaseFinal
+)
+
+var (
+	telemetryEpoch = time.Now()
+	sharedDialer   = &fasthttp.TCPDialer{
+		Concurrency:      64,
+		DNSCacheDuration: 10 * time.Minute,
+	}
+	sharedTLSCache = tls.NewLRUClientSessionCache(32)
+	inquiryLanes   []*inquiryLane
+	sessionUA      string
+	sessionSecCH   string
+
+	errFinalWriteTooLate = errors.New("final inquiry diblokir: first write melewati batas keterlambatan")
+)
+
+type sessionCookieJar struct {
+	mu     sync.RWMutex
+	values map[string]string
+}
+
+func newSessionCookieJar() *sessionCookieJar {
+	return &sessionCookieJar{values: map[string]string{
+		"slug": "mobile-legends-bang-bang",
+	}}
+}
+
+func (j *sessionCookieJar) apply(h *fasthttp.RequestHeader) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	for key, value := range j.values {
+		if value != "" {
+			h.SetCookie(key, value)
+		}
+	}
+}
+
+func (j *sessionCookieJar) capture(h *fasthttp.ResponseHeader) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	h.VisitAllCookie(func(_, raw []byte) {
+		cookie := fasthttp.AcquireCookie()
+		defer fasthttp.ReleaseCookie(cookie)
+		if err := cookie.ParseBytes(raw); err != nil {
+			return
+		}
+		key := string(cookie.Key())
+		value := string(cookie.Value())
+		if key == "" {
+			return
+		}
+		expire := cookie.Expire()
+		if cookie.MaxAge() < 0 ||
+			(!expire.Equal(fasthttp.CookieExpireUnlimited) && expire.Before(time.Now())) {
+			delete(j.values, key)
+			return
+		}
+		if value == "" {
+			delete(j.values, key)
+			return
+		}
+		j.values[key] = value
+	})
+}
+
+type inquiryLane struct {
+	id        int
+	client    *fasthttp.HostClient
+	tlsConfig *tls.Config
+	cookies   *sessionCookieJar
+
+	phase atomic.Int32
+	seq   atomic.Int64
+
+	finalWriteNS    atomic.Int64
+	finalWriteEndNS atomic.Int64
+	finalFirstNS    atomic.Int64
+	finalConnID     atomic.Int64
+	finalBytes      atomic.Int64
+	coldDial        atomic.Bool
+	lateBlocked     atomic.Bool
+	writeAckOnce    sync.Once
+	writeAck        *sync.WaitGroup
+	warmConnID      int64
+	finalCutoff     time.Time
+
+	metaMu      sync.Mutex
+	remoteAddr  string
+	dialStartNS int64
+	dialEndNS   int64
+}
+
+type observedTLSConn struct {
+	*tls.Conn
+	lane   *inquiryLane
+	connID int64
+}
+
+type TransportSnapshot struct {
+	WriteAt      time.Time
+	WriteEndAt   time.Time
+	FirstByteAt  time.Time
+	RemoteAddr   string
+	ConnID       int64
+	WarmConnID   int64
+	Reused       bool
+	ColdDial     bool
+	LateBlocked  bool
+	BytesWritten int64
+	DialMs       float64
+}
+
+func telemetryNowNS() int64 {
+	return time.Since(telemetryEpoch).Nanoseconds()
+}
+
+func telemetryTime(ns int64) time.Time {
+	if ns <= 0 {
+		return time.Time{}
+	}
+	return telemetryEpoch.Add(time.Duration(ns))
+}
+
+func (c *observedTLSConn) Write(p []byte) (int, error) {
+	isFinal := c.lane.phase.Load() == lanePhaseFinal
+	if isFinal {
+		if err := c.lane.beginFinalWrite(c.connID, time.Now()); err != nil {
+			return 0, err
+		}
+	}
+
+	n, err := c.Conn.Write(p)
+	if isFinal {
+		if n > 0 {
+			c.lane.finalBytes.Add(int64(n))
+		}
+		c.lane.finalWriteEndNS.Store(telemetryNowNS())
+	}
+	return n, err
+}
+
+func (c *observedTLSConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 && c.lane.phase.Load() == lanePhaseFinal {
+		c.lane.finalFirstNS.CompareAndSwap(0, telemetryNowNS())
+	}
+	return n, err
+}
+
+func (l *inquiryLane) dialTLS(addr string, timeout time.Duration) (net.Conn, error) {
+	if timeout <= 0 {
+		timeout = time.Duration(INQUIRY_TIMEOUT_MS) * time.Millisecond
+	}
+	isFinal := l.phase.Load() == lanePhaseFinal
+	if isFinal {
+		l.coldDial.Store(true)
+		l.metaMu.Lock()
+		l.dialStartNS = telemetryNowNS()
+		l.dialEndNS = 0
+		l.remoteAddr = ""
+		l.metaMu.Unlock()
+
+		remaining := time.Until(l.finalCutoff)
+		if remaining <= 0 {
+			l.lateBlocked.Store(true)
+			l.markDialDone("")
+			return nil, errFinalWriteTooLate
+		}
+		if timeout > remaining {
+			timeout = remaining
+		}
+	}
+	deadline := time.Now().Add(timeout)
+
+	raw, err := sharedDialer.DialTimeout(addr, timeout)
+	if err != nil {
+		l.markDialDone("")
+		return nil, err
+	}
+
+	if time.Until(deadline) <= 0 {
+		raw.Close()
+		l.markDialDone("")
+		return nil, fmt.Errorf("TCP dial menghabiskan seluruh timeout %s", timeout)
+	}
+	if err := raw.SetDeadline(deadline); err != nil {
+		raw.Close()
+		l.markDialDone("")
+		return nil, err
+	}
+
+	tc := tls.Client(raw, l.tlsConfig.Clone())
+	if err := tc.Handshake(); err != nil {
+		raw.Close()
+		l.markDialDone("")
+		return nil, err
+	}
+	if isFinal && l.finalWriteIsLate(time.Now()) {
+		l.lateBlocked.Store(true)
+		tc.Close()
+		l.markDialDone("")
+		return nil, errFinalWriteTooLate
+	}
+	if err := tc.SetDeadline(time.Time{}); err != nil {
+		tc.Close()
+		l.markDialDone("")
+		return nil, err
+	}
+
+	connID := l.seq.Add(1)
+	l.markDialDone(tc.RemoteAddr().String())
+	return &observedTLSConn{Conn: tc, lane: l, connID: connID}, nil
+}
+
+func (l *inquiryLane) markDialDone(remote string) {
+	l.metaMu.Lock()
+	defer l.metaMu.Unlock()
+	l.dialEndNS = telemetryNowNS()
+	if remote != "" {
+		l.remoteAddr = remote
+	}
+}
+
+func (l *inquiryLane) armFinal(writeAck *sync.WaitGroup, cutoff time.Time) {
+	l.writeAck = writeAck
+	l.finalCutoff = cutoff
+	l.phase.Store(lanePhaseFinal)
+}
+
+func (l *inquiryLane) finishFinal() {
+	l.phase.Store(lanePhaseIdle)
+	l.ackFirstWrite()
+}
+
+func (l *inquiryLane) ackFirstWrite() {
+	l.writeAckOnce.Do(func() {
+		if l.writeAck != nil {
+			l.writeAck.Done()
+		}
+	})
+}
+
+func (l *inquiryLane) finalWriteIsLate(now time.Time) bool {
+	return !l.finalCutoff.IsZero() && now.After(l.finalCutoff)
+}
+
+func (l *inquiryLane) beginFinalWrite(connID int64, now time.Time) error {
+	if l.lateBlocked.Load() {
+		return errFinalWriteTooLate
+	}
+	if !l.finalWriteNS.CompareAndSwap(0, telemetryNowNS()) {
+		return nil
+	}
+	l.finalConnID.Store(connID)
+	// Ack saat fasthttp sudah memasuki plaintext TLS write. Jangan
+	// menahan lane lain bila kernel write pada lane ini tersendat.
+	l.ackFirstWrite()
+	if l.finalWriteIsLate(now) {
+		l.lateBlocked.Store(true)
+		return errFinalWriteTooLate
+	}
+	return nil
+}
+
+func (l *inquiryLane) snapshot() TransportSnapshot {
+	l.metaMu.Lock()
+	remote := l.remoteAddr
+	dialStart := l.dialStartNS
+	dialEnd := l.dialEndNS
+	l.metaMu.Unlock()
+
+	connID := l.finalConnID.Load()
+	s := TransportSnapshot{
+		WriteAt:      telemetryTime(l.finalWriteNS.Load()),
+		WriteEndAt:   telemetryTime(l.finalWriteEndNS.Load()),
+		FirstByteAt:  telemetryTime(l.finalFirstNS.Load()),
+		RemoteAddr:   remote,
+		ConnID:       connID,
+		WarmConnID:   l.warmConnID,
+		ColdDial:     l.coldDial.Load(),
+		LateBlocked:  l.lateBlocked.Load(),
+		BytesWritten: l.finalBytes.Load(),
+	}
+	s.Reused = connID != 0 && connID == l.warmConnID && !s.ColdDial
+	if dialStart > 0 && dialEnd >= dialStart {
+		s.DialMs = float64(dialEnd-dialStart) / float64(time.Millisecond)
+	}
+	return s
+}
+
+func newInquiryLane(id int) *inquiryLane {
+	lane := &inquiryLane{
+		id:      id,
+		cookies: newSessionCookieJar(),
+		tlsConfig: &tls.Config{
+			ServerName:         "gopay.co.id",
+			MinVersion:         tls.VersionTLS12,
+			NextProtos:         []string{"http/1.1"},
+			ClientSessionCache: sharedTLSCache,
+		},
+	}
+	lane.client = &fasthttp.HostClient{
+		Addr:                          "gopay.co.id:443",
+		IsTLS:                         true,
+		MaxConns:                      1,
+		MaxIdemponentCallAttempts:     1,
+		MaxIdleConnDuration:           30 * time.Second,
 		ReadTimeout:                   time.Duration(INQUIRY_TIMEOUT_MS) * time.Millisecond,
 		WriteTimeout:                  time.Duration(INQUIRY_TIMEOUT_MS) * time.Millisecond,
-		MaxConnWaitTimeout:            3 * time.Second,
+		MaxConnWaitTimeout:            0,
 		DisableHeaderNamesNormalizing: true,
 		DisablePathNormalizing:        true,
-		Dial: (&fasthttp.TCPDialer{
-			Concurrency:      2000,
-			DNSCacheDuration: 10 * time.Minute,
-		}).Dial,
+		DialTimeout:                   lane.dialTLS,
+	}
+	return lane
+}
+
+func initFastHTTPClients() {
+	sessionUA, sessionSecCH = getRandomUserAgent()
+	inquiryLanes = make([]*inquiryLane, MAX_USERS)
+	for i := range inquiryLanes {
+		inquiryLanes[i] = newInquiryLane(i + 1)
 	}
 }
 
@@ -186,91 +502,44 @@ func generateSentryTrace() (string, string) {
 	return trace, baggage
 }
 
-func formatMicrotimeNow() string {
-	now := time.Now()
-	return now.Format("15:04:05.000000")
-}
-
 // ===================== FILE HELPERS =====================
 
 func readLeadMs() int {
 	data, err := os.ReadFile("lead.txt")
 	if err != nil {
-		logf("[LEAD] lead.txt tidak ditemukan, pakai default 0ms\n")
-		return 0
+		log.Fatal("❌ lead.txt tidak ditemukan; fixed lead wajib tersedia")
 	}
-	var ms int
-	fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &ms)
+
+	values := strings.Fields(string(data))
+	if len(values) == 0 {
+		log.Fatal("❌ lead.txt kosong; isi satu angka milidetik, contoh -85")
+	}
+
+	ms, err := parseFixedLeadMs(values[0])
+	if err != nil {
+		log.Fatalf("❌ lead.txt tidak valid: %v", err)
+	}
+	if len(values) > 1 {
+		logf("[LEAD] ⚠️ lead.txt berisi %d nilai; VPS ini memakai nilai pertama: %+dms\n", len(values), ms)
+	}
 	return ms
 }
 
-// readTargetSrvMs membaca target srv (ms setelah T=0) dari target_srv.txt (fallback: target_arr.txt).
-func readTargetSrvMs() float64 {
-	for _, name := range []string{"target_srv.txt", "target_arr.txt"} {
-		data, err := os.ReadFile(name)
-		if err != nil {
-			continue
-		}
-		var v float64
-		if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%f", &v); err == nil {
-			return v
-		}
+func parseFixedLeadMs(value string) (int, error) {
+	parsed, err := strconv.ParseInt(value, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%q bukan integer milidetik: %w", value, err)
 	}
-	return TARGET_SRV_MS_DEFAULT
+	ms := int(parsed)
+	if ms < MIN_FIXED_LEAD_MS || ms > MAX_FIXED_LEAD_MS {
+		return 0, fmt.Errorf("%+dms di luar rentang aman [%+d,%+d]ms",
+			ms, MIN_FIXED_LEAD_MS, MAX_FIXED_LEAD_MS)
+	}
+	return ms, nil
 }
 
 func leadToExecTarget(target time.Time, leadMs int) time.Time {
-	if leadMs >= 0 {
-		return target.Add(time.Duration(leadMs) * time.Millisecond)
-	}
-	return target.Add(-time.Duration(-leadMs) * time.Millisecond)
-}
-
-func avgRTT(rtts []float64) float64 {
-	if len(rtts) == 0 {
-		return 0
-	}
-	var sum float64
-	for _, r := range rtts {
-		sum += r
-	}
-	return sum / float64(len(rtts))
-}
-
-// effectiveLeadRTT memilih RTT untuk ow_est / lead dinamis.
-// Default: warmupMinRTT. Jika warm-up T-1.5s spike (> rata-rata fine-tune), pakai rata-rata fine-tune.
-func effectiveLeadRTT() (rtt float64, usedFineTuneAvg bool) {
-	if warmupMinRTT <= 0 {
-		if warmupMedianRTT > 0 {
-			return warmupMedianRTT, false
-		}
-		return 0, false
-	}
-	ftAvg := avgRTT(fineTuneRTTs)
-	if ftAvg > 0 && warmupMinRTT > ftAvg {
-		return ftAvg, true
-	}
-	return warmupMinRTT, false
-}
-
-// resolveLeadMs: lead = target_srv - ow_est, ow_est = effectiveLeadRTT / 2.
-func resolveLeadMs(fallbackLeadMs int, targetSrv float64) int {
-	leadRTT, usedTune := effectiveLeadRTT()
-	owEst := leadRTT / 2.0
-	if owEst <= 0 {
-		logf("[LEAD] Warm-up RTT tidak tersedia → pakai lead.txt: %dms\n", fallbackLeadMs)
-		return fallbackLeadMs
-	}
-	dynamic := int(math.Round(targetSrv - owEst))
-	if usedTune {
-		logf("[LEAD] Dynamic: target_srv=+%.0fms | RTT_min=%.0fms > tune_avg=%.0fms → pakai tune_avg | ow_est=%.0fms → lead=%+dms\n",
-			targetSrv, warmupMinRTT, leadRTT, owEst, dynamic)
-	} else {
-		logf("[LEAD] Dynamic: target_srv=+%.0fms | RTT_min=%.0fms | ow_est=%.0fms → lead=%+dms\n",
-			targetSrv, warmupMinRTT, owEst, dynamic)
-	}
-	logf("[LEAD] (lead.txt=%dms hanya dipakai sebagai fallback)\n", fallbackLeadMs)
-	return dynamic
+	return target.Add(time.Duration(leadMs) * time.Millisecond)
 }
 
 func spinWaitUntil(t time.Time) {
@@ -292,6 +561,308 @@ func spinWaitUntil(t time.Time) {
 	}
 }
 
+type ClockHealth struct {
+	ReferenceID     string
+	LeapStatus      string
+	Stratum         int
+	SystemTimeSec   float64
+	RMSOffsetSec    float64
+	SkewPPM         float64
+	RootDelaySec    float64
+	RootDispSec     float64
+	EstimatedErrMs  float64
+	TrackingRawText string
+}
+
+type ClockLimits struct {
+	OffsetMs float64
+	RMSMs    float64
+	BoundMs  float64
+	SkewPPM  float64
+}
+
+var chronyNumberRE = regexp.MustCompile(`[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?`)
+
+func firstNumber(value string) (float64, error) {
+	match := chronyNumberRE.FindString(value)
+	if match == "" {
+		return 0, fmt.Errorf("angka tidak ditemukan pada %q", value)
+	}
+	return strconv.ParseFloat(match, 64)
+}
+
+func parseChronyTracking(raw string) (ClockHealth, error) {
+	var h ClockHealth
+	h.TrackingRawText = raw
+	found := make(map[string]bool)
+
+	for _, line := range strings.Split(raw, "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		value := strings.TrimSpace(parts[1])
+
+		switch key {
+		case "reference id":
+			fields := strings.Fields(value)
+			if len(fields) == 0 {
+				return ClockHealth{}, fmt.Errorf("reference ID kosong")
+			}
+			h.ReferenceID = fields[0]
+			found[key] = true
+		case "leap status":
+			h.LeapStatus = value
+			found[key] = true
+		case "stratum":
+			n, err := firstNumber(value)
+			if err != nil {
+				return ClockHealth{}, err
+			}
+			h.Stratum = int(n)
+			found[key] = true
+		case "system time":
+			n, err := firstNumber(value)
+			if err != nil {
+				return ClockHealth{}, err
+			}
+			h.SystemTimeSec = n
+			found[key] = true
+		case "rms offset":
+			n, err := firstNumber(value)
+			if err != nil {
+				return ClockHealth{}, err
+			}
+			h.RMSOffsetSec = n
+			found[key] = true
+		case "skew":
+			n, err := firstNumber(value)
+			if err != nil {
+				return ClockHealth{}, err
+			}
+			h.SkewPPM = n
+			found[key] = true
+		case "root delay":
+			n, err := firstNumber(value)
+			if err != nil {
+				return ClockHealth{}, err
+			}
+			h.RootDelaySec = n
+			found[key] = true
+		case "root dispersion":
+			n, err := firstNumber(value)
+			if err != nil {
+				return ClockHealth{}, err
+			}
+			h.RootDispSec = n
+			found[key] = true
+		}
+	}
+
+	for _, required := range []string{
+		"reference id", "leap status", "stratum", "system time", "rms offset", "skew",
+		"root delay", "root dispersion",
+	} {
+		if !found[required] {
+			return ClockHealth{}, fmt.Errorf("field chrony %q tidak ditemukan", required)
+		}
+	}
+
+	h.EstimatedErrMs = (math.Abs(h.SystemTimeSec) +
+		math.Abs(h.RootDispSec) +
+		math.Abs(h.RootDelaySec)/2) * 1000
+	return h, nil
+}
+
+func queryClockHealth(timeout time.Duration) (ClockHealth, error) {
+	if timeout <= 0 {
+		return ClockHealth{}, fmt.Errorf("budget query chrony habis")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	output, err := exec.CommandContext(ctx, "chronyc", "-n", "tracking").CombinedOutput()
+	if err != nil {
+		if ctx.Err() != nil {
+			return ClockHealth{}, fmt.Errorf("chronyc tracking timeout: %w", ctx.Err())
+		}
+		return ClockHealth{}, fmt.Errorf("chronyc tracking gagal: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return parseChronyTracking(string(output))
+}
+
+func clockLimits() ClockLimits {
+	return ClockLimits{
+		OffsetMs: readClockLimitEnv(
+			"WDP_MAX_CLOCK_OFFSET_MS",
+			CLOCK_OFFSET_LIMIT_DEFAULT,
+		),
+		RMSMs: readClockLimitEnv(
+			"WDP_MAX_CLOCK_RMS_MS",
+			CLOCK_RMS_LIMIT_DEFAULT,
+		),
+		BoundMs: readClockBoundLimit(),
+		SkewPPM: CLOCK_SKEW_LIMIT_PPM,
+	}
+}
+
+func readClockBoundLimit() float64 {
+	value := strings.TrimSpace(os.Getenv("WDP_MAX_CLOCK_BOUND_MS"))
+	name := "WDP_MAX_CLOCK_BOUND_MS"
+	if value == "" {
+		// Kompatibilitas konfigurasi timing-v2.
+		value = strings.TrimSpace(os.Getenv("WDP_MAX_CLOCK_ERROR_MS"))
+		name = "WDP_MAX_CLOCK_ERROR_MS"
+	}
+	if value == "" {
+		return CLOCK_BOUND_LIMIT_DEFAULT
+	}
+	limit, err := parseClockErrorLimitMs(value)
+	if err != nil {
+		log.Fatalf("❌ %s tidak valid: %v", name, err)
+	}
+	return limit
+}
+
+func readClockLimitEnv(name string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	limit, err := parseClockErrorLimitMs(value)
+	if err != nil {
+		log.Fatalf("❌ %s tidak valid: %v", name, err)
+	}
+	return limit
+}
+
+func parseClockErrorLimitMs(value string) (float64, error) {
+	limit, err := strconv.ParseFloat(value, 64)
+	if err != nil || limit <= 0 || math.IsNaN(limit) || math.IsInf(limit, 0) {
+		return 0, fmt.Errorf("%q wajib berupa angka finite > 0", value)
+	}
+	return limit, nil
+}
+
+func (h ClockHealth) verdict(limits ClockLimits) (bool, string) {
+	if !strings.EqualFold(strings.TrimSpace(h.LeapStatus), "Normal") {
+		return false, "Leap status bukan Normal"
+	}
+	refID := strings.ToUpper(strings.TrimPrefix(strings.TrimSpace(h.ReferenceID), "0X"))
+	switch refID {
+	case "", "00000000", "7F7F0101", "127.127.1.1", "127.0.0.1", "LOCAL", "LOCL":
+		return false, fmt.Sprintf("reference ID tidak valid/local: %q", h.ReferenceID)
+	}
+	if h.Stratum <= 0 || h.Stratum > 15 {
+		return false, fmt.Sprintf("stratum tidak sehat: %d", h.Stratum)
+	}
+	if math.Abs(h.SkewPPM) > limits.SkewPPM {
+		return false, fmt.Sprintf("skew %.3fppm melewati %.1fppm", math.Abs(h.SkewPPM), limits.SkewPPM)
+	}
+	if math.Abs(h.SystemTimeSec)*1000 > limits.OffsetMs {
+		return false, fmt.Sprintf("system time %.3fms melewati %.3fms", math.Abs(h.SystemTimeSec)*1000, limits.OffsetMs)
+	}
+	if math.Abs(h.RMSOffsetSec)*1000 > limits.RMSMs {
+		return false, fmt.Sprintf("RMS offset %.3fms melewati %.3fms", math.Abs(h.RMSOffsetSec)*1000, limits.RMSMs)
+	}
+	if h.EstimatedErrMs > limits.BoundMs {
+		return false, fmt.Sprintf("estimated clock error %.3fms melewati %.3fms", h.EstimatedErrMs, limits.BoundMs)
+	}
+	return true, "healthy"
+}
+
+func failClock(reason string) {
+	reason = strings.Join(strings.Fields(reason), " ")
+	fmt.Fprintf(os.Stderr, "__WDP_CLOCK_UNHEALTHY__ reason=%s\n", reason)
+	os.Exit(78)
+}
+
+func requireClockHealth(maxWait time.Duration) ClockHealth {
+	if runtime.GOOS != "linux" {
+		logf("[CLOCK] Platform %s: gate chrony dilewati untuk development; VPS Linux tetap wajib chrony.\n", runtime.GOOS)
+		return ClockHealth{LeapStatus: "development"}
+	}
+	if _, err := exec.LookPath("chronyc"); err != nil {
+		failClock("chronyc tidak ditemukan; jalankan ulang installer GitHub agar chrony terpasang")
+		return ClockHealth{}
+	}
+	if maxWait <= 0 {
+		failClock("budget verifikasi clock habis sebelum chrony dapat diperiksa; VPS dibatalkan")
+		return ClockHealth{}
+	}
+
+	limits := clockLimits()
+	deadline := time.Now().Add(maxWait)
+	var lastErr error
+	var lastHealth ClockHealth
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastHealth.LeapStatus != "" {
+				failClock(fmt.Sprintf(
+					"clock VPS tidak sehat: %v | leap=%s stratum=%d bound=%.3fms; VPS dibatalkan",
+					lastErr, lastHealth.LeapStatus, lastHealth.Stratum, lastHealth.EstimatedErrMs,
+				))
+				return ClockHealth{}
+			}
+			failClock(fmt.Sprintf("clock VPS tidak dapat diverifikasi dalam %s: %v", maxWait, lastErr))
+			return ClockHealth{}
+		}
+		queryTimeout := remaining
+		if queryTimeout > 2500*time.Millisecond {
+			queryTimeout = 2500 * time.Millisecond
+		}
+
+		health, err := queryClockHealth(queryTimeout)
+		if err == nil {
+			lastHealth = health
+			if ok, reason := health.verdict(limits); ok {
+				logf("[CLOCK] ✅ chrony sehat | ref=%s stratum=%d | system=%.3f/%.1fms | RMS=%.3f/%.1fms | skew=%.3f/%.1fppm | bound=%.3f/%.1fms\n",
+					health.ReferenceID,
+					health.Stratum,
+					math.Abs(health.SystemTimeSec)*1000,
+					limits.OffsetMs,
+					math.Abs(health.RMSOffsetSec)*1000,
+					limits.RMSMs,
+					math.Abs(health.SkewPPM),
+					limits.SkewPPM,
+					health.EstimatedErrMs,
+					limits.BoundMs)
+				return health
+			} else {
+				lastErr = fmt.Errorf("%s", reason)
+			}
+		} else {
+			lastErr = err
+		}
+
+		remaining = time.Until(deadline)
+		if remaining <= 0 {
+			if lastHealth.LeapStatus != "" {
+				failClock(fmt.Sprintf(
+					"clock VPS tidak sehat: %v | leap=%s stratum=%d bound=%.3fms; VPS dibatalkan",
+					lastErr, lastHealth.LeapStatus, lastHealth.Stratum, lastHealth.EstimatedErrMs,
+				))
+				return ClockHealth{}
+			}
+			failClock(fmt.Sprintf("clock VPS tidak dapat diverifikasi: %v", lastErr))
+			return ClockHealth{}
+		}
+		sleepFor := time.Second
+		if remaining < sleepFor {
+			sleepFor = remaining
+		}
+		time.Sleep(sleepFor)
+	}
+}
+
+func anchorMonotonic(targetWall time.Time) time.Time {
+	now := time.Now()
+	return now.Add(targetWall.Sub(now))
+}
+
 func readTargetTime() time.Time {
 	data, err := os.ReadFile("waktu.txt")
 	if err != nil {
@@ -299,10 +870,17 @@ func readTargetTime() time.Time {
 	}
 	content := strings.TrimSpace(string(data))
 
+	if target, err := time.Parse(time.RFC3339Nano, content); err == nil {
+		if !target.After(time.Now()) {
+			log.Fatalf("❌ Waktu absolut di waktu.txt sudah lewat: %s", content)
+		}
+		return target
+	}
+
 	re := regexp.MustCompile(`^(\d{1,2}):(\d{2})(?::(\d{2}))?$`)
 	m := re.FindStringSubmatch(content)
 	if m == nil {
-		log.Fatal("❌ Format waktu.txt salah!")
+		log.Fatal("❌ Format waktu.txt salah; gunakan HH:MM[:SS] atau RFC3339 ber-zona")
 	}
 
 	hour := atoi(m[1])
@@ -311,11 +889,23 @@ func readTargetTime() time.Time {
 	if len(m) > 3 && m[3] != "" {
 		second = atoi(m[3])
 	}
+	if hour > 23 || minute > 59 || second > 59 {
+		log.Fatalf("❌ Nilai waktu.txt di luar rentang: %s", content)
+	}
 
-	now := time.Now()
-	target := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, second, 0, time.Local)
+	zoneName := strings.TrimSpace(os.Getenv("WDP_TIMEZONE"))
+	if zoneName == "" {
+		zoneName = "Asia/Jakarta"
+	}
+	location, err := time.LoadLocation(zoneName)
+	if err != nil {
+		log.Fatalf("❌ Timezone %q tidak tersedia: %v", zoneName, err)
+	}
+
+	now := time.Now().In(location)
+	target := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, second, 0, location)
 	if target.Before(now) {
-		target = target.Add(24 * time.Hour)
+		target = time.Date(now.Year(), now.Month(), now.Day()+1, hour, minute, second, 0, location)
 	}
 	return target
 }
@@ -333,6 +923,7 @@ func loadOrders() []Order {
 	}
 
 	var orders []Order
+	seenUserIDs := make(map[string]bool)
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -340,21 +931,35 @@ func loadOrders() []Order {
 		}
 		parts := strings.Split(line, "|")
 		if len(parts) >= 2 {
-			orders = append(orders, Order{
+			order := Order{
 				UserID:   strings.TrimSpace(parts[0]),
 				ServerID: strings.TrimSpace(parts[1]),
-			})
+			}
+			if order.UserID == "" || order.ServerID == "" {
+				continue
+			}
+			if seenUserIDs[order.UserID] {
+				logf("[ORDER] ⚠️ User ID duplikat dalam VPS dilewati: %s|%s\n", order.UserID, order.ServerID)
+				continue
+			}
+			seenUserIDs[order.UserID] = true
+			orders = append(orders, order)
 		}
 	}
-	if len(orders) > MAX_USERS {
-		orders = orders[:MAX_USERS]
+	if len(orders) != MAX_USERS {
+		log.Fatalf("❌ VPS wajib memiliki tepat %d User ID berbeda; ditemukan %d", MAX_USERS, len(orders))
 	}
 	logf("✅ Loaded %d order(s) (max %d)\n", len(orders), MAX_USERS)
 	return orders
 }
 
+var outputFileMu sync.Mutex
+
 // appendToFile safely appends a line to a file (used for output files)
 func appendToFile(filename, content string) {
+	outputFileMu.Lock()
+	defer outputFileMu.Unlock()
+
 	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		logf("[WARN] Gagal buka %s: %v\n", filename, err)
@@ -376,14 +981,13 @@ func getFreshCaptcha(quiet bool) string {
 		log.Fatalf("Gagal baca reload.txt: %v", err)
 	}
 
-	_, secCh := getRandomUserAgent()
-
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	httpClient := &http.Client{Timeout: CAPTCHA_TIMEOUT}
 	req, _ := http.NewRequest("POST", "https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o", bytes.NewReader(reloadBody))
 	req.Header.Set("sec-ch-ua-platform", `"Android"`)
-	req.Header.Set("sec-ch-ua", secCh)
+	req.Header.Set("sec-ch-ua", sessionSecCH)
 	req.Header.Set("content-type", "application/x-protobuffer")
 	req.Header.Set("sec-ch-ua-mobile", "?1")
+	req.Header.Set("user-agent", sessionUA)
 	req.Header.Set("origin", "https://www.google.com")
 	req.Header.Set("x-requested-with", "mark.via.gp")
 	req.Header.Set("referer", "https://www.google.com/recaptcha/api2/anchor?ar=1&k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o&co=aHR0cHM6Ly9nb3BheS5jby5pZDo0NDM.&hl=en&v=79clEdOi5xQbrrpL2L8kGmK3&size=invisible&anchor-ms=20000&execute-ms=30000&cb=34spuflel6ax")
@@ -412,19 +1016,22 @@ func getFreshCaptcha(quiet bool) string {
 
 // ===================== BUILD HEADERS & BODY (untuk fasthttp) =====================
 
-func setInquiryHeaders(req *fasthttp.Request, captchaToken string) {
-	ua, secCh := getRandomUserAgent()
+func setInquiryHeaders(req *fasthttp.Request, captchaToken string, cookies *sessionCookieJar) {
 	trace, baggage := generateSentryTrace()
 
 	h := &req.Header
 	h.Set("sec-ch-ua-platform", `"Android"`)
 	h.Set("authorization", "Bearer undefined")
-	h.Set("sec-ch-ua", secCh)
+	h.Set("sec-ch-ua", sessionSecCH)
 	h.Set("sec-ch-ua-mobile", "?1")
 	h.Set("baggage", baggage)
 	h.Set("sentry-trace", trace)
-	h.Set("user-agent", ua)
-	h.Set("x-captcha-token", captchaToken)
+	h.Set("user-agent", sessionUA)
+	if captchaToken != "" {
+		h.Set("x-captcha-token", captchaToken)
+	} else {
+		h.Del("x-captcha-token")
+	}
 	h.Set("content-type", "application/json")
 	h.Set("x-client", "mobile")
 	h.Set("accept", "*/*")
@@ -436,7 +1043,9 @@ func setInquiryHeaders(req *fasthttp.Request, captchaToken string) {
 	h.Set("referer", "https://gopay.co.id/games/mobile-legends-bang-bang")
 	h.Set("accept-language", "en-US,en;q=0.9")
 	h.Set("x-timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
-	h.Set("cookie", "acw_tc=9581d31c17748587792257129e0deb0a34ec18f05b8a68459d00a474893677; slug=mobile-legends-bang-bang")
+	if cookies != nil {
+		cookies.apply(h)
+	}
 }
 
 func buildInquiryBody(order Order) []byte {
@@ -604,215 +1213,176 @@ func classifyInquiryResponse(code int, body []byte) (status string, orderID stri
 
 // ===================== DO INQUIRY (FASTHTTP - ZERO ALLOC STYLE) =====================
 
-// fillInquiryRequest mengisi sebuah *fasthttp.Request dengan URI, method, header,
-// dan body inquiry. Dipisah dari doInquiry supaya bisa dipanggil DI LUAR window
-// burst (pre-build) — semua kerja berat (crypto/rand untuk UA/sentry-trace,
-// json.Marshal body, ~20 fmt.Sprintf header) terjadi di sini, bukan di hot path.
-func fillInquiryRequest(req *fasthttp.Request, order Order, captchaToken string) {
+// fillInquiryRequest membangun request lengkap di luar hot path.
+func fillInquiryRequest(req *fasthttp.Request, order Order, captchaToken string, lane *inquiryLane) {
 	req.SetRequestURI("https://gopay.co.id/games/v1/order/inquiry")
 	req.Header.SetMethod("POST")
-	setInquiryHeaders(req, captchaToken)
+	setInquiryHeaders(req, captchaToken, lane.cookies)
 	req.SetBody(buildInquiryBody(order))
 }
 
-// prebuiltReqs menyimpan satu *fasthttp.Request siap-tembak per user untuk SALVO #1.
-// Dibangun saat warmup (lihat prebuildInquiryRequests) sehingga di T=0 hot path
-// hanya menjalankan fastClient.Do() murni — tidak ada alokasi/crypto di jalur kritis.
-var (
-	prebuiltReqs   = make(map[string]*fasthttp.Request)
-	prebuiltReqsMu sync.Mutex
-)
+type prebuiltInquiry struct {
+	Order   Order
+	Request *fasthttp.Request
+	Lane    *inquiryLane
+}
 
-func orderKey(o Order) string { return o.UserID + "|" + o.ServerID }
+func prebuildInquiryRequests(orders []Order, captchaToken string) []prebuiltInquiry {
+	if len(orders) != len(inquiryLanes) {
+		log.Fatalf("❌ Jumlah order (%d) tidak cocok dengan dedicated lane (%d)", len(orders), len(inquiryLanes))
+	}
 
-// prebuildInquiryRequests membangun request salvo-1 untuk semua order memakai
-// captcha final. Harus dipanggil SETELAH captcha terakhir di-refresh dan SEBELUM
-// burst (idealnya di dalam window warmup yang masih punya budget waktu).
-func prebuildInquiryRequests(orders []Order, captchaToken string) {
-	prebuiltReqsMu.Lock()
-	defer prebuiltReqsMu.Unlock()
-	for _, o := range orders {
+	prebuilt := make([]prebuiltInquiry, 0, len(orders))
+	for i, o := range orders {
 		req := fasthttp.AcquireRequest()
-		fillInquiryRequest(req, o, captchaToken)
-		prebuiltReqs[orderKey(o)] = req
+		lane := inquiryLanes[i]
+		fillInquiryRequest(req, o, captchaToken, lane)
+		prebuilt = append(prebuilt, prebuiltInquiry{Order: o, Request: req, Lane: lane})
 	}
+	return prebuilt
 }
 
-// doInquiryPrebuilt menembak memakai request yang sudah dibangun sebelumnya (salvo #1).
-// Mengembalikan ok=false jika tidak ada prebuilt untuk order ini (fallback ke doInquiry).
-func doInquiryPrebuilt(order Order) (InquiryResult, bool) {
-	prebuiltReqsMu.Lock()
-	req := prebuiltReqs[orderKey(order)]
-	delete(prebuiltReqs, orderKey(order)) // sekali pakai; retry berikutnya rebuild fresh
-	prebuiltReqsMu.Unlock()
-	if req == nil {
-		return InquiryResult{}, false
-	}
-	defer fasthttp.ReleaseRequest(req)
-
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseResponse(resp)
-
-	start := time.Now()
-	err := fastClient.DoTimeout(req, resp, time.Duration(INQUIRY_TIMEOUT_MS)*time.Millisecond)
-	rtt := time.Since(start).Seconds() * 1000
-	if err != nil {
-		return InquiryResult{Status: "retry", ErrMsg: err.Error(), RTTMs: rtt}, true
-	}
-	code := resp.StatusCode()
-	status, orderID, errMsg := classifyInquiryResponse(code, resp.Body())
-	return InquiryResult{Status: status, OrderID: orderID, ErrMsg: errMsg, HTTPCode: code, RTTMs: rtt}, true
-}
-
-func doInquiry(order Order, captchaToken string, attempt int) InquiryResult {
-	req := fasthttp.AcquireRequest()
-	defer fasthttp.ReleaseRequest(req)
-
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseResponse(resp)
-
-	fillInquiryRequest(req, order, captchaToken)
-
-	start := time.Now()
-	err := fastClient.DoTimeout(req, resp, time.Duration(INQUIRY_TIMEOUT_MS)*time.Millisecond)
-	rtt := time.Since(start).Seconds() * 1000
-
-	if err != nil {
-		return InquiryResult{Status: "retry", ErrMsg: err.Error(), RTTMs: rtt}
-	}
-
-	code := resp.StatusCode()
-	body := resp.Body()
-	status, orderID, errMsg := classifyInquiryResponse(code, body)
-
-	return InquiryResult{
-		Status:   status,
-		OrderID:  orderID,
-		ErrMsg:   errMsg,
-		HTTPCode: code,
-		RTTMs:    rtt,
-	}
-}
-
-// ===================== KALIBRASI JAM SERVER =====================
-
-// probeServerDate menembak endpoint inquiry (tidak konsumsi voucher saat pre-war)
-// lalu membaca header Date untuk mengukur jam server. Mengembalikan instant
-// pembuatan response menurut jam VPS (start + rtt/2) dan detik epoch server.
-func probeServerDate(order Order, captchaToken string) (serverGenLocalMs float64, dateSec int64, ok bool) {
-	req := fasthttp.AcquireRequest()
-	defer fasthttp.ReleaseRequest(req)
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseResponse(resp)
-
-	req.SetRequestURI("https://gopay.co.id/games/v1/order/inquiry")
-	req.Header.SetMethod("POST")
-	setInquiryHeaders(req, captchaToken)
-	req.SetBody(buildInquiryBody(order))
-
-	start := time.Now()
-	err := fastClient.DoTimeout(req, resp, time.Duration(INQUIRY_TIMEOUT_MS)*time.Millisecond)
-	rtt := time.Since(start)
-	if err != nil {
-		return 0, 0, false
-	}
-
-	dateBytes := resp.Header.Peek("Date")
-	if len(dateBytes) == 0 {
-		return 0, 0, false
-	}
-	t, perr := http.ParseTime(string(dateBytes))
-	if perr != nil {
-		return 0, 0, false
-	}
-
-	// Perkiraan momen server membuat response, diukur pakai jam VPS.
-	genLocal := start.Add(rtt / 2)
-	serverGenLocalMs = float64(genLocal.UnixNano()) / 1e6
-	return serverGenLocalMs, t.Unix(), true
-}
-
-// computeClockOffset mendeteksi pergantian detik (rollover) pada header Date
-// untuk menentukan batas detik server secara presisi sub-detik, lalu menetapkan
-// serverClockOffsetMs. Header Date hanya presisi detik, jadi titik rollover
-// (saat detik berganti) adalah satu-satunya cara mendapat akurasi milidetik.
-func computeClockOffset(samples []clockSample) {
-	if len(samples) < 2 {
-		logf("[CLOCK] Sampel kurang (%d) — pakai jam VPS apa adanya.\n", len(samples))
-		return
-	}
-
-	var offsets []float64
-	for i := 1; i < len(samples); i++ {
-		// Hanya pakai pergantian tepat +1 detik (rollover bersih, tanpa gap).
-		if samples[i].sec != samples[i-1].sec+1 {
-			continue
-		}
-		// Batas detik server berada di antara dua sampel; ambil titik tengah.
-		boundaryLocal := (samples[i-1].localMs + samples[i].localMs) / 2.0
-		// Pada momen itu jam server tepat = sec * 1000 ms.
-		off := float64(samples[i].sec)*1000.0 - boundaryLocal
-		offsets = append(offsets, off)
-	}
-
-	if len(offsets) == 0 {
-		logf("[CLOCK] Tidak ada rollover detik terdeteksi — pakai jam VPS apa adanya.\n")
-		return
-	}
-
-	sort.Float64s(offsets)
-	med := offsets[len(offsets)/2]
-	serverClockOffsetMs = med
-	serverClockKnown = true
-
-	hint := "jam VPS akurat"
-	if med > 20 {
-		hint = "jam VPS KETINGGALAN dari server → burst dimajukan otomatis"
-	} else if med < -20 {
-		hint = "jam VPS KECEPETAN dari server → burst dimundurkan otomatis"
-	}
-	logf("[CLOCK] Offset jam server vs VPS: %+.0fms (dari %d rollover) — %s\n", med, len(offsets), hint)
-}
-
-// ===================== ADAPTIVE INQUIRY =====================
-
-// processInquiryResult mencatat statistik, menyusun log, dan menerapkan verdict
-// (success/stop/skip/region/retry) untuk satu attempt. Mengembalikan done=true
-// bila goroutine harus berhenti (tidak retry lagi). Dipakai bersama oleh salvo-1
-// dan retry supaya tidak ada duplikasi logika.
-//
-// srv = fire + ow, ow = min(RTT_burst/2, RTT_med_warmup/2) — metrik utama timing war.
-func processInquiryResult(order Order, k string, attempt int, fireTime time.Time, result InquiryResult) bool {
-	fireOffset := 0.0
-	if !warStartWall.IsZero() {
-		fireOffset = float64(fireTime.Sub(warStartWall).Milliseconds())
-	}
-
-	// === Perhitungan LAMA (dipertahankan apa adanya: srv & ow) ===
-	currentOneWay := result.RTTMs / 2.0
-	oneWay := currentOneWay
-	if warmupMedianRTT > 0 {
-		warmOneWay := warmupMedianRTT / 2.0
-		if warmOneWay < oneWay {
-			oneWay = warmOneWay
+func responseHeaderString(h *fasthttp.ResponseHeader, names ...string) string {
+	for _, name := range names {
+		if value := h.Peek(name); len(value) > 0 {
+			return string(value)
 		}
 	}
-	srvArrival := fireOffset + oneWay
+	return ""
+}
+
+func doInquiryPrebuilt(item prebuiltInquiry, deadline time.Time) InquiryResult {
+	defer fasthttp.ReleaseRequest(item.Request)
+
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	callAt := time.Now()
+	err := item.Lane.client.DoDeadline(item.Request, resp, deadline)
+	doneAt := time.Now()
+
+	transport := item.Lane.snapshot()
+	item.Lane.finishFinal()
+
+	result := InquiryResult{
+		RTTMs:     durationMs(doneAt.Sub(callAt)),
+		CallAt:    callAt,
+		DoneAt:    doneAt,
+		Transport: transport,
+	}
+	if err != nil {
+		result.Status = "retry"
+		result.ErrMsg = err.Error()
+		return result
+	}
+
+	item.Lane.cookies.capture(&resp.Header)
+	result.HTTPCode = resp.StatusCode()
+	result.CFRay = responseHeaderString(&resp.Header, "cf-ray", "CF-Ray")
+	result.Via = responseHeaderString(&resp.Header, "via", "Via")
+	result.UpstreamMS = responseHeaderString(&resp.Header, "x-envoy-upstream-service-time", "X-Envoy-Upstream-Service-Time")
+	result.RetryAfter = responseHeaderString(&resp.Header, "retry-after", "Retry-After")
+	result.RateRemain = responseHeaderString(&resp.Header, "x-retry-remaining", "X-Retry-Remaining")
+	result.RateLimit = responseHeaderString(&resp.Header, "x-ratelimit-limit", "X-RateLimit-Limit")
+	result.Status, result.OrderID, result.ErrMsg = classifyInquiryResponse(resp.StatusCode(), resp.Body())
+	return result
+}
+
+// ===================== SINGLE SALVO INQUIRY =====================
+
+func durationMs(d time.Duration) float64 {
+	return float64(d) / float64(time.Millisecond)
+}
+
+func offsetMs(at, target time.Time) float64 {
+	if at.IsZero() || target.IsZero() {
+		return 0
+	}
+	return durationMs(at.Sub(target))
+}
+
+func registerInquirySuccess(order Order, result InquiryResult, lane *inquiryLane) (SuccessEntry, bool) {
+	if result.Status != "success" || result.OrderID == "" {
+		return SuccessEntry{}, false
+	}
+	key := order.UserID + "|" + order.ServerID
+	entry := SuccessEntry{Order: order, OrderID: result.OrderID, Lane: lane}
+	mu.Lock()
+	successMap[key] = entry
+	mu.Unlock()
+	return entry, true
+}
+
+// recordInquiryResult hanya mencatat observasi client-side. Tidak ada lagi
+// estimasi "server arrival" dari RTT/2 karena itu bukan timestamp origin.
+func recordInquiryResult(order Order, k string, result InquiryResult) {
+	callOffset := offsetMs(result.CallAt, warStartWall)
+	writeOffset := offsetMs(result.Transport.WriteAt, warStartWall)
+	writeEndOffset := offsetMs(result.Transport.WriteEndAt, warStartWall)
+	firstByteOffset := offsetMs(result.Transport.FirstByteAt, warStartWall)
+	if result.Transport.WriteAt.IsZero() {
+		writeOffset = callOffset
+	}
+	if result.Transport.WriteEndAt.IsZero() {
+		writeEndOffset = writeOffset
+	}
+	fireOffset := writeOffset
+
+	acquireMs := 0.0
+	writeDurationMs := 0.0
+	ttfbMs := 0.0
+	if !result.Transport.WriteAt.IsZero() {
+		acquireMs = durationMs(result.Transport.WriteAt.Sub(result.CallAt))
+	}
+	if !result.Transport.WriteAt.IsZero() && !result.Transport.WriteEndAt.IsZero() {
+		writeDurationMs = durationMs(result.Transport.WriteEndAt.Sub(result.Transport.WriteAt))
+	}
+	if !result.Transport.WriteEndAt.IsZero() && !result.Transport.FirstByteAt.IsZero() {
+		ttfbMs = durationMs(result.Transport.FirstByteAt.Sub(result.Transport.WriteEndAt))
+	}
 
 	mu.Lock()
 	attemptStats = append(attemptStats, AttemptStat{
-		User:       k,
-		Try:        attempt,
-		RTTMs:      result.RTTMs,
-		FireOffset: fireOffset,
-		HTTPCode:   result.HTTPCode,
-		Verdict:    result.Status,
+		User:            k,
+		RTTMs:           result.RTTMs,
+		FireOffset:      fireOffset,
+		WriteOffset:     writeOffset,
+		FirstByteOffset: firstByteOffset,
+		TTFBMs:          ttfbMs,
+		HTTPCode:        result.HTTPCode,
+		Verdict:         result.Status,
+		Reused:          result.Transport.Reused,
+		ColdDial:        result.Transport.ColdDial,
+		LateBlocked:     result.Transport.LateBlocked,
+		BytesWritten:    result.Transport.BytesWritten,
 	})
-	attempts[k] = attempt
+	mu.Unlock()
 
-	tRel := float64(time.Since(warStartWall).Milliseconds())
-	detailTag := fmt.Sprintf("[+%6.1fms][%s][try %d/%d][rtt %.0fms][srv%+.0fms][HTTP %d][fire%+.0fms][ow %.0fms]",
-		tRel, k, attempt, MAX_RETRY_PER_USER+1, result.RTTMs, srvArrival, result.HTTPCode, fireOffset, oneWay)
+	tRel := durationMs(time.Since(warStartWall))
+	connState := "cold"
+	if result.Transport.Reused {
+		connState = "reused"
+	} else if result.Transport.ColdDial {
+		connState = "reconnected"
+	}
+	if result.Transport.LateBlocked {
+		connState = "late-blocked"
+	}
+	remote := result.Transport.RemoteAddr
+	if remote == "" {
+		remote = "unknown"
+	}
+	fireText := "n/a"
+	writeEndText := "n/a"
+	if result.Transport.BytesWritten > 0 {
+		fireText = fmt.Sprintf("%+.3fms", fireOffset)
+		writeEndText = fmt.Sprintf("%+.3fms", writeEndOffset)
+	}
+	detailTag := fmt.Sprintf(
+		"[+%7.3fms][%s][try 1/1][rtt %.3fms][HTTP %d][fire %s][call%+.3fms][write-end %s][bytes %d][acquire %.3fms][write-dur %.3fms][ttfb %.3fms][conn %s][remote %s]",
+		tRel, k, result.RTTMs, result.HTTPCode, fireText, callOffset,
+		writeEndText, result.Transport.BytesWritten, acquireMs, writeDurationMs, ttfbMs, connState, remote,
+	)
 
 	shortErr := truncateRunes(result.ErrMsg, 80)
 	if shortErr == "" {
@@ -820,127 +1390,141 @@ func processInquiryResult(order Order, k string, attempt int, fireTime time.Time
 	}
 
 	var logLines []string
-	done := false
 
 	switch result.Status {
 	case "success":
-		successMap[k] = SuccessEntry{Order: order, OrderID: result.OrderID}
 		logLines = append(logLines, fmt.Sprintf("%s ✅ OrderID: %s", detailTag, result.OrderID))
-		done = true
 
 	case "stop":
-		stopGlobal = true
-		logLines = append(logLines,
-			fmt.Sprintf("%s ⚠️ stop: %s", detailTag, shortErr),
-			"🛑 STOP GLOBAL: voucher habis terdeteksi. Batalkan semua retry.")
-		done = true
+		logLines = append(logLines, fmt.Sprintf("%s ⚠️ stop: %s", detailTag, shortErr))
 
 	case "skip_user":
-		skipUsers[k] = true
 		logLines = append(logLines,
 			fmt.Sprintf("%s ⚠️ skip_user: %s", detailTag, shortErr),
-			fmt.Sprintf("[%s] ⏭️ SKIP USER: sudah pernah claim, tidak retry.", k))
-		done = true
+			fmt.Sprintf("[%s] ⏭️ SKIP USER: sudah pernah claim.", k))
 
 	case "user_invalid":
-		// User ID salah (Error_Role_Null dll), jangan dianggap sebagai limit/redeem
 		logLines = append(logLines,
 			fmt.Sprintf("%s ❌ user_invalid: %s", detailTag, shortErr),
-			fmt.Sprintf("[%s] ❌ USER ID SALAH: tidak retry.", k))
-		done = true
+			fmt.Sprintf("[%s] ❌ USER ID SALAH.", k))
 
 	case "region_block":
-		regionBlocked[k] = true
 		logLines = append(logLines,
 			fmt.Sprintf("%s ⚠️ region_block: %s", detailTag, shortErr),
-			fmt.Sprintf("[%s] 🌐 USER ID DILUAR REGION: tidak retry.", k))
-		done = true
+			fmt.Sprintf("[%s] 🌐 USER ID DILUAR REGION.", k))
 
 	default:
-		if attempt > MAX_RETRY_PER_USER {
-			logLines = append(logLines, fmt.Sprintf("%s ⛔ max retry tercapai", detailTag))
-			done = true
-		} else {
-			logLines = append(logLines, fmt.Sprintf("%s ⚠️ %s: %s → retry", detailTag, result.Status, shortErr))
-		}
+		logLines = append(logLines, fmt.Sprintf("%s ⚠️ %s: %s → final single-shot", detailTag, result.Status, shortErr))
 	}
-	mu.Unlock()
+
+	edgeParts := make([]string, 0, 6)
+	if result.CFRay != "" {
+		edgeParts = append(edgeParts, "cf-ray="+result.CFRay)
+	}
+	if result.UpstreamMS != "" {
+		edgeParts = append(edgeParts, "upstream-ms="+result.UpstreamMS)
+	}
+	if result.RateRemain != "" {
+		edgeParts = append(edgeParts, "remaining="+result.RateRemain)
+	}
+	if result.RateLimit != "" {
+		edgeParts = append(edgeParts, "limit="+result.RateLimit)
+	}
+	if result.RetryAfter != "" {
+		edgeParts = append(edgeParts, "retry-after="+result.RetryAfter)
+	}
+	if result.Via != "" {
+		edgeParts = append(edgeParts, "via="+truncateRunes(result.Via, 120))
+	}
+	if len(edgeParts) > 0 {
+		logLines = append(logLines, fmt.Sprintf("[%s][EDGE] %s", k, strings.Join(edgeParts, " | ")))
+	}
 
 	for _, ln := range logLines {
 		logf("%s\n", ln)
 	}
-	return done
 }
 
-func runAdaptiveInquiry(orders []Order, captchaToken string) []SuccessEntry {
-	var wg sync.WaitGroup
+type singleSalvo struct {
+	startCh    chan struct{}
+	postFireCh chan struct{}
+	jobs       []prebuiltInquiry
+	deadline   time.Time
+	done       sync.WaitGroup
+	writeAck   sync.WaitGroup
+	payments   *paymentPipeline
+}
+
+func prepareSingleSalvo(prebuilt []prebuiltInquiry, payments *paymentPipeline, deadline time.Time) *singleSalvo {
+	salvo := &singleSalvo{
+		startCh:    make(chan struct{}),
+		postFireCh: make(chan struct{}),
+		jobs:       prebuilt,
+		deadline:   deadline,
+		payments:   payments,
+	}
 	key := func(o Order) string { return o.UserID + "|" + o.ServerID }
 
-	// Broadcast-release barrier: semua goroutine salvo-1 di-spawn LEBIH DULU, lalu
-	// blok di <-startCh. Saat semua siap, close(startCh) melepas kelimanya pada
-	// instant yang sama — meniadakan jitter "goroutine #1 nembak sebelum #5 lahir".
-	startCh := make(chan struct{})
 	var ready sync.WaitGroup
-	ready.Add(len(orders))
+	ready.Add(len(prebuilt))
 
-	for _, ord := range orders {
-		wg.Add(1)
-		go func(order Order) {
-			defer wg.Done()
+	for _, job := range prebuilt {
+		salvo.done.Add(1)
+		go func(item prebuiltInquiry) {
+			defer salvo.done.Done()
+			order := item.Order
 			k := key(order)
 
-			for attempt := 1; attempt <= MAX_RETRY_PER_USER+1; attempt++ {
-				mu.Lock()
-				skip := stopGlobal || successMap[k] != (SuccessEntry{}) || skipUsers[k] || regionBlocked[k] || totalInquiries >= MAX_TOTAL_INQUIRIES
-				if !skip {
-					totalInquiries++
-				}
-				mu.Unlock()
+			ready.Done()
+			<-salvo.startCh
 
-				if skip {
-					if attempt == 1 {
-						ready.Done() // tetap lepaskan barrier walau goroutine ini batal
-					}
-					return
-				}
+			result := doInquiryPrebuilt(item, salvo.deadline)
+			<-salvo.postFireCh
 
-				var (
-					result   InquiryResult
-					fireTime time.Time
-				)
-				if attempt == 1 {
-					// Salvo #1: signal siap, tunggu barrier, lalu tembak prebuilt
-					// request. Hot path murni Do() — tanpa alokasi/crypto/build.
-					ready.Done()
-					<-startCh
-					fireTime = time.Now()
-					if r, ok := doInquiryPrebuilt(order); ok {
-						result = r
-					} else {
-						result = doInquiry(order, captchaToken, attempt)
-					}
-				} else {
-					// Retry: jalan secepatnya tanpa barrier, build request fresh.
-					fireTime = time.Now()
-					result = doInquiry(order, captchaToken, attempt)
-				}
-
-				if processInquiryResult(order, k, attempt, fireTime, result) {
-					return
-				}
-
-				time.Sleep(3 * time.Millisecond) // refire sangat cepat (PHP style)
+			if entry, ok := registerInquirySuccess(order, result, item.Lane); ok {
+				salvo.payments.submit(entry)
 			}
-		}(ord)
+			recordInquiryResult(order, k, result)
+		}(job)
 	}
 
-	// Lepas barrier: tunggu kelima goroutine selesai build & siap, lalu close.
 	ready.Wait()
-	logf("🔫 RELEASE barrier: %d user lepas bersamaan @ [%s]\n", len(orders), formatMicrotimeNow())
-	close(startCh)
+	return salvo
+}
 
-	wg.Wait()
+func armSingleSalvo(salvo *singleSalvo, execTarget time.Time) {
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	cutoff := execTarget.Add(MAX_RELEASE_LATE)
+	salvo.writeAck.Add(len(salvo.jobs))
+	for _, job := range salvo.jobs {
+		job.Request.Header.Set("x-timestamp", timestamp)
+		job.Lane.armFinal(&salvo.writeAck, cutoff)
+	}
+}
 
+func fireSingleSalvo(salvo *singleSalvo, execTarget time.Time, orderCount int) []SuccessEntry {
+	spinWaitUntil(execTarget)
+
+	releasedAt := time.Now()
+	if late := releasedAt.Sub(execTarget); late > MAX_RELEASE_LATE {
+		log.Fatalf("❌ Release terlambat %.3fms (batas %.3fms); VPS ini dibatalkan agar tidak mengirim salvo jauh dari target",
+			durationMs(late), durationMs(MAX_RELEASE_LATE))
+	}
+	close(salvo.startCh)
+	salvo.writeAck.Wait()
+	allWritesAt := time.Now()
+	close(salvo.postFireCh)
+
+	logf("🚀 SINGLE SALVO RELEASE: %d user lepas bersamaan @ [%s]\n",
+		orderCount, releasedAt.Format("15:04:05.000000"))
+	logf("[TIMING] release=%+.3fms | seluruh lane memasuki first TLS application write dalam %.3fms | tidak ada log/file I/O di antaranya\n",
+		durationMs(releasedAt.Sub(execTarget)),
+		durationMs(allWritesAt.Sub(releasedAt)))
+
+	salvo.done.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
 	var results []SuccessEntry
 	for _, v := range successMap {
 		results = append(results, v)
@@ -950,260 +1534,306 @@ func runAdaptiveInquiry(orders []Order, captchaToken string) []SuccessEntry {
 
 // ===================== PAYMENT (FASTHTTP) =====================
 
-func runParallelPayment(successes []SuccessEntry) int {
-	if len(successes) == 0 {
-		return 0
-	}
-
-	var wg sync.WaitGroup
-	successCount := 0
-	var muPay sync.Mutex
-
-	for _, entry := range successes {
-		wg.Add(1)
-		go func(e SuccessEntry) {
-			defer wg.Done()
-			k := e.Order.UserID + "|" + e.Order.ServerID
-			orderID := e.OrderID
-			// Fix: pakai SHA256 seperti di PHP
-			hash := sha256.Sum256([]byte(orderID))
-			ref := hex.EncodeToString(hash[:])[:32]
-
-			req := fasthttp.AcquireRequest()
-			defer fasthttp.ReleaseRequest(req)
-			resp := fasthttp.AcquireResponse()
-			defer fasthttp.ReleaseResponse(resp)
-
-			payBody, _ := json.Marshal(map[string]interface{}{
-				"orderId":            orderID,
-				"paymentChannelId":   73,
-				"phoneNumber":        "628783219212",
-				"paymentPhoneNumber": "",
-				"quantity":           1,
-				"invoiceUrl":         "https://gopay.co.id/games/payment/",
-			})
-
-			req.SetRequestURI("https://gopay.co.id/games/v1/order/payment")
-			req.Header.SetMethod("POST")
-			setInquiryHeaders(req, "") // base headers
-			req.Header.Set("x-timestamp", fmt.Sprintf("%d", time.Now().UnixMilli()))
-			req.Header.Set("x-request-reference", ref)
-			req.Header.Set("x-request-id", ref)
-			req.Header.Set("idempotency-key", ref)
-			req.Header.Del("x-captcha-token")
-			req.SetBody(payBody)
-
-			if err := fastClient.DoTimeout(req, resp, time.Duration(PAYMENT_TIMEOUT_MS)*time.Millisecond); err != nil {
-				logf("[%s] Payment error: %v\n", k, err)
-				return
-			}
-			if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
-				payErr := truncateRunes(extractApiErrorMessage(resp.Body()), 120)
-				if payErr != "" {
-					logf("[%s] Payment HTTP %d - %s\n", k, resp.StatusCode(), payErr)
-				} else {
-					logf("[%s] Payment HTTP %d\n", k, resp.StatusCode())
-				}
-				return
-			}
-
-			var payRes map[string]interface{}
-			json.Unmarshal(resp.Body(), &payRes)
-			txnID, _ := payRes["data"].(string)
-			if txnID == "" {
-				return
-			}
-
-			txnData := getTransactionUntilReady(txnID)
-			if txnData != nil {
-				payURL := ""
-				if ap, ok := txnData["actionPayment"].(map[string]interface{}); ok {
-					if pd, ok := ap["paymentDirect"].(string); ok {
-						payURL = pd
-					} else if dr, ok := ap["deeplinkRedirect"].(string); ok {
-						payURL = dr
-					}
-				}
-				appendToFile("transaksi_url.txt", fmt.Sprintf("%s|%s\n", k, "https://gopay.co.id/games/payment/"+txnID))
-				appendToFile("deeplinks.txt", payURL+"\n")
-				appendToFile("order_ids.txt", fmt.Sprintf("%s|%s|%s\n", k, orderID, payURL))
-
-				logf("[%s] ✅ SUCCESS | Pay URL tersedia\n", k)
-				muPay.Lock()
-				successCount++
-				muPay.Unlock()
-			}
-		}(entry)
-	}
-	wg.Wait()
-	return successCount
+type paymentPipeline struct {
+	jobs    chan SuccessEntry
+	workers sync.WaitGroup
+	success atomic.Int32
 }
 
-func getTransactionUntilReady(txnID string) map[string]interface{} {
+func startPaymentPipeline() *paymentPipeline {
+	p := &paymentPipeline{jobs: make(chan SuccessEntry, MAX_USERS)}
+	for i := 0; i < MAX_USERS; i++ {
+		p.workers.Add(1)
+		go func() {
+			defer p.workers.Done()
+			for entry := range p.jobs {
+				if processPayment(entry) {
+					p.success.Add(1)
+				}
+			}
+		}()
+	}
+	return p
+}
+
+func (p *paymentPipeline) submit(entry SuccessEntry) {
+	p.jobs <- entry
+}
+
+func (p *paymentPipeline) closeAndWait() int {
+	close(p.jobs)
+	p.workers.Wait()
+	return int(p.success.Load())
+}
+
+func processPayment(e SuccessEntry) bool {
+	k := e.Order.UserID + "|" + e.Order.ServerID
+	orderID := e.OrderID
+	hash := sha256.Sum256([]byte(orderID))
+	ref := hex.EncodeToString(hash[:])[:32]
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	payBody, _ := json.Marshal(map[string]interface{}{
+		"orderId":            orderID,
+		"paymentChannelId":   73,
+		"phoneNumber":        "628783219212",
+		"paymentPhoneNumber": "",
+		"quantity":           1,
+		"invoiceUrl":         "https://gopay.co.id/games/payment/",
+	})
+
+	req.SetRequestURI("https://gopay.co.id/games/v1/order/payment")
+	req.Header.SetMethod("POST")
+	setInquiryHeaders(req, "", e.Lane.cookies)
+	req.Header.Set("x-request-reference", ref)
+	req.Header.Set("x-request-id", ref)
+	req.Header.Set("idempotency-key", ref)
+	req.SetBody(payBody)
+
+	if err := e.Lane.client.DoTimeout(req, resp, time.Duration(PAYMENT_TIMEOUT_MS)*time.Millisecond); err != nil {
+		logf("[%s] Payment error: %v\n", k, err)
+		return false
+	}
+	e.Lane.cookies.capture(&resp.Header)
+	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
+		payErr := truncateRunes(extractApiErrorMessage(resp.Body()), 120)
+		if payErr != "" {
+			logf("[%s] Payment HTTP %d - %s\n", k, resp.StatusCode(), payErr)
+		} else {
+			logf("[%s] Payment HTTP %d\n", k, resp.StatusCode())
+		}
+		return false
+	}
+
+	var payRes map[string]interface{}
+	if json.Unmarshal(resp.Body(), &payRes) != nil {
+		return false
+	}
+	txnID, _ := payRes["data"].(string)
+	if txnID == "" {
+		return false
+	}
+
+	txnData := getTransactionUntilReady(txnID, e.Lane)
+	if txnData == nil {
+		return false
+	}
+
+	payURL := transactionPaymentURL(txnData)
+	if payURL == "" {
+		logf("[%s] Payment belum siap: URL pembayaran kosong\n", k)
+		return false
+	}
+	appendToFile("transaksi_url.txt", fmt.Sprintf("%s|%s\n", k, "https://gopay.co.id/games/payment/"+txnID))
+	appendToFile("deeplinks.txt", payURL+"\n")
+	appendToFile("order_ids.txt", fmt.Sprintf("%s|%s|%s\n", k, orderID, payURL))
+	logf("[%s] ✅ SUCCESS | Pay URL tersedia\n", k)
+	return true
+}
+
+func transactionPaymentURL(data map[string]interface{}) string {
+	ap, ok := data["actionPayment"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"paymentDirect", "deeplinkRedirect"} {
+		if value, ok := ap[key].(string); ok {
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func getTransactionUntilReady(txnID string, lane *inquiryLane) map[string]interface{} {
 	delays := []time.Duration{90, 120, 160, 220, 300, 420, 560, 750, 950}
+	deadline := time.Now().Add(TRANSACTION_POLL_TIMEOUT)
 
 	for _, d := range delays {
-		time.Sleep(d * time.Millisecond)
+		sleepFor := d * time.Millisecond
+		if time.Until(deadline) <= sleepFor {
+			return nil
+		}
+		time.Sleep(sleepFor)
 
 		req := fasthttp.AcquireRequest()
 		resp := fasthttp.AcquireResponse()
-		defer fasthttp.ReleaseRequest(req)
-		defer fasthttp.ReleaseResponse(resp)
 
 		req.SetRequestURI("https://gopay.co.id/games/v1/transaction/" + txnID)
 		req.Header.SetMethod("GET")
-		setInquiryHeaders(req, "")
+		setInquiryHeaders(req, "", lane.cookies)
 
-		if err := fastClient.DoTimeout(req, resp, 3500*time.Millisecond); err != nil {
-			continue
+		err := lane.client.DoDeadline(req, resp, deadline)
+		if err == nil {
+			lane.cookies.capture(&resp.Header)
 		}
-
 		var data map[string]interface{}
-		if json.Unmarshal(resp.Body(), &data) == nil {
-			if ap, ok := data["actionPayment"].(map[string]interface{}); ok {
-				if _, ok := ap["paymentDirect"]; ok || ap["deeplinkRedirect"] != nil {
-					return data
-				}
+		if err == nil && json.Unmarshal(resp.Body(), &data) == nil {
+			if transactionPaymentURL(data) != "" {
+				fasthttp.ReleaseRequest(req)
+				fasthttp.ReleaseResponse(resp)
+				return data
 			}
+		}
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+		if err != nil {
+			continue
 		}
 	}
 	return nil
 }
 
-// ===================== TIMING & WARMUP =====================
+// ===================== TIMING & CONNECTION PREFLIGHT =====================
 
-func waitUntilPreWar(secondsBefore int) {
-	target := readTargetTime()
+func waitUntilPreWar(target time.Time, secondsBefore int) {
 	testTs := target.Add(-time.Duration(secondsBefore) * time.Second)
 
 	if diff := time.Until(testTs); diff > 0 {
-		logf("Menunggu fase tes koneksi (T-%ds sebelum war)...\n", secondsBefore)
+		logf("Menunggu fase persiapan (T-%ds sebelum war)...\n", secondsBefore)
 		time.Sleep(diff)
 	} else {
-		logf("[PRE-WAR] Sudah lewat T-%ds window, langsung jalankan pre-war test sekarang...\n", secondsBefore)
+		logf("[TIMING] T-%ds sudah lewat; persiapan dijalankan sekarang.\n", secondsBefore)
 	}
 }
 
-func preWarConnectionTest(sample Order, captcha string, times int) {
-	logf("Pre-war connection test + kalibrasi jam server (%d kali)...\n", times)
-	// Tembakan back-to-back (~150-250ms/req) membentang >1 detik sehingga pasti
-	// melewati 1-2 pergantian detik server → cukup untuk deteksi rollover.
-	samples := make([]clockSample, 0, times)
-	for i := 0; i < times; i++ {
-		if localMs, sec, ok := probeServerDate(sample, captcha); ok {
-			samples = append(samples, clockSample{localMs: localMs, sec: sec})
+type laneWarmResult struct {
+	LaneID int
+	HTTP   int
+	RTTMs  float64
+	Remote string
+	ConnID int64
+	Err    error
+}
+
+// warmLane menguji HTTP keep-alive melalui resource publik non-mutating.
+// Tidak ada request ke endpoint inquiry dan tidak ada captcha yang dikonsumsi.
+func warmLane(lane *inquiryLane, timeout time.Duration) laneWarmResult {
+	result := laneWarmResult{LaneID: lane.id}
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI("https://gopay.co.id/robots.txt")
+	req.Header.SetMethod("GET")
+	req.Header.Set("user-agent", sessionUA)
+	req.Header.Set("accept", "text/plain,*/*")
+	req.Header.Set("accept-language", "en-US,en;q=0.9")
+	req.Header.Set("connection", "keep-alive")
+	lane.cookies.apply(&req.Header)
+
+	start := time.Now()
+	err := lane.client.DoTimeout(req, resp, timeout)
+	result.RTTMs = durationMs(time.Since(start))
+	if err != nil {
+		result.Err = err
+		return result
+	}
+	result.HTTP = resp.StatusCode()
+	lane.cookies.capture(&resp.Header)
+	if resp.Header.ConnectionClose() {
+		result.Err = fmt.Errorf("robots.txt HTTP %d menutup koneksi warm", resp.StatusCode())
+		return result
+	}
+
+	lane.warmConnID = lane.seq.Load()
+	lane.metaMu.Lock()
+	result.Remote = lane.remoteAddr
+	lane.metaMu.Unlock()
+	result.ConnID = lane.warmConnID
+	if result.ConnID == 0 {
+		result.Err = fmt.Errorf("connection generation tidak tercatat")
+	}
+	return result
+}
+
+func warmDedicatedLanes(timeout time.Duration) int {
+	logf("[CONN] T-5s: validasi %d dedicated TLS lane via GET /robots.txt (deadline %dms; tanpa inquiry)\n",
+		len(inquiryLanes), timeout.Milliseconds())
+
+	results := make(chan laneWarmResult, len(inquiryLanes))
+	for _, lane := range inquiryLanes {
+		go func(l *inquiryLane) {
+			results <- warmLane(l, timeout)
+		}(lane)
+	}
+
+	okCount := 0
+	for range inquiryLanes {
+		result := <-results
+		if result.Err != nil {
+			logf("[CONN] ⚠️ lane=%d warm gagal rtt=%.3fms: %v; final akan tercatat cold/reconnect\n",
+				result.LaneID, result.RTTMs, result.Err)
+			continue
 		}
+		okCount++
+		logf("[CONN] ✅ lane=%d conn=%d remote=%s HTTP=%d rtt=%.3fms reusable\n",
+			result.LaneID, result.ConnID, result.Remote, result.HTTP, result.RTTMs)
 	}
-	computeClockOffset(samples)
-	logf("Pre-war test selesai\n")
+	return okCount
 }
 
-// doFineTuneProbes: 8x inquiry @ 1 req/detik dari H-12s sampai H-5s.
-func doFineTuneProbes(sample Order, captcha string) {
-	logf("[FINE-TUNE] Probe RTT %dx @ 1 req/detik (H-12s → H-5s)...\n", FINE_TUNE_PROBE_COUNT)
-	fineTuneRTTs = make([]float64, 0, FINE_TUNE_PROBE_COUNT)
-	for i := 1; i <= FINE_TUNE_PROBE_COUNT; i++ {
-		if i > 1 {
-			time.Sleep(FINE_TUNE_PROBE_INTERVAL)
-		}
-		result := doInquiry(sample, captcha, 0)
-		fineTuneRTTs = append(fineTuneRTTs, result.RTTMs)
-		logf("  fine-tune #%d | rtt %.0fms | HTTP %d | %s\n", i, result.RTTMs, result.HTTPCode, result.Status)
-	}
-}
-
-func doWarmupProbes(sample Order, captcha string, maxMs int) {
-	logf("[WARM-UP] T-%.1fs re-warm TLS pool (%d paralel)...\n", float64(MINI_PROBE2_LEAD_MS)/1000, MINI_PROBE2_PARALLEL)
-
-	var wg sync.WaitGroup
-	var muWarm sync.Mutex
-	var rtts []float64
-
-	for i := 0; i < MINI_PROBE2_PARALLEL; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			start := time.Now()
-			doInquiry(sample, captcha, 0)
-			rtt := float64(time.Since(start).Milliseconds())
-
-			muWarm.Lock()
-			rtts = append(rtts, rtt)
-			muWarm.Unlock()
-		}()
-	}
-	wg.Wait()
-
-	if len(rtts) > 0 {
-		sort.Float64s(rtts)
-		warmupMedianRTT = rtts[len(rtts)/2]
-		warmupMinRTT = rtts[0]
-		logf("[WARM-UP] RTT min=%.0fms med=%.0fms (min/2→ow_est, hanya dari H-1.5s %d paralel — bukan fine-tune)\n",
-			warmupMinRTT, warmupMedianRTT, len(rtts))
-	} else {
-		logf("[WARM-UP] Selesai (RTT tidak tersedia)\n")
-	}
-}
-
-func waitForExactBurstTime(fallbackLeadMs int, sample Order, captcha string, beforeBurst func(int)) {
-	fineTuneRTTs = nil
-	target := readTargetTime()
-
-	// Koreksi ke JAM SERVER: target dari waktu.txt adalah wall-clock server.
-	if serverClockKnown {
-		target = target.Add(-time.Duration(serverClockOffsetMs) * time.Millisecond)
-		logf("[CLOCK] Target burst dikoreksi %+.0fms ke jam server.\n", -serverClockOffsetMs)
-	}
-
-	warStartWall = target // T=0 — detik go-live server (HH:MM:00 dari waktu.txt)
-	targetSrv := readTargetSrvMs()
-
-	logf("⏰ Target burst (T=0): %s | target_srv: +%.0fms | lead.txt fallback: %dms\n",
-		target.Format("15:04:05.000"), targetSrv, fallbackLeadMs)
-
-	// Warm-up T-1.5s: RTT_min → lead dinamis; jika spike > rata-rata fine-tune, pakai tune_avg.
-	warmupAt := target.Add(-time.Duration(MINI_PROBE2_LEAD_MS) * time.Millisecond)
-
-	if d := time.Until(warmupAt); d > 15*time.Second {
-		time.Sleep(d - time.Duration(FINE_TUNE_START_BEFORE_MS)*time.Millisecond)
-		logf("Masuk fase fine tuning (H-12s → H-5s, %dx @ 1/detik)...\n", FINE_TUNE_PROBE_COUNT)
-		doFineTuneProbes(sample, captcha)
-	} else if d > 6*time.Second {
-		time.Sleep(d - 6*time.Second)
-		logf("Masuk fase fine tuning...\n")
-	}
-
-	spinWaitUntil(warmupAt)
-
-	if beforeBurst != nil {
-		budget := MINI_PROBE2_LEAD_MS - 200
-		if budget >= 150 {
-			beforeBurst(budget)
-		}
-	}
-
-	leadMs := resolveLeadMs(fallbackLeadMs, targetSrv)
+func runFixedLeadSingleSalvo(target time.Time, leadMs int, orders []Order) ([]SuccessEntry, int) {
+	warStartWall = target
+	captchaAt := target.Add(-CAPTCHA_LEAD)
+	preconnectAt := target.Add(-PRECONNECT_LEAD)
+	prebuildAt := target.Add(-PREBUILD_LEAD)
+	armAt := target.Add(-ARM_LEAD)
 	execTarget := leadToExecTarget(target, leadMs)
-
-	if execTarget.Before(time.Now()) {
-		logf("[LEAD] ⚠️ Dynamic lead %dms membuat exec di masa lalu → fallback lead.txt %dms\n",
-			leadMs, fallbackLeadMs)
-		leadMs = fallbackLeadMs
-		execTarget = leadToExecTarget(target, leadMs)
+	if !execTarget.After(armAt) {
+		log.Fatalf("❌ Fixed lead %+dms mendahului fase arm T-%s", leadMs, ARM_LEAD)
 	}
 
-	leadRTT, _ := effectiveLeadRTT()
-	owEst := leadRTT / 2.0
-	if owEst > 0 {
-		estSrv := float64(leadMs) + owEst
-		logf("⏰ Lead: %dms | Exec: %s | estimasi srv: %+.0fms\n",
-			leadMs, execTarget.Format("15:04:05.000"), estSrv)
+	logf("⏰ Target T=0: %s | zone=%s | fixed lead.txt: %+dms | exec: %s\n",
+		target.Format(time.RFC3339Nano), target.Location(), leadMs, execTarget.Format("15:04:05.000000"))
+
+	if time.Now().Before(captchaAt) {
+		spinWaitUntil(captchaAt)
 	} else {
-		logf("⏰ Lead: %dms | Exec: %s\n", leadMs, execTarget.Format("15:04:05.000"))
+		logf("[CAPTCHA] T-10s sudah lewat; token diambil sekarang dengan timeout %s.\n", CAPTCHA_TIMEOUT)
+	}
+	captcha := getFreshCaptcha(false)
+	logf("[CAPTCHA] Token final siap pada T%+.3fms.\n", durationMs(time.Now().Sub(target)))
+
+	if time.Now().Before(preconnectAt) {
+		spinWaitUntil(preconnectAt)
+	} else {
+		logf("[CONN] T-5s sudah lewat; preconnect dijalankan jika budget masih aman.\n")
 	}
 
-	spinWaitUntil(execTarget)
-	logf("🚀 BURST START! [%s] MULAI FULL FLOW!\n\n", formatMicrotimeNow())
+	warmBudget := time.Until(prebuildAt) - 250*time.Millisecond
+	if warmBudget > PRECONNECT_TIMEOUT {
+		warmBudget = PRECONNECT_TIMEOUT
+	}
+	if warmBudget >= 200*time.Millisecond {
+		warmed := warmDedicatedLanes(warmBudget)
+		logf("[CONN] %d/%d lane terbukti reusable; tidak ada fallback inquiry warm-up.\n", warmed, len(inquiryLanes))
+	} else {
+		logf("[CONN] Preconnect dilewati: sisa budget hanya %dms.\n", warmBudget.Milliseconds())
+	}
+
+	spinWaitUntil(prebuildAt)
+	prebuilt := prebuildInquiryRequests(orders, captcha)
+	payments := startPaymentPipeline()
+	inquiryDeadline := execTarget.Add(time.Duration(INQUIRY_TIMEOUT_MS) * time.Millisecond)
+	salvo := prepareSingleSalvo(prebuilt, payments, inquiryDeadline)
+	oldGCPercent := debug.SetGCPercent(-1)
+	runtime.GC()
+	defer debug.SetGCPercent(oldGCPercent)
+	logf("[PREBUILD] T-2s: %d request + seluruh worker siap; forced GC selesai dan automatic GC dipause sampai flow selesai.\n", len(orders))
+
+	spinWaitUntil(armAt)
+	armSingleSalvo(salvo, execTarget)
+
+	successes := fireSingleSalvo(salvo, execTarget, len(orders))
+	paymentSuccess := payments.closeAndWait()
+	return successes, paymentSuccess
 }
 
 // printTimingSummary - Analisis timing untuk kalibrasi lead.txt
@@ -1212,54 +1842,65 @@ func printTimingSummary() {
 		return
 	}
 
-	logf("\n📈 ========== TIMING SUMMARY (untuk kalibrasi lead) ==========\n")
+	logf("\n📈 ========== TIMING SUMMARY (client-side, bukan origin arrival) ==========\n")
 
-	// Group by try number
-	salvos := make(map[int][]AttemptStat)
+	var rtts []float64
+	var offsets []float64
+	var ttfbs []float64
+	stopCount := 0
+	reusedCount := 0
+	coldCount := 0
+	lateBlockedCount := 0
 	for _, s := range attemptStats {
-		salvos[s.Try] = append(salvos[s.Try], s)
-	}
-
-	for try := 1; try <= MAX_RETRY_PER_USER+1; try++ {
-		list, ok := salvos[try]
-		if !ok {
-			continue
-		}
-
-		var rtts []float64
-		var offsets []float64
-		stopCount := 0
-
-		for _, s := range list {
-			rtts = append(rtts, s.RTTMs)
+		rtts = append(rtts, s.RTTMs)
+		if s.BytesWritten > 0 {
 			offsets = append(offsets, s.FireOffset)
-			if s.Verdict == "stop" {
-				stopCount++
-			}
 		}
-
-		// Simple min/med/max
-		minRTT, medRTT, maxRTT := minMedMax(rtts)
-		minOff, medOff, maxOff := minMedMax(offsets)
-
-		logf("   Salvo #%d (n=%d): RTT[min=%.0f med=%.0f max=%.0f] | FireOffset[min=%+.0f med=%+.0f max=%+.0f] | STOP=%d\n",
-			try, len(list), minRTT, medRTT, maxRTT, minOff, medOff, maxOff, stopCount)
+		if s.TTFBMs > 0 {
+			ttfbs = append(ttfbs, s.TTFBMs)
+		}
+		if s.Verdict == "stop" {
+			stopCount++
+		}
+		if s.Reused {
+			reusedCount++
+		}
+		if s.ColdDial {
+			coldCount++
+		}
+		if s.LateBlocked {
+			lateBlockedCount++
+		}
 	}
 
-	// First STOP timing (paling penting untuk kalibrasi)
+	minRTT, medRTT, maxRTT := minMedMax(rtts)
+	minOff, medOff, maxOff := minMedMax(offsets)
+	minTTFB, medTTFB, maxTTFB := minMedMax(ttfbs)
+	if len(offsets) > 0 {
+		logf("   Salvo #1 (orders=%d writes=%d): RTT[min=%.3f med=%.3f max=%.3f] | first TLS-app write[min=%+.3f med=%+.3f max=%+.3f] | TTFB[min=%.3f med=%.3f max=%.3f]\n",
+			len(attemptStats), len(offsets), minRTT, medRTT, maxRTT, minOff, medOff, maxOff, minTTFB, medTTFB, maxTTFB)
+	} else {
+		logf("   Salvo #1 (orders=%d writes=0): tidak ada byte inquiry yang dikirim | RTT[min=%.3f med=%.3f max=%.3f]\n",
+			len(attemptStats), minRTT, medRTT, maxRTT)
+	}
+	logf("   Connection reuse=%d/%d | cold/reconnect=%d | late-blocked=%d | STOP=%d | retry inquiry=OFF\n",
+		reusedCount, len(attemptStats), coldCount, lateBlockedCount, stopCount)
+
 	firstStop := 0.0
+	hasStop := false
 	for _, s := range attemptStats {
 		if s.Verdict == "stop" {
 			firstStop = s.FireOffset
+			hasStop = true
 			break
 		}
 	}
 
-	if firstStop != 0 {
-		logf("\n   → First OUT-OF-STOCK terdeteksi pada FireOffset ≈ %+.0fms\n", firstStop)
-		logf("   → Saran: turunkan target_srv di target_srv.txt atau lead lebih awal (fire ≈ %dms)\n", int(firstStop))
+	if hasStop {
+		logf("\n   → First OUT-OF-STOCK berasal dari request dengan first TLS-app write %+.3fms.\n", firstStop)
+		logf("   → Ini timestamp masuk tls.Conn.Write di client, bukan timestamp NIC/origin.\n")
 	} else {
-		logf("\n   → Tidak ada 'out of stock' → kemungkinan masih ada stok atau timing terlalu telat\n")
+		logf("\n   → Tidak ada respons 'out of stock' pada single salvo ini.\n")
 	}
 
 	logf("============================================================\n\n")
@@ -1284,6 +1925,8 @@ func initLogging() {
 	logFile, err = os.OpenFile("loghasil.txt", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		logFile = nil
+		logger = log.New(os.Stdout, "", log.LstdFlags)
+		return
 	}
 	mw := io.MultiWriter(os.Stdout, logFile)
 	logger = log.New(mw, "", log.LstdFlags)
@@ -1296,42 +1939,59 @@ func logf(format string, v ...interface{}) {
 // ===================== MAIN =====================
 
 func main() {
-	initLogging()
-	initFastHTTPClient()
-
-	logf("=== GOPAY MLBB WDP WAR (GOLANG + FASTHTTP) ===\n")
-	logf("MAX_USERS=%d | MAX_RETRY=%d | WARMUP_PARALLEL=%d | DYNAMIC_LEAD target_srv=+%.0fms\n\n",
-		MAX_USERS, MAX_RETRY_PER_USER, MINI_PROBE2_PARALLEL, readTargetSrvMs())
-
-	orders := loadOrders()
-	if len(orders) == 0 {
-		log.Fatal("Tidak ada order valid")
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version":
+			fmt.Printf("wdp-war %s %s/%s\n", PROGRAM_VERSION, runtime.GOOS, runtime.GOARCH)
+			return
+		case "--check-clock":
+			logger = log.New(os.Stdout, "", 0)
+			requireClockHealth(CLOCK_WAIT_MAX)
+			fmt.Println("__WDP_CLOCK_HEALTHY__")
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "argumen tidak dikenal: %s\n", os.Args[1])
+			os.Exit(2)
+		}
 	}
 
-	captcha := getFreshCaptcha(false)
-	fallbackLeadMs := readLeadMs()
-	logf("⚡ Lead fallback (lead.txt): %dms\n\n", fallbackLeadMs)
+	initLogging()
+	if logFile != nil {
+		defer logFile.Close()
+	}
 
-	waitUntilPreWar(60)
-	preWarConnectionTest(orders[0], captcha, PREWAR_TEST_COUNT)
-	captcha = getFreshCaptcha(true)
-	logf("Captcha diperbarui\n\n")
+	logf("=== GOPAY MLBB WDP WAR (GOLANG + FASTHTTP) ===\n")
+	logf("VERSION=%s | MODE=SINGLE_SALVO | MAX_USERS=%d | RETRY=OFF | LANES=4xH1 | LEAD=FIXED\n\n",
+		PROGRAM_VERSION, MAX_USERS)
 
-	waitForExactBurstTime(fallbackLeadMs, orders[0], captcha, func(budgetMs int) {
-		doWarmupProbes(orders[0], captcha, budgetMs)
-		prebuildInquiryRequests(orders, captcha)
-		logf("[PREBUILD] %d request salvo-1 siap (hot path = Do() murni)\n", len(orders))
-	})
+	orders := loadOrders()
+	targetWall := readTargetTime()
+	leadMs := readLeadMs()
+	logf("⚡ Lead offset: %+dms (fixed dari lead.txt)\n\n", leadMs)
 
-	logf("🔥 SALVO #1: tembak %d user paralel @ [%s]\n", len(orders), formatMicrotimeNow())
-	inquirySuccess := runAdaptiveInquiry(orders, captcha)
+	// Gate pertama menjaga proses yang dijalankan jauh sebelum target.
+	requireClockHealth(CLOCK_WAIT_MAX)
+	waitUntilPreWar(targetWall, 60)
+
+	// Gate kedua dilakukan dekat event, lalu wall target di-anchor ke monotonic.
+	secondBudget := CLOCK_WAIT_MAX
+	if safe := time.Until(targetWall) - 10*time.Second; safe < secondBudget {
+		secondBudget = safe
+	}
+	if secondBudget < 0 {
+		secondBudget = 0
+	}
+	requireClockHealth(secondBudget)
+	target := anchorMonotonic(targetWall)
+	logf("[CLOCK] Deadline T=0 sudah di-anchor ke monotonic clock.\n")
+
+	initFastHTTPClients()
+	inquirySuccess, paymentSuccess := runFixedLeadSingleSalvo(target, leadMs, orders)
 
 	logf("\n📊 Inquiry selesai: %d/%d sukses\n", len(inquirySuccess), len(orders))
 
 	printTimingSummary()
 
-	success := runParallelPayment(inquirySuccess)
-
-	logf("\n🏁 FULL FLOW SELESAI! Berhasil: %d / %d\n", success, len(orders))
+	logf("\n🏁 FULL FLOW SELESAI! Berhasil: %d / %d\n", paymentSuccess, len(orders))
 	logf("Lihat: deeplinks.txt, order_ids.txt, transaksi_url.txt, loghasil.txt\n")
 }
