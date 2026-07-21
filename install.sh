@@ -4,38 +4,52 @@
 #
 # Termux  : PHP only di /sdcard/wdp  (tanpa Golang — seperti install awal)
 # Linux   : file di $HOME (root → /root), TANPA subfolder wdp
-#           + timezone WIB + NTP + Golang (snap) + go mod
+#           + timezone WIB + chrony sehat + binary GitHub Release terverifikasi
 #           (PHP CLI sengaja TIDAK di-install di Linux untuk saat ini)
 #
 # Jalankan:
 #   bash install.sh              # full auto sesuai platform
 #   bash install.sh --menu       # pilih menu manual
-#   bash install.sh --update     # update file saja (tanpa reinstall Go/PHP)
-#   bash install.sh --go-only    # Linux: setup Golang + go mod saja
+#   bash install.sh --update     # sync paket + ganti binary secara atomik
+#   bash install.sh --go-only    # Linux: build dari source secara eksplisit
+#   bash install.sh --clock-only # Linux: pasang/start chrony + tunggu sehat
+#   bash install.sh --verify-clock
 #   APP_DIR=/path bash install.sh
 # ======================================================================
 set -Eeuo pipefail
 
-# Default: arsip branch main dari GitHub. Override: ARCHIVE_URL=... bash install.sh
-ARCHIVE_URL="${ARCHIVE_URL:-https://github.com/asepmaries/warwdpgo/archive/refs/heads/main.tar.gz}"
-GO_MOD_NAME="${GO_MOD_NAME:-wdp-war}"
-FASTHTTP_PKG="github.com/valyala/fasthttp"
-CHRONY_WAIT_TRIES="${CHRONY_WAIT_TRIES:-60}"
-CHRONY_MAX_CORRECTION="${CHRONY_MAX_CORRECTION:-0.005}"
-CHRONY_MAX_SKEW="${CHRONY_MAX_SKEW:-0}"
-CHRONY_WAIT_INTERVAL="${CHRONY_WAIT_INTERVAL:-1}"
-CHRONY_REQUIRE_WAR_CLOCK_HEALTHY="${CHRONY_REQUIRE_WAR_CLOCK_HEALTHY:-0}"
+# Default mengambil paket + binary dari GitHub Release yang sama. RELEASE_TAG=latest
+# mengikuti release terbaru; pin tag (mis. v2026.07.21) untuk deployment reproducible.
+RELEASE_REPO="${RELEASE_REPO:-asepmaries/warwdpgo}"
+RELEASE_TAG="${RELEASE_TAG:-latest}"
+RELEASE_PACKAGE_ASSET="${RELEASE_PACKAGE_ASSET:-warwdpgo-source.tar.gz}"
+RELEASE_CHECKSUM_ASSET="${RELEASE_CHECKSUM_ASSET:-SHA256SUMS}"
+RELEASE_BINARY_PREFIX="${RELEASE_BINARY_PREFIX:-war-linux}"
+
+# Override arsip hanya boleh eksplisit dan wajib disertai SHA-256.
+ARCHIVE_URL="${ARCHIVE_URL:-}"
+ARCHIVE_SHA256="${ARCHIVE_SHA256:-}"
+
+# Policy kesehatan clock. Unit correction/error adalah detik; skew adalah ppm.
+CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-45}"
+CLOCK_WAIT_INTERVAL_SEC="${CLOCK_WAIT_INTERVAL_SEC:-2}"
+CLOCK_MAX_CORRECTION_SEC="${CLOCK_MAX_CORRECTION_SEC:-0.010}"
+CLOCK_MAX_SKEW_PPM="${CLOCK_MAX_SKEW_PPM:-100}"
+CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.010}"
+CLOCK_CHECK_TIMEOUT_SEC="${CLOCK_CHECK_TIMEOUT_SEC:-15}"
 
 # File yang selalu di-sync dari paket
 # - Termux memakai war.php; war.go/go.mod ikut di-copy tapi tidak dijalankan di Android
 # - Linux memakai war.go (+ go.mod/go.sum) dan war.php cadangan
-CORE_FILES=(war.go war.php install.sh go.mod go.sum)
+CORE_FILES=(war.php install.sh go.mod go.sum)
 
 # Config: jangan di-overwrite kalau sudah ada isi (kecuali --force)
 CONFIG_FILES=(waktu.txt user_server_wdp.txt lead.txt reload.txt target_srv.txt)
 
 FORCE_OVERWRITE=0
-MODE="auto" # auto | menu | update | go-only
+MODE="auto" # auto | menu | update | go-only | clock-only | verify-clock
+BINARY_MODE="${BINARY_MODE:-release}" # release | source
+ALLOW_SOURCE_FALLBACK="${ALLOW_SOURCE_FALLBACK:-0}"
 
 # ----------------------------------------------------------------------
 # Util
@@ -49,6 +63,32 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Command wajib tidak ada: $1"
 }
 
+cleanup_paths() {
+  local path
+  for path in "$@"; do
+    [ -z "$path" ] || rm -f -- "$path"
+  done
+}
+
+is_sha256() {
+  printf '%s\n' "$1" | grep -Eq '^[[:xdigit:]]{64}$'
+}
+
+require_positive_integer() {
+  local name="$1" value="$2"
+  case "$value" in
+    ''|*[!0-9]*) die "$name wajib bilangan bulat positif (didapat: $value)" ;;
+  esac
+  [ "$value" -gt 0 ] || die "$name wajib > 0"
+}
+
+require_nonnegative_number() {
+  local name="$1" value="$2"
+  printf '%s\n' "$value" \
+    | grep -Eq '^([0-9]+([.][0-9]*)?|[.][0-9]+)$' \
+    || die "$name wajib angka non-negatif (didapat: $value)"
+}
+
 run_root() {
   # Jalankan command sebagai root (langsung atau via sudo)
   if [ "$(id -u)" -eq 0 ]; then
@@ -57,15 +97,6 @@ run_root() {
     sudo "$@"
   else
     die "Butuh root/sudo untuk: $*"
-  fi
-}
-
-ensure_path_snap() {
-  if [ -d /snap/bin ]; then
-    case ":$PATH:" in
-      *:/snap/bin:*) ;;
-      *) export PATH="/snap/bin:$PATH" ;;
-    esac
   fi
 }
 
@@ -114,35 +145,52 @@ parse_args() {
     case "$1" in
       --menu|-m)     MODE="menu" ;;
       --update|-u)   MODE="update" ;;
-      --go-only)     MODE="go-only" ;;
+      --go-only)     MODE="go-only"; BINARY_MODE="source" ;;
+      --clock-only)  MODE="clock-only" ;;
+      --verify-clock) MODE="verify-clock" ;;
+      --build-from-source) BINARY_MODE="source" ;;
+      --allow-source-fallback) ALLOW_SOURCE_FALLBACK=1 ;;
+      --release-tag)
+        [ $# -ge 2 ] || die "--release-tag membutuhkan nilai"
+        shift
+        RELEASE_TAG="$1"
+        ;;
       --force|-f)    FORCE_OVERWRITE=1 ;;
-      --app-dir)     shift; APP_DIR="${1:-}" ;;
+      --app-dir)
+        [ $# -ge 2 ] || die "--app-dir membutuhkan DIR"
+        shift
+        APP_DIR="$1"
+        ;;
       --help|-h)
         cat <<'EOF'
 Usage: bash install.sh [options]
 
-  (default)     Full install otomatis sesuai platform
-  --menu, -m    Tampilkan menu pilihan
-  --update, -u  Update file dari ARCHIVE_URL saja
-  --go-only     Linux only: timezone + NTP + Golang + go mod
-  --force, -f   Overwrite config (waktu.txt, user_server_wdp.txt, dll.)
-  --app-dir DIR Folder instalasi (default Termux:/sdcard/wdp Linux:\$HOME)
-  --help, -h    Bantuan
+  (default)               Full install; Linux memakai binary Release terverifikasi
+  --menu, -m              Tampilkan menu pilihan
+  --update, -u            Sync paket + ganti binary secara atomik
+  --go-only               Linux: install Go + build source secara eksplisit
+  --clock-only            Linux: install/start chrony lalu tunggu clock sehat
+  --verify-clock          Linux: read-only, gagal bila clock tidak sehat
+  --build-from-source     Jangan ambil prebuilt; compile war.go
+  --allow-source-fallback Jika prebuilt gagal, izinkan compile source
+  --release-tag TAG       Pin GitHub Release (default: latest)
+  --force, -f             Overwrite config lokal
+  --app-dir DIR           Folder instalasi (Termux:/sdcard/wdp Linux:$HOME)
+  --help, -h              Bantuan
 
 Env:
-  ARCHIVE_URL   URL tarball (default: GitHub branch main)
-  APP_DIR       Sama seperti --app-dir
-  CHRONY_WAIT_TRIES       Jumlah cek sinkronisasi (default: 60)
-  CHRONY_MAX_CORRECTION   Maksimum System time dalam detik (default: 0.005)
-  CHRONY_MAX_SKEW         Maksimum skew bootstrap ppm (default: 0 = tunggu correction saja)
-  CHRONY_WAIT_INTERVAL    Interval cek detik (default: 1)
-  CHRONY_REQUIRE_WAR_CLOCK_HEALTHY
-                          1 = installer menunggu gate war ketat (default: 0)
+  RELEASE_REPO / RELEASE_TAG
+  ARCHIVE_URL + ARCHIVE_SHA256  Override paket; keduanya wajib bersama
+                               Linux: wajib --build-from-source
+  CLOCK_WAIT_TRIES / CLOCK_WAIT_INTERVAL_SEC
+  CLOCK_MAX_CORRECTION_SEC / CLOCK_MAX_SKEW_PPM / CLOCK_MAX_ERROR_SEC
+  CLOCK_CHECK_TIMEOUT_SEC
+  APP_DIR
 EOF
         exit 0
         ;;
       *)
-        warn "Argumen diabaikan: $1"
+        die "Argumen tidak dikenal: $1"
         ;;
     esac
     shift
@@ -152,23 +200,164 @@ EOF
 # ----------------------------------------------------------------------
 # Download & extract paket
 # ----------------------------------------------------------------------
+validate_release_settings() {
+  printf '%s\n' "$RELEASE_REPO" \
+    | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
+    || die "RELEASE_REPO tidak valid: $RELEASE_REPO"
+  if [ "$RELEASE_TAG" != "latest" ]; then
+    printf '%s\n' "$RELEASE_TAG" \
+      | grep -Eq '^[A-Za-z0-9._-]+$' \
+      || die "RELEASE_TAG tidak valid: $RELEASE_TAG"
+  fi
+  printf '%s\n' "$RELEASE_PACKAGE_ASSET" \
+    | grep -Eq '^[A-Za-z0-9._-]+$' \
+    || die "RELEASE_PACKAGE_ASSET tidak valid"
+  printf '%s\n' "$RELEASE_CHECKSUM_ASSET" \
+    | grep -Eq '^[A-Za-z0-9._-]+$' \
+    || die "RELEASE_CHECKSUM_ASSET tidak valid"
+}
+
+release_download_base() {
+  if [ "$RELEASE_TAG" = "latest" ]; then
+    printf 'https://github.com/%s/releases/latest/download' "$RELEASE_REPO"
+  else
+    printf 'https://github.com/%s/releases/download/%s' "$RELEASE_REPO" "$RELEASE_TAG"
+  fi
+}
+
+resolve_latest_release_tag() {
+  local release_url effective tag
+  [ "$RELEASE_TAG" = "latest" ] || return 0
+  release_url="https://github.com/$RELEASE_REPO/releases/latest"
+  effective="$(curl --fail --location --silent --show-error \
+    --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
+    --output /dev/null --write-out '%{url_effective}' "$release_url")" \
+    || die "Gagal resolve GitHub Release latest"
+  effective="${effective%/}"
+  case "$effective" in
+    "https://github.com/$RELEASE_REPO/releases/tag/"*) ;;
+    *) die "Redirect Release latest tidak valid: $effective" ;;
+  esac
+  tag="${effective##*/}"
+  printf '%s\n' "$tag" | grep -Eq '^[A-Za-z0-9._-]+$' \
+    || die "Tag hasil resolve tidak valid: $tag"
+  RELEASE_TAG="$tag"
+  ok "Release latest dipin untuk proses ini: $RELEASE_TAG"
+}
+
+curl_download() {
+  local url="$1" dest="$2"
+  case "$url" in
+    https://*) ;;
+    *) warn "Tolak URL non-HTTPS: $url"; return 1 ;;
+  esac
+  curl --fail --location --silent --show-error \
+    --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
+    "$url" -o "$dest"
+}
+
+verify_file_sha256() {
+  local file="$1" expected="$2" actual
+  is_sha256 "$expected" || return 1
+  actual="$(sha256sum "$file" | awk '{print $1}')" || return 1
+  [ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" = \
+    "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ]
+}
+
+download_verified_release_asset() {
+  local asset="$1" dest="$2"
+  local base sums expected matches count download_status
+  VERIFIED_ASSET_SHA256=""
+  base="$(release_download_base)"
+  sums="${dest}.SHA256SUMS.$$"
+  rm -f "$dest" "$sums"
+
+  if ! curl_download "$base/$RELEASE_CHECKSUM_ASSET" "$sums"; then
+    warn "Gagal download checksum Release: $base/$RELEASE_CHECKSUM_ASSET"
+    rm -f "$sums"
+    return 1
+  fi
+
+  matches="$(awk -v asset="$asset" '
+    $2 == asset || $2 == "*" asset { print $1 }
+  ' "$sums")"
+  count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$count" = "0" ]; then
+    warn "Checksum asset tidak ditemukan: $asset"
+    rm -f "$sums"
+    return 1
+  fi
+  if [ "$count" != "1" ]; then
+    warn "Checksum asset duplikat: $asset"
+    rm -f "$sums"
+    return 2
+  fi
+  expected="$(printf '%s\n' "$matches" | sed -n '1p')"
+  if ! is_sha256 "$expected"; then
+    warn "Format checksum invalid untuk asset: $asset"
+    rm -f "$sums"
+    return 2
+  fi
+
+  if curl_download "$base/$asset" "$dest"; then
+    download_status=0
+  else
+    download_status=$?
+  fi
+  if [ "$download_status" -ne 0 ]; then
+    warn "Gagal download asset Release: $asset"
+    rm -f "$dest" "$sums"
+    return 1
+  fi
+  if ! verify_file_sha256 "$dest" "$expected"; then
+    warn "SHA-256 TIDAK COCOK untuk asset: $asset"
+    rm -f "$dest" "$sums"
+    return 2
+  fi
+
+  VERIFIED_ASSET_SHA256="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+  rm -f "$sums"
+  return 0
+}
+
 download_package() {
-  local tmp_dir archive_file extract_dir
+  local tmp_dir archive_file extract_dir required
   need_cmd curl
   need_cmd tar
+  need_cmd sha256sum
+
+  if [ -z "$ARCHIVE_URL" ] && [ -n "$ARCHIVE_SHA256" ]; then
+    die "ARCHIVE_SHA256 tanpa ARCHIVE_URL tidak boleh diabaikan"
+  fi
+  if [ -n "$ARCHIVE_URL" ] && [ "$IS_LINUX" -eq 1 ] \
+    && [ "$BINARY_MODE" != "source" ]; then
+    die "ARCHIVE_URL kustom di Linux wajib dipakai bersama --build-from-source"
+  fi
 
   tmp_dir="$(mktemp -d)"
   archive_file="${tmp_dir}/warwdpgo.tar.gz"
   extract_dir="${tmp_dir}/extract"
   mkdir -p "$extract_dir"
 
-  log "Download paket dari GitHub / ARCHIVE_URL"
-  printf '    URL: %s\n' "$ARCHIVE_URL"
-  curl -fL --retry 3 --retry-delay 2 "$ARCHIVE_URL" -o "$archive_file" \
-    || die "Gagal download: $ARCHIVE_URL"
+  if [ -n "$ARCHIVE_URL" ]; then
+    log "Download paket dari ARCHIVE_URL eksplisit"
+    is_sha256 "$ARCHIVE_SHA256" \
+      || die "ARCHIVE_URL wajib disertai ARCHIVE_SHA256 64-digit"
+    printf '    URL: %s\n' "$ARCHIVE_URL"
+    curl_download "$ARCHIVE_URL" "$archive_file" \
+      || die "Gagal download ARCHIVE_URL"
+    verify_file_sha256 "$archive_file" "$ARCHIVE_SHA256" \
+      || die "SHA-256 ARCHIVE_URL tidak cocok"
+  else
+    validate_release_settings
+    resolve_latest_release_tag
+    log "Download paket GitHub Release + verifikasi SHA-256"
+    printf '    Release: %s @ %s\n' "$RELEASE_REPO" "$RELEASE_TAG"
+    download_verified_release_asset "$RELEASE_PACKAGE_ASSET" "$archive_file" \
+      || die "Gagal download/verifikasi $RELEASE_PACKAGE_ASSET"
+  fi
 
-  # GitHub archive: warwdpgo-main/...
-  # Coba strip 1 level dulu; fallback extract flat untuk URL override kustom.
+  # Release bundle punya satu top-level directory. Override kustom boleh flat.
   if ! tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1 2>/dev/null; then
     tar -xzf "$archive_file" -C "$extract_dir" || die "Gagal extract tarball"
   fi
@@ -182,9 +371,10 @@ download_package() {
       rmdir "$sub" 2>/dev/null || true
     fi
   fi
-  if [ ! -f "$extract_dir/war.php" ] && [ ! -f "$extract_dir/war.go" ] && [ ! -f "$extract_dir/install.sh" ]; then
-    die "Tarball tidak berisi file war (war.php / war.go / install.sh)"
-  fi
+  for required in war.go war.php install.sh go.mod go.sum; do
+    [ -f "$extract_dir/$required" ] \
+      || die "Tarball tidak lengkap; file wajib hilang: $required"
+  done
 
   # Ekspor path extract untuk caller (via global)
   EXTRACT_DIR="$extract_dir"
@@ -225,11 +415,17 @@ copy_file_smart() {
 
 install_files_from_extract() {
   local extract_dir="$1"
-  local f
+  local f src
 
   mkdir -p "$APP_DIR"
 
   log "Pasang file ke $APP_DIR"
+  # Semua file Go ikut agar build package "." konsisten dengan binary Release.
+  for src in "$extract_dir"/*.go; do
+    [ -f "$src" ] || continue
+    f="$(basename "$src")"
+    copy_file_smart "$src" "$APP_DIR/$f" 0
+  done
   for f in "${CORE_FILES[@]}"; do
     copy_file_smart "$extract_dir/$f" "$APP_DIR/$f" 0
   done
@@ -309,163 +505,260 @@ EOF
 # ----------------------------------------------------------------------
 # LINUX / VPS (setara vpswar.php menu 25)
 # ----------------------------------------------------------------------
-linux_setup_timezone_chrony() {
-  log "Linux: timezone Asia/Jakarta + Chrony presisi"
-
-  # Timezone hanya mengubah representasi waktu. Sinkronisasi tetap berjalan
-  # terhadap UTC melalui chronyd.
-  if command -v timedatectl >/dev/null 2>&1; then
-    run_root timedatectl set-timezone Asia/Jakarta || warn "Gagal set timezone"
+linux_set_timezone() {
+  log "Linux: timezone Asia/Jakarta"
+  if command -v timedatectl >/dev/null 2>&1 \
+    && run_root timedatectl set-timezone Asia/Jakarta; then
+    :
+  elif [ -f /usr/share/zoneinfo/Asia/Jakarta ]; then
+    run_root ln -sf /usr/share/zoneinfo/Asia/Jakarta /etc/localtime \
+      || die "Gagal memasang /etc/localtime Asia/Jakarta"
+    printf '%s\n' "Asia/Jakarta" | run_root tee /etc/timezone >/dev/null \
+      || die "Gagal menulis /etc/timezone"
   else
-    if [ -f /usr/share/zoneinfo/Asia/Jakarta ]; then
-      run_root ln -sf /usr/share/zoneinfo/Asia/Jakarta /etc/localtime || true
-      if [ -w /etc/timezone ] || [ "$(id -u)" -eq 0 ]; then
-        echo "Asia/Jakarta" | run_root tee /etc/timezone >/dev/null || true
-      fi
-    else
-      warn "timedatectl & zoneinfo tidak tersedia — set timezone manual"
-    fi
+    die "Timezone Asia/Jakarta tidak tersedia"
   fi
 
-  need_cmd chronyc
-
-  # Hanya satu daemon pengatur waktu. systemd-timesyncd dihentikan agar tidak
-  # bersaing dengan chronyd. Package chrony Ubuntu biasanya melakukan ini juga,
-  # tetapi installer memastikan ulang secara idempotent.
-  if command -v systemctl >/dev/null 2>&1; then
-    run_root systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 || true
-    run_root systemctl enable --now chrony.service \
-      || die "Gagal enable/start chrony.service"
-    run_root systemctl is-active --quiet chrony.service \
-      || die "chrony.service tidak aktif"
-  elif command -v service >/dev/null 2>&1; then
-    run_root service chrony restart || die "Gagal restart service chrony"
-  else
-    die "Tidak ada systemctl/service untuk menjalankan chronyd"
-  fi
-
-  log "Chrony: online + burst + tunggu reference dan koreksi <= ${CHRONY_MAX_CORRECTION}s"
-  run_root chronyc online >/dev/null || die "chronyc online gagal"
-  # Bila offset awal besar, izinkan satu step pada update berikutnya. Ini aman
-  # saat provisioning dan tidak dijalankan oleh war.go ketika countdown.
-  run_root chronyc makestep 0.1 1 >/dev/null \
-    || warn "chronyc makestep policy gagal; lanjut ke waitsync"
-  run_root chronyc burst 4/4 >/dev/null \
-    || die "chronyc burst gagal"
-
-  if ! run_root chronyc waitsync \
-    "$CHRONY_WAIT_TRIES" \
-    "$CHRONY_MAX_CORRECTION" \
-    "$CHRONY_MAX_SKEW" \
-    "$CHRONY_WAIT_INTERVAL"; then
-    run_root chronyc -n tracking 2>/dev/null | sed 's/^/    /' || true
-    run_root chronyc -n sources -v 2>/dev/null | sed 's/^/    /' || true
-    die "Chrony bootstrap belum sinkron: belum ada reference atau correction>${CHRONY_MAX_CORRECTION}s"
-  fi
-
-  run_root chronyc -n tracking | sed 's/^/    /' \
-    || die "Gagal membaca chronyc tracking"
-  timedatectl status 2>/dev/null | sed 's/^/    /' || true
-  ok "Timezone Asia/Jakarta + Chrony tersinkron"
+  [ "$(date +%z 2>/dev/null || true)" = "+0700" ] \
+    || die "Timezone aktif bukan Asia/Jakarta (+0700)"
+  ok "Timezone Asia/Jakarta aktif"
 }
 
 linux_apt_base() {
-  log "Linux: apt update + paket dasar"
+  log "Linux: apt update + paket dasar + chrony"
   if command -v apt-get >/dev/null 2>&1; then
     run_root apt-get update -y
-    DEBIAN_FRONTEND=noninteractive run_root apt-get install -y \
-      curl tar ca-certificates snapd chrony \
+    run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      curl tar ca-certificates chrony \
       || die "Gagal apt install paket dasar"
   elif command -v apt >/dev/null 2>&1; then
     run_root apt update -y
-    DEBIAN_FRONTEND=noninteractive run_root apt install -y \
-      curl tar ca-certificates snapd chrony \
+    run_root env DEBIAN_FRONTEND=noninteractive apt install -y \
+      curl tar ca-certificates chrony \
       || die "Gagal apt install paket dasar"
   else
-    die "Sistem ini bukan Debian/Ubuntu (butuh apt). Install curl/tar/snapd manual."
+    die "Sistem ini bukan Debian/Ubuntu apt. Installer tidak menebak package manager/provider."
   fi
+  need_cmd chronyc
+  need_cmd sha256sum
   ok "Paket dasar + chrony terpasang"
+}
+
+linux_start_chrony() {
+  local unit started=0
+  log "Linux: enable + start chrony"
+
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    for unit in chrony.service chronyd.service; do
+      if systemctl cat "$unit" >/dev/null 2>&1; then
+        run_root systemctl enable --now "$unit" \
+          || die "Gagal enable/start $unit"
+        started=1
+        break
+      fi
+    done
+  elif command -v service >/dev/null 2>&1; then
+    if run_root service chrony start >/dev/null 2>&1; then
+      started=1
+    elif run_root service chronyd start >/dev/null 2>&1; then
+      started=1
+    fi
+  fi
+
+  [ "$started" -eq 1 ] \
+    || die "Service chrony/chronyd tidak dapat dimulai; init system tidak didukung"
+  ok "Daemon chrony aktif"
+}
+
+clock_tracking_is_healthy() {
+  awk -F, \
+    -v max_correction="$CLOCK_MAX_CORRECTION_SEC" \
+    -v max_skew="$CLOCK_MAX_SKEW_PPM" \
+    -v max_error="$CLOCK_MAX_ERROR_SEC" '
+    function abs(v) { return v < 0 ? -v : v }
+    function numeric(v) {
+      return v ~ /^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$/
+    }
+    function fail(message) {
+      print "tracking tidak sehat: " message > "/dev/stderr"
+      exit 1
+    }
+    {
+      if (NF != 14) fail("jumlah field CSV " NF ", seharusnya 14")
+      sub(/\r$/, "", $14)
+      if ($1 == "7F7F0101") fail("chrony memakai synthetic local reference")
+      if (!numeric($3) || $3 < 1 || $3 > 15) fail("stratum invalid")
+      if ($14 != "Normal") fail("leap status=" $14)
+      if (!numeric($5) || !numeric($10) || !numeric($11) || !numeric($12)) {
+        fail("field numerik invalid")
+      }
+      if (abs($5) > max_correction) fail("system correction melebihi batas")
+      if ($10 < 0 || $10 > max_skew) fail("skew melebihi batas")
+      if ($12 < 0) fail("root dispersion negatif")
+      error_bound = abs($5) + $12 + (0.5 * abs($11))
+      if (error_bound > max_error) fail("clock error bound melebihi batas")
+    }
+  '
+}
+
+linux_wait_clock_health() {
+  local wait_output tracking
+  need_cmd chronyc
+  need_cmd awk
+  require_positive_integer "CLOCK_WAIT_TRIES" "$CLOCK_WAIT_TRIES"
+  require_positive_integer "CLOCK_WAIT_INTERVAL_SEC" "$CLOCK_WAIT_INTERVAL_SEC"
+  require_nonnegative_number "CLOCK_MAX_CORRECTION_SEC" "$CLOCK_MAX_CORRECTION_SEC"
+  require_nonnegative_number "CLOCK_MAX_SKEW_PPM" "$CLOCK_MAX_SKEW_PPM"
+  require_nonnegative_number "CLOCK_MAX_ERROR_SEC" "$CLOCK_MAX_ERROR_SEC"
+
+  log "Clock gate: tunggu chrony sinkron dan akurat"
+  if ! wait_output="$(LC_ALL=C chronyc -n waitsync \
+      "$CLOCK_WAIT_TRIES" \
+      "$CLOCK_MAX_CORRECTION_SEC" \
+      "$CLOCK_MAX_SKEW_PPM" \
+      "$CLOCK_WAIT_INTERVAL_SEC" 2>&1)"; then
+    printf '%s\n' "$wait_output" | sed 's/^/    /' >&2
+    LC_ALL=C chronyc -n tracking 2>&1 | sed 's/^/    /' >&2 || true
+    printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
+    die "chronyc waitsync gagal/timeout"
+  fi
+
+  if ! tracking="$(LC_ALL=C chronyc -c tracking 2>&1)"; then
+    printf '%s\n' "$tracking" | sed 's/^/    /' >&2
+    printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
+    die "chronyc tracking gagal"
+  fi
+  if ! printf '%s\n' "$tracking" | clock_tracking_is_healthy; then
+    LC_ALL=C chronyc -n tracking 2>&1 | sed 's/^/    /' >&2 || true
+    printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
+    die "Metrik chrony di luar policy"
+  fi
+
+  printf '%s\n' "__WDP_CLOCK_HEALTHY__"
+  ok "Chrony sinkron; correction/error/skew di dalam batas"
+}
+
+linux_prepare_clock() {
+  linux_apt_base
+  linux_set_timezone
+  linux_start_chrony
+  linux_wait_clock_health
 }
 
 # Go resmi ke /usr/local/go — terlihat semua user (root + macbook/ubuntu).
 # Lebih andal daripada snap (idcloud sering: snap list kosong / /snap/bin hilang).
-GO_OFFICIAL_VERSION="${GO_OFFICIAL_VERSION:-1.22.12}"
+GO_OFFICIAL_VERSION="${GO_OFFICIAL_VERSION:-1.26.5}"
+GO_OFFICIAL_SHA256="${GO_OFFICIAL_SHA256:-}"
+
+official_go_checksum() {
+  local ver="$1" arch="$2"
+  if [ -n "$GO_OFFICIAL_SHA256" ]; then
+    is_sha256 "$GO_OFFICIAL_SHA256" || die "GO_OFFICIAL_SHA256 wajib 64-digit hex"
+    printf '%s' "$GO_OFFICIAL_SHA256"
+    return 0
+  fi
+  case "$ver/$arch" in
+    1.26.5/amd64)
+      printf '%s' "5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+      ;;
+    1.26.5/arm64)
+      printf '%s' "fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+      ;;
+    *)
+      die "GO_OFFICIAL_VERSION=$ver tidak punya checksum bawaan; set GO_OFFICIAL_SHA256"
+      ;;
+  esac
+}
 
 linux_install_golang_official() {
   local ver="$GO_OFFICIAL_VERSION"
-  local arch tarball url
-  case "$(uname -m 2>/dev/null || echo x86_64)" in
+  local arch tarball url expected downloaded stage backup
+  case "$(uname -m 2>/dev/null || true)" in
     x86_64|amd64) arch=amd64 ;;
     aarch64|arm64) arch=arm64 ;;
-    *) arch=amd64 ;;
+    *) die "Arsitektur Go tidak didukung: $(uname -m 2>/dev/null || echo unknown)" ;;
   esac
   tarball="go${ver}.linux-${arch}.tar.gz"
   url="https://go.dev/dl/${tarball}"
+  expected="$(official_go_checksum "$ver" "$arch")"
+  downloaded="$(mktemp "${TMPDIR:-/tmp}/wdp-go.XXXXXX.tar.gz")" \
+    || die "Tidak bisa membuat file sementara Go"
+  stage="/usr/local/.wdp-go-stage.$$"
+  backup="/usr/local/.wdp-go-backup.$$"
 
-  log "Linux: install Go ${ver} resmi → /usr/local/go"
+  log "Linux: install Go ${ver} resmi terverifikasi → /usr/local/go"
   need_cmd curl
-  curl -fsSL --retry 3 "$url" -o "/tmp/${tarball}" || die "Gagal download $url"
-  run_root rm -rf /usr/local/go
-  run_root tar -C /usr/local -xzf "/tmp/${tarball}" || die "Gagal extract Go tarball"
-  rm -f "/tmp/${tarball}" 2>/dev/null || true
-  export PATH="/usr/local/go/bin:/snap/bin:$PATH"
-  hash -r 2>/dev/null || true
-  command -v go >/dev/null 2>&1 || [ -x /usr/local/go/bin/go ] || die "go tidak ada setelah install resmi"
-  # pastikan `go` di PATH
-  if ! command -v go >/dev/null 2>&1 && [ -x /usr/local/go/bin/go ]; then
-    export PATH="/usr/local/go/bin:$PATH"
+  need_cmd sha256sum
+  if ! curl_download "$url" "$downloaded"; then
+    rm -f "$downloaded"
+    die "Gagal download $url"
   fi
+  if ! verify_file_sha256 "$downloaded" "$expected"; then
+    rm -f "$downloaded"
+    die "SHA-256 tarball Go tidak cocok"
+  fi
+  tar -tzf "$downloaded" go/bin/go >/dev/null 2>&1 \
+    || { rm -f "$downloaded"; die "Isi tarball Go tidak valid"; }
+
+  run_root rm -rf "$stage" "$backup"
+  run_root mkdir -p "$stage"
+  if ! run_root tar -C "$stage" -xzf "$downloaded"; then
+    rm -f "$downloaded"
+    run_root rm -rf "$stage"
+    die "Gagal extract Go tarball"
+  fi
+  rm -f "$downloaded"
+  [ -x "$stage/go/bin/go" ] || {
+    run_root rm -rf "$stage"
+    die "Binary go tidak ada di hasil extract"
+  }
+
+  if [ -e /usr/local/go ]; then
+    run_root mv /usr/local/go "$backup" || {
+      run_root rm -rf "$stage"
+      die "Gagal menyiapkan upgrade /usr/local/go"
+    }
+  fi
+  if ! run_root mv "$stage/go" /usr/local/go; then
+    [ ! -e "$backup" ] || run_root mv "$backup" /usr/local/go || true
+    run_root rm -rf "$stage"
+    die "Gagal memasang /usr/local/go"
+  fi
+  run_root rm -rf "$stage" "$backup"
+
+  export PATH="/usr/local/go/bin:$PATH"
+  hash -r 2>/dev/null || true
+  [ -x /usr/local/go/bin/go ] || die "go tidak ada setelah install resmi"
   ok "Go resmi: $(/usr/local/go/bin/go version 2>/dev/null || go version)"
 }
 
-linux_install_golang_snap() {
-  log "Linux: coba Golang via snap (go --classic)"
-  ensure_path_snap
-  if command -v systemctl >/dev/null 2>&1; then
-    run_root systemctl enable --now snapd.socket 2>/dev/null || true
-    run_root systemctl start snapd 2>/dev/null || true
-    if [ ! -e /snap ] && [ -d /var/lib/snapd/snap ]; then
-      run_root ln -sfn /var/lib/snapd/snap /snap 2>/dev/null || true
-    fi
-    sleep 2
-  fi
-  command -v snap >/dev/null 2>&1 || return 1
-  local attempt
-  for attempt in 1 2 3; do
-    if run_root snap install go --classic; then
-      ensure_path_snap
-      hash -r 2>/dev/null || true
-      if command -v go >/dev/null 2>&1 || [ -x /snap/bin/go ]; then
-        export PATH="/snap/bin:$PATH"
-        ok "Go snap: $(go version 2>/dev/null || /snap/bin/go version)"
-        return 0
-      fi
-    fi
-    sleep 3
-  done
-  return 1
+required_go_version() {
+  awk '$1 == "go" { print $2; exit }' "$APP_DIR/go.mod"
+}
+
+go_version_at_least() {
+  local actual="$1" required="$2" first
+  actual="${actual#go}"
+  first="$(printf '%s\n%s\n' "$required" "$actual" | sort -V | head -n1)"
+  [ "$first" = "$required" ]
 }
 
 linux_install_golang() {
   export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  local gobin actual required
+  required="$(required_go_version)"
+  [ -n "$required" ] || die "Versi Go tidak ditemukan di $APP_DIR/go.mod"
 
-  if command -v go >/dev/null 2>&1 || [ -x /usr/local/go/bin/go ] || [ -x /snap/bin/go ]; then
-    export PATH="/usr/local/go/bin:/snap/bin:$PATH"
-    ok "Go sudah ada: $(go version 2>/dev/null || /usr/local/go/bin/go version 2>/dev/null || /snap/bin/go version)"
-    return 0
+  if gobin="$(resolve_go_bin 2>/dev/null)"; then
+    actual="$("$gobin" env GOVERSION 2>/dev/null || true)"
+    if [ -n "$actual" ] && go_version_at_least "$actual" "$required"; then
+      ok "Go sudah memenuhi go.mod: $actual (minimum $required)"
+      return 0
+    fi
+    warn "Go ${actual:-unknown} lebih lama dari kebutuhan $required; upgrade resmi"
   fi
 
-  # Utama: tarball resmi (semua user bisa pakai /usr/local/go/bin/go)
-  if linux_install_golang_official; then
-    return 0
-  fi
-
-  # Cadangan: snap
-  if linux_install_golang_snap; then
-    return 0
-  fi
-
-  die "Gagal install Go (official tarball + snap)"
+  linux_install_golang_official
 }
 
 # GOPATH/GOMODCACHE HARUS di luar APP_DIR (folder yang berisi go.mod).
@@ -527,116 +820,281 @@ resolve_go_bin() {
   fi
 }
 
+linux_release_arch() {
+  case "$(uname -m 2>/dev/null || true)" in
+    x86_64|amd64) printf '%s' "amd64" ;;
+    aarch64|arm64) printf '%s' "arm64" ;;
+    *) return 1 ;;
+  esac
+}
+
+try_install_prebuilt_war_binary() {
+  # Return: 1=asset/arch unavailable, 2=integrity failure, 3=local commit failure.
+  local arch asset app_dir_abs staged expected manifest_tmp download_status
+  local binary_backup="" manifest_backup="" had_binary=0 had_manifest=0
+  arch="$(linux_release_arch)" || {
+    warn "Arsitektur prebuilt tidak didukung: $(uname -m 2>/dev/null || echo unknown)"
+    return 1
+  }
+  validate_release_settings
+  resolve_latest_release_tag
+  printf '%s\n' "$RELEASE_BINARY_PREFIX" \
+    | grep -Eq '^[A-Za-z0-9._-]+$' \
+    || die "RELEASE_BINARY_PREFIX tidak valid"
+
+  mkdir -p "$APP_DIR" || return 3
+  app_dir_abs="$(cd "$APP_DIR" && pwd -P)" || return 3
+  asset="${RELEASE_BINARY_PREFIX}-${arch}"
+  staged="$(mktemp "$app_dir_abs/.war.release.XXXXXX")" || {
+    warn "Tidak bisa membuat staging binary di $app_dir_abs"
+    return 3
+  }
+
+  log "Install prebuilt $asset dari GitHub Release"
+  if download_verified_release_asset "$asset" "$staged"; then
+    download_status=0
+  else
+    download_status=$?
+  fi
+  if [ "$download_status" -ne 0 ]; then
+    rm -f "$staged"
+    return "$download_status"
+  fi
+  expected="$VERIFIED_ASSET_SHA256"
+  if [ ! -s "$staged" ] || ! verify_file_sha256 "$staged" "$expected"; then
+    warn "Binary staging kosong atau berubah setelah verifikasi"
+    rm -f "$staged"
+    return 2
+  fi
+  chmod 0755 "$staged" || {
+    rm -f "$staged"
+    return 3
+  }
+
+  manifest_tmp="$(mktemp "$app_dir_abs/.wdp-war-release.XXXXXX")" \
+    || { rm -f "$staged"; return 3; }
+  if ! {
+    printf 'repository=%s\n' "$RELEASE_REPO"
+    printf 'release_tag=%s\n' "$RELEASE_TAG"
+    printf 'asset=%s\n' "$asset"
+    printf 'sha256=%s\n' "$expected"
+  } > "$manifest_tmp"; then
+    rm -f "$staged" "$manifest_tmp"
+    return 3
+  fi
+  chmod 0644 "$manifest_tmp" || {
+    rm -f "$staged" "$manifest_tmp"
+    return 3
+  }
+
+  # Siapkan rollback sebelum commit. Staging dan backup tetap di filesystem APP_DIR.
+  if [ -e "$app_dir_abs/war" ]; then
+    binary_backup="$(mktemp "$app_dir_abs/.war.backup.XXXXXX")" || {
+      rm -f "$staged" "$manifest_tmp"
+      return 3
+    }
+    cp -p -- "$app_dir_abs/war" "$binary_backup" || {
+      cleanup_paths "$staged" "$manifest_tmp" "$binary_backup"
+      return 3
+    }
+    had_binary=1
+  fi
+  if [ -e "$app_dir_abs/.wdp-war-release" ]; then
+    manifest_backup="$(mktemp "$app_dir_abs/.wdp-war-release.backup.XXXXXX")" || {
+      cleanup_paths "$staged" "$manifest_tmp" "$binary_backup"
+      return 3
+    }
+    cp -p -- "$app_dir_abs/.wdp-war-release" "$manifest_backup" || {
+      cleanup_paths "$staged" "$manifest_tmp" "$binary_backup" "$manifest_backup"
+      return 3
+    }
+    had_manifest=1
+  fi
+
+  # Binary replacement adalah satu rename atomik pada filesystem yang sama.
+  if ! mv -f -- "$staged" "$app_dir_abs/war"; then
+    cleanup_paths "$staged" "$manifest_tmp" "$binary_backup" "$manifest_backup"
+    return 3
+  fi
+  if ! mv -f -- "$manifest_tmp" "$app_dir_abs/.wdp-war-release" \
+    || ! verify_file_sha256 "$app_dir_abs/war" "$expected"; then
+    if [ "$had_binary" -eq 1 ]; then
+      mv -f -- "$binary_backup" "$app_dir_abs/war" || true
+    else
+      rm -f "$app_dir_abs/war"
+    fi
+    if [ "$had_manifest" -eq 1 ]; then
+      mv -f -- "$manifest_backup" "$app_dir_abs/.wdp-war-release" || true
+    else
+      rm -f "$app_dir_abs/.wdp-war-release"
+    fi
+    cleanup_paths "$staged" "$manifest_tmp" "$binary_backup" "$manifest_backup"
+    return 3
+  fi
+  cleanup_paths "$binary_backup" "$manifest_backup"
+
+  printf '%s\n' "__WDP_WAR_BIN_OK__"
+  ok "Binary Release terverifikasi dan terpasang atomik: $app_dir_abs/war"
+}
+
 prebuild_war_binary() {
-  log "Prebuild war (go mod download + go build) — biar tidak download saat jalan"
+  local source_dir="$1"
+  log "Prebuild war dari source terverifikasi"
   export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
-  local gobin
+  local gobin app_dir_abs source_dir_abs staged
   gobin="$(resolve_go_bin)" || die "perintah go tidak ditemukan untuk prebuild"
   ensure_go_workspace
-  (
-    cd "$APP_DIR"
-    "$gobin" mod download || die "go mod download gagal"
-    "$gobin" mod tidy || warn "go mod tidy warning (lanjut build)"
-    # Binary siap pakai: ./war  (tanpa go run / tanpa jaringan)
-    "$gobin" build -o war war.go || die "go build war.go gagal"
-    chmod +x war 2>/dev/null || true
-  ) || die "Prebuild war gagal"
-  if [ -x "$APP_DIR/war" ] || [ -f "$APP_DIR/war" ]; then
-    ok "Binary siap: $APP_DIR/war ($(du -h "$APP_DIR/war" 2>/dev/null | awk '{print $1}' || echo '?'))"
-    ok "Jalankan: cd $APP_DIR && ./war"
-  else
-    die "Binary $APP_DIR/war tidak terbentuk"
+  app_dir_abs="$(cd "$APP_DIR" && pwd -P)" \
+    || die "APP_DIR tidak bisa diakses: $APP_DIR"
+  source_dir_abs="$(cd "$source_dir" && pwd -P)" \
+    || die "Source staging tidak bisa diakses: $source_dir"
+  staged="$(mktemp "$app_dir_abs/.war.build.XXXXXX")" \
+    || die "Tidak bisa membuat staging build"
+  rm -f "$staged"
+
+  if ! (
+    cd "$source_dir_abs" || exit 1
+    GOFLAGS="-mod=readonly" GOTOOLCHAIN=local "$gobin" mod download || exit 1
+    GOFLAGS="-mod=readonly" GOTOOLCHAIN=local "$gobin" mod verify || exit 1
+    CGO_ENABLED=0 GOFLAGS="-mod=readonly" GOTOOLCHAIN=local \
+      "$gobin" build -trimpath -o "$staged" . || exit 1
+  ); then
+    rm -f "$staged"
+    die "Build source gagal; binary lama tidak diubah"
   fi
+  [ -s "$staged" ] || {
+    rm -f "$staged"
+    die "Build source menghasilkan binary kosong"
+  }
+  chmod 0755 "$staged"
+  mv -f -- "$staged" "$app_dir_abs/war" \
+    || { rm -f "$staged"; die "Gagal mengganti binary secara atomik"; }
+  rm -f "$app_dir_abs/.wdp-war-release"
+
+  printf '%s\n' "__WDP_WAR_BIN_OK__"
+  ok "Binary source siap dan terpasang atomik: $app_dir_abs/war"
 }
 
 setup_go_mod() {
-  # Linux/VPS only — pastikan go.mod/go.sum + fasthttp siap untuk war.go
-  log "Setup Go module (go.mod + fasthttp) di $APP_DIR"
+  local source_dir="$1"
+  # Source build sengaja fail-closed: release wajib membawa lockfile utuh.
+  log "Verifikasi Go module terkunci di source staging"
   export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
   local gobin
   gobin="$(resolve_go_bin)" || die "perintah go tidak ditemukan"
   mkdir -p "$APP_DIR"
   ensure_go_workspace
+  [ -f "$source_dir/go.mod" ] || die "Paket source tidak berisi go.mod"
+  [ -f "$source_dir/go.sum" ] || die "Paket source tidak berisi go.sum"
+  [ -f "$source_dir/war.go" ] || die "Paket source tidak berisi war.go"
   ok "GOPATH=$GOPATH (di luar APP_DIR)"
   ok "go bin: $gobin"
-  (
-    cd "$APP_DIR"
-    if [ ! -f go.mod ]; then
-      "$gobin" mod init "$GO_MOD_NAME" 2>/dev/null || "$gobin" mod init "$GO_MOD_NAME"
-      ok "go mod init $GO_MOD_NAME"
-    else
-      ok "go.mod sudah ada (dari paket)"
-    fi
-    "$gobin" get "$FASTHTTP_PKG" || die "go get $FASTHTTP_PKG gagal (cek jaringan)"
-    if [ -f war.go ]; then
-      "$gobin" mod tidy || warn "go mod tidy gagal (boleh diulang manual)"
-    fi
-    "$gobin" list -m all 2>/dev/null | head -n 5 | sed 's/^/    /' || true
-  ) || die "Gagal setup go.mod / go get"
-  ok "Modul Go siap ($GO_MOD_NAME + $FASTHTTP_PKG)"
 
   install_go_env_file
-  prebuild_war_binary
+  prebuild_war_binary "$source_dir"
+  ok "go.mod + go.sum terverifikasi tanpa go get/tidy"
 }
 
 # linux_install_php() — DINONAKTIFKAN sementara (Linux fokus Golang saja).
 # Aktifkan lagi di do_install_linux() jika war.php dibutuhkan di VPS.
+
+install_linux_war_binary() {
+  local source_dir="$1" prebuilt_status
+  case "$BINARY_MODE" in
+    release)
+      if try_install_prebuilt_war_binary; then
+        INSTALLED_BINARY_KIND="release"
+        return 0
+      else
+        prebuilt_status=$?
+      fi
+      case "$prebuilt_status" in
+        1)
+          case "$ALLOW_SOURCE_FALLBACK" in
+            1)
+              warn "Prebuilt tidak tersedia; source fallback diizinkan eksplisit"
+              ;;
+            0)
+              die "Prebuilt tidak tersedia. Ulangi dengan --allow-source-fallback atau --build-from-source"
+              ;;
+            *)
+              die "ALLOW_SOURCE_FALLBACK hanya boleh 0 atau 1"
+              ;;
+          esac
+          ;;
+        2)
+          die "Verifikasi integritas prebuilt gagal; source fallback sengaja diblokir"
+          ;;
+        *)
+          die "Commit prebuilt gagal secara lokal; binary lama dipertahankan bila ada"
+          ;;
+      esac
+      ;;
+    source)
+      ;;
+    *)
+      die "BINARY_MODE tidak valid: $BINARY_MODE (pilih release atau source)"
+      ;;
+  esac
+
+  linux_install_golang
+  setup_go_mod "$source_dir"
+  INSTALLED_BINARY_KIND="source"
+}
+
+verify_linux_setup() {
+  local manifest="$APP_DIR/.wdp-war-release" expected installed_sha clock_output
+  [ -s "$APP_DIR/war" ] || die "Verify binary gagal: $APP_DIR/war kosong/tidak ada"
+  [ -x "$APP_DIR/war" ] || die "Verify binary gagal: $APP_DIR/war tidak executable"
+  installed_sha="$(sha256sum "$APP_DIR/war" | awk '{print $1}')" \
+    || die "Tidak bisa menghitung checksum binary terpasang"
+  is_sha256 "$installed_sha" || die "Checksum binary terpasang invalid"
+
+  if [ "${INSTALLED_BINARY_KIND:-}" = "release" ] && [ ! -f "$manifest" ]; then
+    die "Manifest wajib untuk binary Release"
+  fi
+  if [ -f "$manifest" ]; then
+    expected="$(awk -F= '$1 == "sha256" { print $2 }' "$manifest")"
+    is_sha256 "$expected" || die "Manifest Release punya checksum invalid"
+    verify_file_sha256 "$APP_DIR/war" "$expected" \
+      || die "Checksum binary terpasang tidak cocok dengan manifest"
+  fi
+
+  printf '%s\n' "__WDP_WAR_BIN_OK__"
+  ok "Verify binary hash: $installed_sha"
+  need_cmd timeout
+  require_positive_integer "CLOCK_CHECK_TIMEOUT_SEC" "$CLOCK_CHECK_TIMEOUT_SEC"
+  if ! clock_output="$(
+    cd "$APP_DIR" \
+      && timeout --signal=TERM "${CLOCK_CHECK_TIMEOUT_SEC}s" \
+        ./war --check-clock 2>&1
+  )"; then
+    printf '%s\n' "$clock_output" | sed 's/^/    /' >&2
+    die "Runtime clock check gagal: war --check-clock"
+  fi
+  [ -z "$clock_output" ] || printf '%s\n' "$clock_output" | sed 's/^/    /'
+
+  # Marker agregat hanya muncul setelah hash/manifest dan runtime clock gate lulus.
+  printf '%s\n' "__WDP_INSTALL_OK__"
+}
 
 verify_golang_setup() {
   export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
   local gobin
   gobin="$(resolve_go_bin)" || die "Verify Go gagal: binary go tidak ada"
   ok "Verify: $($gobin version) → __WDP_GO_SETUP_OK__"
-  if [ -x "$APP_DIR/war" ]; then
-    ok "Verify binary: $APP_DIR/war → __WDP_WAR_BIN_OK__"
-  else
-    die "Binary ./war belum ada atau tidak executable setelah prebuild"
-  fi
-
-  log "Verify clock contract dari binary war"
-  local clock_output clock_rc
-  clock_rc=0
-  clock_output="$(cd "$APP_DIR" && ./war --check-clock 2>&1)" || clock_rc=$?
-  if [ "$clock_rc" -ne 0 ]; then
-    printf '%s\n' "$clock_output" | sed 's/^/    /'
-    if [ "$clock_rc" -eq 78 ] \
-      && printf '%s' "$clock_output" | grep -q "__WDP_CLOCK_UNHEALTHY__"; then
-      printf '%s\n' "__WDP_CLOCK_SETTLING__ chronyd akan terus mengumpulkan sampel"
-      if [ "$CHRONY_REQUIRE_WAR_CLOCK_HEALTHY" = "1" ]; then
-        die "Clock belum memenuhi gate war ketat dan strict install diaktifkan"
-      fi
-      warn "Clock bootstrap sudah terkoreksi, tetapi skew/dispersion belum matang; installer lanjut, war tetap akan menolak sampai sehat"
-    else
-      die "war --check-clock gagal dengan exit ${clock_rc}"
-    fi
-  else
-    printf '%s\n' "$clock_output" | sed 's/^/    /'
-    case "$clock_output" in
-      *"__WDP_CLOCK_HEALTHY__"*)
-        ok "Clock runtime terverifikasi → __WDP_CLOCK_HEALTHY__"
-        ;;
-      *)
-        die "war --check-clock exit 0 tanpa marker sehat"
-        ;;
-    esac
-  fi
-  if command -v systemctl >/dev/null 2>&1 \
-    && ! run_root systemctl is-active --quiet chrony.service 2>/dev/null; then
-    die "chrony.service berhenti setelah setup"
-  fi
+  verify_linux_setup
 }
 
 do_setup_golang_only() {
   [ "$IS_LINUX" -eq 1 ] || die "--go-only hanya untuk Linux/VPS (Termux Android pakai PHP saja)"
-  linux_apt_base
-  linux_setup_timezone_chrony
+  BINARY_MODE="source"
+  linux_prepare_clock
+  download_package
+  install_files_from_extract "$EXTRACT_DIR"
   linux_install_golang
-  if [ ! -f "$APP_DIR/war.go" ]; then
-    download_package
-    install_files_from_extract "$EXTRACT_DIR"
-    cleanup_download
-  fi
-  setup_go_mod
+  setup_go_mod "$EXTRACT_DIR"
+  cleanup_download
   verify_golang_setup
   cat <<EOF
 
@@ -648,21 +1106,16 @@ Jalankan war (langsung, tanpa download):
   ./war
 ============================================================
 EOF
-  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-bootstrap-v1"
 }
 
 do_install_linux() {
-  linux_apt_base
-  linux_setup_timezone_chrony
-  # PHP CLI sengaja di-skip (fokus Golang di VPS)
-  linux_install_golang
-
+  linux_prepare_clock
   download_package
   install_files_from_extract "$EXTRACT_DIR"
-  cleanup_download
 
-  setup_go_mod
-  verify_golang_setup
+  install_linux_war_binary "$EXTRACT_DIR"
+  cleanup_download
+  verify_linux_setup
 
   cat <<EOF
 
@@ -670,14 +1123,9 @@ do_install_linux() {
 ✓ LINUX/VPS siap — WAR Golang di $APP_DIR
 
 Yang sudah dikonfigurasi:
-  • apt update + paket dasar (curl, tar, snapd, chrony)
-  • timezone Asia/Jakarta + Chrony (timesyncd dimatikan)
-  • bootstrap waitsync correction <= ${CHRONY_MAX_CORRECTION}s
-  • chronyd terus mematangkan skew/dispersion di background
-  • ./war --check-clock tetap menjadi gate ketat sebelum war
-  • snap install go --classic
-  • go mod download + go build → binary ./war
-  • env permanen: $APP_DIR/wdp-env.sh (+ ~/.bashrc)
+  • timezone Asia/Jakarta + chrony fail-closed
+  • binary ${INSTALLED_BINARY_KIND:-unknown} terverifikasi dan diganti atomik
+  • source build hanya bila diminta eksplisit
 
 Edit config:
   nano $APP_DIR/waktu.txt
@@ -687,48 +1135,49 @@ Jalankan (disarankan — TANPA download GitHub):
   cd $APP_DIR
   ./war
 
-Atau (butuh source env dulu):
-  . $APP_DIR/wdp-env.sh
-  go run war.go
-
-Update file dari GitHub:
+Update dari GitHub Release:
   bash $APP_DIR/install.sh --update
 ============================================================
 EOF
-  printf '%s\n' "__WDP_INSTALL_OK__ contract=chrony-bootstrap-v1"
 }
 
 # ----------------------------------------------------------------------
 # Update-only
 # ----------------------------------------------------------------------
 do_update_files() {
-  log "Mode update: sync file dari ARCHIVE_URL ke $APP_DIR"
+  log "Mode update: sync paket Release ke $APP_DIR"
+  if [ "$IS_LINUX" -eq 1 ]; then
+    linux_prepare_clock
+  fi
   download_package
   install_files_from_extract "$EXTRACT_DIR"
-  cleanup_download
 
-  # Linux: refresh go mod bila go tersedia (Termux skip — PHP only)
-  if [ "$IS_LINUX" -eq 1 ] && command -v go >/dev/null 2>&1; then
-    ensure_path_snap
-    (
-      cd "$APP_DIR"
-      if [ ! -f go.mod ]; then
-        go mod init "$GO_MOD_NAME" 2>/dev/null || true
-      fi
-      if [ -f war.go ] || [ -f go.mod ]; then
-        go get "$FASTHTTP_PKG" 2>/dev/null || true
-        go mod tidy 2>/dev/null || true
-      fi
-    ) || true
+  if [ "$IS_LINUX" -eq 1 ]; then
+    install_linux_war_binary "$EXTRACT_DIR"
+    verify_linux_setup
   fi
+  cleanup_download
 
   cat <<EOF
 
 ============================================================
 ✓ Update selesai → $APP_DIR
+  Binary Linux: ${INSTALLED_BINARY_KIND:-tidak berlaku}
   (config berisi data lokal tidak di-overwrite; pakai --force untuk ganti)
 ============================================================
 EOF
+}
+
+do_clock_only() {
+  [ "$IS_LINUX" -eq 1 ] || die "--clock-only hanya untuk Linux/VPS"
+  linux_prepare_clock
+}
+
+do_verify_clock() {
+  [ "$IS_LINUX" -eq 1 ] || die "--verify-clock hanya untuk Linux/VPS"
+  [ "$(date +%z 2>/dev/null || true)" = "+0700" ] \
+    || die "Timezone aktif bukan Asia/Jakarta (+0700)"
+  linux_wait_clock_health
 }
 
 # ----------------------------------------------------------------------
@@ -746,6 +1195,7 @@ show_menu() {
   2) Update file dari GitHub saja
   3) Setup Golang saja (Linux/VPS only)
   4) Force overwrite config + full install
+  5) Setup + verifikasi chrony saja (Linux/VPS only)
   0) Keluar
 ============================================================
 EOF
@@ -761,8 +1211,9 @@ EOF
   case "$choice" in
     1) MODE="auto" ;;
     2) MODE="update" ;;
-    3) MODE="go-only" ;;
+    3) MODE="go-only"; BINARY_MODE="source" ;;
     4) FORCE_OVERWRITE=1; MODE="auto" ;;
+    5) MODE="clock-only" ;;
     0) exit 0 ;;
     *) warn "Pilihan tidak dikenal, pakai full install"; MODE="auto" ;;
   esac
@@ -792,12 +1243,21 @@ main() {
     go-only)
       do_setup_golang_only
       ;;
-    auto|*)
+    clock-only)
+      do_clock_only
+      ;;
+    verify-clock)
+      do_verify_clock
+      ;;
+    auto)
       if [ "$IS_TERMUX" -eq 1 ]; then
         do_install_termux
       else
         do_install_linux
       fi
+      ;;
+    *)
+      die "Mode internal tidak dikenal: $MODE"
       ;;
   esac
 
@@ -808,4 +1268,6 @@ main() {
   fi
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
