@@ -31,8 +31,8 @@ ARCHIVE_URL="${ARCHIVE_URL:-}"
 ARCHIVE_SHA256="${ARCHIVE_SHA256:-}"
 
 # Policy kesehatan clock. Unit correction/error adalah detik; skew adalah ppm.
-CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-60}"
-CLOCK_WAIT_INTERVAL_SEC="${CLOCK_WAIT_INTERVAL_SEC:-2}"
+CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-120}"
+CLOCK_WAIT_INTERVAL_SEC="${CLOCK_WAIT_INTERVAL_SEC:-1}"
 CLOCK_MAX_CORRECTION_SEC="${CLOCK_MAX_CORRECTION_SEC:-0.005}"
 CLOCK_MAX_RMS_SEC="${CLOCK_MAX_RMS_SEC:-0.010}"
 CLOCK_MAX_SKEW_PPM="${CLOCK_MAX_SKEW_PPM:-100}"
@@ -55,6 +55,8 @@ FORCE_OVERWRITE=0
 MODE="auto" # auto | menu | update | go-only | clock-only | verify-clock
 BINARY_MODE="${BINARY_MODE:-release}" # release | source
 ALLOW_SOURCE_FALLBACK="${ALLOW_SOURCE_FALLBACK:-0}"
+RELEASE_CHECKSUM_FILE=""
+RELEASE_CHECKSUM_TAG=""
 
 # ----------------------------------------------------------------------
 # Util
@@ -235,7 +237,8 @@ resolve_latest_release_tag() {
   [ "$RELEASE_TAG" = "latest" ] || return 0
   release_url="https://github.com/$RELEASE_REPO/releases/latest"
   effective="$(curl --fail --location --silent --show-error \
-    --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 1 --connect-timeout 15 --max-time 180 \
+    --proto '=https' --tlsv1.2 \
     --output /dev/null --write-out '%{url_effective}' "$release_url")" \
     || die "Gagal resolve GitHub Release latest"
   effective="${effective%/}"
@@ -257,8 +260,29 @@ curl_download() {
     *) warn "Tolak URL non-HTTPS: $url"; return 1 ;;
   esac
   curl --fail --location --silent --show-error \
-    --retry 3 --retry-delay 2 --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 1 --connect-timeout 15 --max-time 180 \
+    --proto '=https' --tlsv1.2 \
     "$url" -o "$dest"
+}
+
+ensure_release_checksums() {
+  local base sums
+  if [ -n "$RELEASE_CHECKSUM_FILE" ] \
+    && [ "$RELEASE_CHECKSUM_TAG" = "$RELEASE_TAG" ] \
+    && [ -s "$RELEASE_CHECKSUM_FILE" ]; then
+    return 0
+  fi
+
+  base="$(release_download_base)"
+  sums="${TMP_DIR:-${TMPDIR:-/tmp}}/SHA256SUMS.$$"
+  rm -f "$sums"
+  if ! curl_download "$base/$RELEASE_CHECKSUM_ASSET" "$sums"; then
+    warn "Gagal download checksum Release: $base/$RELEASE_CHECKSUM_ASSET"
+    rm -f "$sums"
+    return 1
+  fi
+  RELEASE_CHECKSUM_FILE="$sums"
+  RELEASE_CHECKSUM_TAG="$RELEASE_TAG"
 }
 
 verify_file_sha256() {
@@ -274,14 +298,10 @@ download_verified_release_asset() {
   local base sums expected matches count download_status
   VERIFIED_ASSET_SHA256=""
   base="$(release_download_base)"
-  sums="${dest}.SHA256SUMS.$$"
-  rm -f "$dest" "$sums"
+  rm -f "$dest"
 
-  if ! curl_download "$base/$RELEASE_CHECKSUM_ASSET" "$sums"; then
-    warn "Gagal download checksum Release: $base/$RELEASE_CHECKSUM_ASSET"
-    rm -f "$sums"
-    return 1
-  fi
+  ensure_release_checksums || return 1
+  sums="$RELEASE_CHECKSUM_FILE"
 
   matches="$(awk -v asset="$asset" '
     $2 == asset || $2 == "*" asset { print $1 }
@@ -289,18 +309,15 @@ download_verified_release_asset() {
   count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
   if [ "$count" = "0" ]; then
     warn "Checksum asset tidak ditemukan: $asset"
-    rm -f "$sums"
     return 1
   fi
   if [ "$count" != "1" ]; then
     warn "Checksum asset duplikat: $asset"
-    rm -f "$sums"
     return 2
   fi
   expected="$(printf '%s\n' "$matches" | sed -n '1p')"
   if ! is_sha256 "$expected"; then
     warn "Format checksum invalid untuk asset: $asset"
-    rm -f "$sums"
     return 2
   fi
 
@@ -311,17 +328,16 @@ download_verified_release_asset() {
   fi
   if [ "$download_status" -ne 0 ]; then
     warn "Gagal download asset Release: $asset"
-    rm -f "$dest" "$sums"
+    rm -f "$dest"
     return 1
   fi
   if ! verify_file_sha256 "$dest" "$expected"; then
     warn "SHA-256 TIDAK COCOK untuk asset: $asset"
-    rm -f "$dest" "$sums"
+    rm -f "$dest"
     return 2
   fi
 
   VERIFIED_ASSET_SHA256="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
-  rm -f "$sums"
   return 0
 }
 
@@ -340,6 +356,10 @@ download_package() {
   fi
 
   tmp_dir="$(mktemp -d)"
+  TMP_DIR="$tmp_dir"
+  RELEASE_CHECKSUM_FILE=""
+  RELEASE_CHECKSUM_TAG=""
+  trap cleanup_download EXIT
   archive_file="${tmp_dir}/warwdpgo.tar.gz"
   extract_dir="${tmp_dir}/extract"
   mkdir -p "$extract_dir"
@@ -388,11 +408,14 @@ download_package() {
 }
 
 cleanup_download() {
+  trap - EXIT
   if [ -n "${TMP_DIR:-}" ] && [ -d "${TMP_DIR:-}" ]; then
     rm -rf "$TMP_DIR"
   fi
   TMP_DIR=""
   EXTRACT_DIR=""
+  RELEASE_CHECKSUM_FILE=""
+  RELEASE_CHECKSUM_TAG=""
 }
 
 copy_file_smart() {
@@ -529,21 +552,115 @@ linux_set_timezone() {
   ok "Timezone Asia/Jakarta aktif"
 }
 
+linux_apt_sources_https() {
+  local source_file changed=0
+  [ -d /etc/apt ] || return 0
+  while IFS= read -r source_file; do
+    if grep -Eq 'http://([^/]*\.)?archive\.ubuntu\.com/ubuntu|http://security\.ubuntu\.com/ubuntu|http://ports\.ubuntu\.com/ubuntu-ports' "$source_file"; then
+      run_root sed -i -E \
+        -e 's#http://(([^/]*\.)?archive\.ubuntu\.com/ubuntu)#https://\1#g' \
+        -e 's#http://(security\.ubuntu\.com/ubuntu)#https://\1#g' \
+        -e 's#http://(ports\.ubuntu\.com/ubuntu-ports)#https://\1#g' \
+        "$source_file" || die "Gagal mengubah source Ubuntu ke HTTPS: $source_file"
+      changed=1
+    fi
+  done < <(find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) -print 2>/dev/null)
+  [ "$changed" -eq 0 ] || ok "Source resmi Ubuntu memakai HTTPS"
+}
+
+linux_have_ca_bundle() {
+  [ -s /etc/ssl/certs/ca-certificates.crt ] \
+    || [ -s /etc/pki/tls/certs/ca-bundle.crt ] \
+    || [ -s /etc/ssl/cert.pem ]
+}
+
 linux_apt_base() {
-  log "Linux: apt update + paket dasar + chrony"
+  local package candidate need_update=0 install_ok=0
+  local -a packages=()
+  local -a apt_cmd=()
+  local -a install_flags=(--no-install-recommends --no-upgrade)
+  local -a apt_opts=(
+    -o Acquire::ForceIPv4=true
+    -o Acquire::Retries=2
+    -o Acquire::http::Timeout=12
+    -o Acquire::https::Timeout=20
+    -o DPkg::Lock::Timeout=60
+    -o Dpkg::Use-Pty=0
+  )
+
+  if ! linux_have_ca_bundle \
+    && command -v update-ca-certificates >/dev/null 2>&1; then
+    run_root update-ca-certificates --fresh >/dev/null 2>&1 || true
+  fi
+  linux_have_ca_bundle \
+    || die "CA bundle HTTPS tidak tersedia; bootstrap aman tidak dapat dilanjutkan"
+
+  command -v curl >/dev/null 2>&1 || packages+=(curl)
+  command -v tar >/dev/null 2>&1 || packages+=(tar)
+  command -v chronyc >/dev/null 2>&1 || packages+=(chrony)
+  if ! command -v sha256sum >/dev/null 2>&1 \
+    || ! command -v timeout >/dev/null 2>&1; then
+    packages+=(coreutils)
+  fi
+  if [ "${#packages[@]}" -eq 0 ]; then
+    log "Linux: paket dasar + chrony sudah tersedia (skip APT)"
+    ok "Fast path dependency aktif"
+    return 0
+  fi
+
   if command -v apt-get >/dev/null 2>&1; then
-    run_root apt-get update -y
-    run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-      curl tar ca-certificates chrony \
-      || die "Gagal apt install paket dasar"
+    apt_cmd=(apt-get)
   elif command -v apt >/dev/null 2>&1; then
-    run_root apt update -y
-    run_root env DEBIAN_FRONTEND=noninteractive apt install -y \
-      curl tar ca-certificates chrony \
-      || die "Gagal apt install paket dasar"
+    apt_cmd=(apt)
   else
     die "Sistem ini bukan Debian/Ubuntu apt. Installer tidak menebak package manager/provider."
   fi
+
+  log "Linux: install dependency yang belum ada: ${packages[*]}"
+  linux_apt_sources_https
+
+  if command -v apt-cache >/dev/null 2>&1; then
+    for package in "${packages[@]}"; do
+      candidate="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ { print $2; exit }')"
+      if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+        need_update=1
+        break
+      fi
+    done
+  else
+    need_update=1
+  fi
+
+  if [ "$need_update" -eq 1 ]; then
+    run_root "${apt_cmd[@]}" "${apt_opts[@]}" update \
+      || warn "Sebagian repository APT gagal diperbarui; validasi kandidat paket wajib tetap dijalankan"
+    for package in "${packages[@]}"; do
+      candidate="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ { print $2; exit }')"
+      if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+        printf '%s\n' "__WDP_APT_TRANSIENT__" >&2
+        die "Repository APT tidak menyediakan kandidat paket: $package"
+      fi
+    done
+  fi
+
+  if run_root env DEBIAN_FRONTEND=noninteractive \
+    "${apt_cmd[@]}" "${apt_opts[@]}" install -y \
+      "${install_flags[@]}" "${packages[@]}"; then
+    install_ok=1
+  elif [ "$need_update" -eq 0 ]; then
+    warn "Cache APT lama gagal dipakai; refresh index satu kali"
+    run_root "${apt_cmd[@]}" "${apt_opts[@]}" update \
+      || warn "Sebagian repository APT gagal diperbarui; lanjut hanya bila paket wajib tersedia"
+    run_root env DEBIAN_FRONTEND=noninteractive \
+      "${apt_cmd[@]}" "${apt_opts[@]}" install -y \
+        "${install_flags[@]}" "${packages[@]}" \
+      && install_ok=1
+  fi
+  if [ "$install_ok" -ne 1 ]; then
+    printf '%s\n' "__WDP_APT_TRANSIENT__" >&2
+    die "Gagal apt install dependency: ${packages[*]}"
+  fi
+
   need_cmd chronyc
   need_cmd sha256sum
   ok "Paket dasar + chrony terpasang"
@@ -665,7 +782,6 @@ linux_prepare_clock() {
   linux_apt_base
   linux_set_timezone
   linux_start_chrony
-  linux_wait_clock_health
 }
 
 # Go resmi ke /usr/local/go — terlihat semua user (root + macbook/ubuntu).
@@ -1125,6 +1241,7 @@ do_setup_golang_only() {
   BINARY_MODE="source"
   linux_prepare_clock
   download_package
+  linux_wait_clock_health
   install_files_from_extract "$EXTRACT_DIR"
   linux_install_golang
   setup_go_mod "$EXTRACT_DIR"
@@ -1145,6 +1262,7 @@ EOF
 do_install_linux() {
   linux_prepare_clock
   download_package
+  linux_wait_clock_health
   install_files_from_extract "$EXTRACT_DIR"
 
   install_linux_war_binary "$EXTRACT_DIR"
@@ -1184,13 +1302,20 @@ do_update_files() {
     linux_prepare_clock
   fi
   download_package
+
+  if [ "$IS_LINUX" -eq 1 ]; then
+    linux_wait_clock_health
+  fi
   install_files_from_extract "$EXTRACT_DIR"
 
   if [ "$IS_LINUX" -eq 1 ]; then
     install_linux_war_binary "$EXTRACT_DIR"
-    verify_linux_setup
   fi
   cleanup_download
+
+  if [ "$IS_LINUX" -eq 1 ]; then
+    verify_linux_setup
+  fi
 
   cat <<EOF
 
@@ -1205,6 +1330,7 @@ EOF
 do_clock_only() {
   [ "$IS_LINUX" -eq 1 ] || die "--clock-only hanya untuk Linux/VPS"
   linux_prepare_clock
+  linux_wait_clock_health
 }
 
 do_verify_clock() {
