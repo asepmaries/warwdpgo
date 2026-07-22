@@ -66,6 +66,15 @@ ok()   { printf '    [OK] %s\n' "$*"; }
 warn() { printf '    [!] %s\n' "$*" >&2; }
 die()  { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
 
+on_unexpected_error() {
+  local exit_code="${1:-1}" line="${2:-unknown}"
+  trap - ERR
+  printf '\n[ERROR] Installer berhenti tak terduga di baris %s (exit %s).\n' \
+    "$line" "$exit_code" >&2
+  printf '%s\n' "__WDP_INSTALLER_ERROR__" >&2
+  exit "$exit_code"
+}
+
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Command wajib tidak ada: $1"
 }
@@ -574,6 +583,15 @@ linux_have_ca_bundle() {
     || [ -s /etc/ssl/cert.pem ]
 }
 
+linux_apt_candidate() {
+  local package="$1" policy
+  command -v apt-cache >/dev/null 2>&1 || return 0
+  if ! policy="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null)"; then
+    return 0
+  fi
+  printf '%s\n' "$policy" | awk '/Candidate:/ { print $2; exit }' || true
+}
+
 linux_apt_base() {
   local package candidate need_update=0 install_ok=0
   local -a packages=()
@@ -619,23 +637,20 @@ linux_apt_base() {
   log "Linux: install dependency yang belum ada: ${packages[*]}"
   linux_apt_sources_https
 
-  if command -v apt-cache >/dev/null 2>&1; then
-    for package in "${packages[@]}"; do
-      candidate="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ { print $2; exit }')"
-      if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
-        need_update=1
-        break
-      fi
-    done
-  else
-    need_update=1
-  fi
+  for package in "${packages[@]}"; do
+    candidate="$(linux_apt_candidate "$package")"
+    if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+      need_update=1
+      break
+    fi
+  done
 
   if [ "$need_update" -eq 1 ]; then
+    ok "Cache APT belum siap; refresh index satu kali"
     run_root "${apt_cmd[@]}" "${apt_opts[@]}" update \
       || warn "Sebagian repository APT gagal diperbarui; validasi kandidat paket wajib tetap dijalankan"
     for package in "${packages[@]}"; do
-      candidate="$(LC_ALL=C apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ { print $2; exit }')"
+      candidate="$(linux_apt_candidate "$package")"
       if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
         printf '%s\n' "__WDP_APT_TRANSIENT__" >&2
         die "Repository APT tidak menyediakan kandidat paket: $package"
@@ -1383,6 +1398,7 @@ EOF
 # Main
 # ----------------------------------------------------------------------
 main() {
+  trap 'on_unexpected_error "$?" "$LINENO"' ERR
   parse_args "$@"
   detect_platform
 

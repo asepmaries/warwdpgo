@@ -40,6 +40,28 @@ case "$root_log" in
     ;;
 esac
 
+# apt-cache dapat exit non-zero ketika index provider rusak/belum tersedia.
+# Installer harus refresh index, bukan berhenti diam-diam akibat errexit+pipefail.
+apt_ready_marker="$fake_bin/apt-ready"
+export APT_READY_MARKER="$apt_ready_marker"
+printf '#!/usr/bin/env bash\nif [ -f "$APT_READY_MARKER" ]; then printf "  Candidate: 1.0\\n"; else exit 100; fi\n' > "$fake_bin/apt-cache"
+chmod +x "$fake_bin/apt-cache"
+update_calls=0
+install_calls=0
+run_root() {
+  case " $* " in
+    *" update "*) update_calls=$((update_calls + 1)); touch "$apt_ready_marker"; return 0 ;;
+    *" install "*) install_calls=$((install_calls + 1)); return 0 ;;
+    *) return 0 ;;
+  esac
+}
+PATH="$fake_bin:$PATH" linux_apt_base >/dev/null
+[ "$update_calls" -eq 1 ]
+[ "$install_calls" -eq 1 ]
+
+printf '#!/usr/bin/env bash\nprintf "  Candidate: 1.0\\n"\n' > "$fake_bin/apt-cache"
+chmod +x "$fake_bin/apt-cache"
+
 install_calls=0
 update_calls=0
 root_log=""
