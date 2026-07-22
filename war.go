@@ -55,7 +55,7 @@ const (
 	CLOCK_SKEW_LIMIT_PPM       = 100.0
 	MIN_FIXED_LEAD_MS          = -499
 	MAX_FIXED_LEAD_MS          = 499
-	PROGRAM_VERSION            = "2026.07.21-timing-v3"
+	PROGRAM_VERSION            = "2026.07.22-timing-v3"
 )
 
 // Pola error (sama persis dengan PHP)

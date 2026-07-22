@@ -31,12 +31,17 @@ ARCHIVE_URL="${ARCHIVE_URL:-}"
 ARCHIVE_SHA256="${ARCHIVE_SHA256:-}"
 
 # Policy kesehatan clock. Unit correction/error adalah detik; skew adalah ppm.
-CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-45}"
+CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-60}"
 CLOCK_WAIT_INTERVAL_SEC="${CLOCK_WAIT_INTERVAL_SEC:-2}"
-CLOCK_MAX_CORRECTION_SEC="${CLOCK_MAX_CORRECTION_SEC:-0.010}"
+CLOCK_MAX_CORRECTION_SEC="${CLOCK_MAX_CORRECTION_SEC:-0.005}"
+CLOCK_MAX_RMS_SEC="${CLOCK_MAX_RMS_SEC:-0.010}"
 CLOCK_MAX_SKEW_PPM="${CLOCK_MAX_SKEW_PPM:-100}"
-CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.010}"
-CLOCK_CHECK_TIMEOUT_SEC="${CLOCK_CHECK_TIMEOUT_SEC:-15}"
+# Selaraskan aggregate bound dengan runtime WAR (50 ms). Offset tetap wajib
+# <=5 ms baik pada gate chrony maupun pemeriksaan binary.
+CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.050}"
+# Binary memberi Chrony budget 30 detik; wrapper harus lebih panjang agar tidak
+# membunuh pemeriksaan yang sebenarnya masih menunggu sinkronisasi sehat.
+CLOCK_CHECK_TIMEOUT_SEC="${CLOCK_CHECK_TIMEOUT_SEC:-45}"
 
 # File yang selalu di-sync dari paket
 # - Termux memakai war.php; war.go/go.mod ikut di-copy tapi tidak dijalankan di Android
@@ -183,7 +188,7 @@ Env:
   ARCHIVE_URL + ARCHIVE_SHA256  Override paket; keduanya wajib bersama
                                Linux: wajib --build-from-source
   CLOCK_WAIT_TRIES / CLOCK_WAIT_INTERVAL_SEC
-  CLOCK_MAX_CORRECTION_SEC / CLOCK_MAX_SKEW_PPM / CLOCK_MAX_ERROR_SEC
+  CLOCK_MAX_CORRECTION_SEC / CLOCK_MAX_RMS_SEC / CLOCK_MAX_SKEW_PPM / CLOCK_MAX_ERROR_SEC
   CLOCK_CHECK_TIMEOUT_SEC
   APP_DIR
 EOF
@@ -549,6 +554,10 @@ linux_start_chrony() {
   log "Linux: enable + start chrony"
 
   if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then
+      run_root systemctl disable --now systemd-timesyncd.service >/dev/null 2>&1 \
+        || warn "systemd-timesyncd tidak dapat dinonaktifkan; cek konflik NTP bila gate gagal"
+    fi
     for unit in chrony.service chronyd.service; do
       if systemctl cat "$unit" >/dev/null 2>&1; then
         run_root systemctl enable --now "$unit" \
@@ -568,11 +577,22 @@ linux_start_chrony() {
   [ "$started" -eq 1 ] \
     || die "Service chrony/chronyd tidak dapat dimulai; init system tidak didukung"
   ok "Daemon chrony aktif"
+
+  # VPS baru sering baru memiliki satu sampel NTP sehingga skew/dispersion
+  # sementara sangat besar. Pastikan source online, izinkan step hanya pada
+  # bootstrap, lalu ambil burst sampel. Gate ketat di bawah tetap penentu akhir.
+  run_root chronyc -a online >/dev/null 2>&1 \
+    || warn "Chrony online awal tidak tersedia; lanjut menunggu sinkronisasi normal"
+  run_root chronyc -a makestep 0.1 1 >/dev/null 2>&1 \
+    || warn "Chrony makestep bootstrap tidak tersedia; lanjut menunggu sinkronisasi normal"
+  run_root chronyc -a burst 4/4 >/dev/null 2>&1 \
+    || warn "Chrony burst awal tidak tersedia; lanjut menunggu sinkronisasi normal"
 }
 
 clock_tracking_is_healthy() {
-  awk -F, \
+  LC_ALL=C awk -F, \
     -v max_correction="$CLOCK_MAX_CORRECTION_SEC" \
+    -v max_rms="$CLOCK_MAX_RMS_SEC" \
     -v max_skew="$CLOCK_MAX_SKEW_PPM" \
     -v max_error="$CLOCK_MAX_ERROR_SEC" '
     function abs(v) { return v < 0 ? -v : v }
@@ -586,13 +606,14 @@ clock_tracking_is_healthy() {
     {
       if (NF != 14) fail("jumlah field CSV " NF ", seharusnya 14")
       sub(/\r$/, "", $14)
-      if ($1 == "7F7F0101") fail("chrony memakai synthetic local reference")
+      if (toupper($1) == "7F7F0101") fail("chrony memakai synthetic local reference")
       if (!numeric($3) || $3 < 1 || $3 > 15) fail("stratum invalid")
       if ($14 != "Normal") fail("leap status=" $14)
-      if (!numeric($5) || !numeric($10) || !numeric($11) || !numeric($12)) {
+      if (!numeric($5) || !numeric($7) || !numeric($10) || !numeric($11) || !numeric($12)) {
         fail("field numerik invalid")
       }
       if (abs($5) > max_correction) fail("system correction melebihi batas")
+      if (abs($7) > max_rms) fail("RMS offset melebihi batas")
       if ($10 < 0 || $10 > max_skew) fail("skew melebihi batas")
       if ($12 < 0) fail("root dispersion negatif")
       error_bound = abs($5) + $12 + (0.5 * abs($11))
@@ -608,6 +629,7 @@ linux_wait_clock_health() {
   require_positive_integer "CLOCK_WAIT_TRIES" "$CLOCK_WAIT_TRIES"
   require_positive_integer "CLOCK_WAIT_INTERVAL_SEC" "$CLOCK_WAIT_INTERVAL_SEC"
   require_nonnegative_number "CLOCK_MAX_CORRECTION_SEC" "$CLOCK_MAX_CORRECTION_SEC"
+  require_nonnegative_number "CLOCK_MAX_RMS_SEC" "$CLOCK_MAX_RMS_SEC"
   require_nonnegative_number "CLOCK_MAX_SKEW_PPM" "$CLOCK_MAX_SKEW_PPM"
   require_nonnegative_number "CLOCK_MAX_ERROR_SEC" "$CLOCK_MAX_ERROR_SEC"
 
@@ -619,6 +641,7 @@ linux_wait_clock_health() {
       "$CLOCK_WAIT_INTERVAL_SEC" 2>&1)"; then
     printf '%s\n' "$wait_output" | sed 's/^/    /' >&2
     LC_ALL=C chronyc -n tracking 2>&1 | sed 's/^/    /' >&2 || true
+    LC_ALL=C chronyc -n sources -v 2>&1 | sed 's/^/    /' >&2 || true
     printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
     die "chronyc waitsync gagal/timeout"
   fi
@@ -1044,6 +1067,8 @@ install_linux_war_binary() {
 
 verify_linux_setup() {
   local manifest="$APP_DIR/.wdp-war-release" expected installed_sha clock_output
+  local clock_offset_ms clock_rms_ms clock_bound_ms
+  local runtime_clock_offset_ms runtime_clock_rms_ms runtime_clock_bound_ms
   [ -s "$APP_DIR/war" ] || die "Verify binary gagal: $APP_DIR/war kosong/tidak ada"
   [ -x "$APP_DIR/war" ] || die "Verify binary gagal: $APP_DIR/war tidak executable"
   installed_sha="$(sha256sum "$APP_DIR/war" | awk '{print $1}')" \
@@ -1064,9 +1089,18 @@ verify_linux_setup() {
   ok "Verify binary hash: $installed_sha"
   need_cmd timeout
   require_positive_integer "CLOCK_CHECK_TIMEOUT_SEC" "$CLOCK_CHECK_TIMEOUT_SEC"
+  clock_offset_ms="$(awk -v seconds="$CLOCK_MAX_CORRECTION_SEC" 'BEGIN { printf "%.6f", seconds * 1000 }')"
+  clock_rms_ms="$(awk -v seconds="$CLOCK_MAX_RMS_SEC" 'BEGIN { printf "%.6f", seconds * 1000 }')"
+  clock_bound_ms="$(awk -v seconds="$CLOCK_MAX_ERROR_SEC" 'BEGIN { printf "%.6f", seconds * 1000 }')"
+  runtime_clock_offset_ms="${WDP_MAX_CLOCK_OFFSET_MS:-$clock_offset_ms}"
+  runtime_clock_rms_ms="${WDP_MAX_CLOCK_RMS_MS:-$clock_rms_ms}"
+  runtime_clock_bound_ms="${WDP_MAX_CLOCK_BOUND_MS:-${WDP_MAX_CLOCK_ERROR_MS:-$clock_bound_ms}}"
   if ! clock_output="$(
     cd "$APP_DIR" \
-      && timeout --signal=TERM "${CLOCK_CHECK_TIMEOUT_SEC}s" \
+      && env WDP_MAX_CLOCK_OFFSET_MS="$runtime_clock_offset_ms" \
+        WDP_MAX_CLOCK_RMS_MS="$runtime_clock_rms_ms" \
+        WDP_MAX_CLOCK_BOUND_MS="$runtime_clock_bound_ms" \
+        timeout --signal=TERM --kill-after=5s "${CLOCK_CHECK_TIMEOUT_SEC}s" \
         ./war --check-clock 2>&1
   )"; then
     printf '%s\n' "$clock_output" | sed 's/^/    /' >&2
