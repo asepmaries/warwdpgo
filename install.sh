@@ -241,12 +241,25 @@ release_download_base() {
   fi
 }
 
+curl_retry_extra_flags() {
+  local help_text flags=""
+  help_text="$(curl --help all 2>/dev/null || curl --help 2>/dev/null || true)"
+  printf '%s\n' "$help_text" | grep -Fq -- '--retry-connrefused' \
+    && flags="$flags --retry-connrefused"
+  printf '%s\n' "$help_text" | grep -Fq -- '--retry-all-errors' \
+    && flags="$flags --retry-all-errors"
+  printf '%s\n' "$flags"
+}
+
 resolve_latest_release_tag() {
-  local release_url effective tag
+  local release_url effective tag retry_flags
   [ "$RELEASE_TAG" = "latest" ] || return 0
   release_url="https://github.com/$RELEASE_REPO/releases/latest"
+  retry_flags="$(curl_retry_extra_flags)"
+  # shellcheck disable=SC2086 -- daftar flag dibangun dari opsi curl statis.
   effective="$(curl --fail --location --silent --show-error \
-    --retry 3 --retry-delay 1 --connect-timeout 15 --max-time 180 \
+    --retry 3 --retry-delay 1 $retry_flags \
+    --connect-timeout 15 --max-time 180 \
     --proto '=https' --tlsv1.2 \
     --output /dev/null --write-out '%{url_effective}' "$release_url")" \
     || die "Gagal resolve GitHub Release latest"
@@ -263,13 +276,19 @@ resolve_latest_release_tag() {
 }
 
 curl_download() {
-  local url="$1" dest="$2"
+  local url="$1" dest="$2" retry_flags
   case "$url" in
     https://*) ;;
     *) warn "Tolak URL non-HTTPS: $url"; return 1 ;;
   esac
+  retry_flags="$(curl_retry_extra_flags)"
+  # --retry-all-errors mencakup curl exit 7 (gagal connect/DNS/rute), kasus
+  # yang dapat terjadi sesaat pada VPS baru. Curl lama tetap memakai flag yang
+  # didukung tanpa menggagalkan installer karena opsi tidak dikenal.
+  # shellcheck disable=SC2086 -- daftar flag dibangun dari opsi curl statis.
   curl --fail --location --silent --show-error \
-    --retry 3 --retry-delay 1 --connect-timeout 15 --max-time 180 \
+    --retry 3 --retry-delay 1 $retry_flags \
+    --connect-timeout 15 --max-time 180 \
     --proto '=https' --tlsv1.2 \
     "$url" -o "$dest"
 }
