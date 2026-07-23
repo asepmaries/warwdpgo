@@ -1,23 +1,45 @@
 <?php
 // ======================================================================
-// GOPAY MLBB WDP - WAR EDITION (Dynamic Lead + Adaptive Retry)
+// GOPAY MLBB WDP - WAR EDITION (Fixed Lead + Single Inquiry)
 //
 // Strategi:
-//  - Lead time otomatis: target_srv - (RTT efektif / 2).
-//    lead.txt hanya fallback kalau RTT warm-up tidak tersedia.
+//  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
+//    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
 //  - Warm-up tunggal T-1.5s (4 paralel) untuk warm TLS pool sebelum burst.
-//  - Salvo pertama biasanya "voucher not available" -> retry SECEPATNYA.
-//  - Adaptive per-handle: handle yang selesai langsung di-retry sendiri,
-//    tidak menunggu handle lain (pakai curl_multi_info_read).
-//  - User yang sudah SUCCESS tidak ikut retry.
-//  - User di luar region promo tidak ikut retry.
-//  - Stop GLOBAL kalau ada response "out of stock" (voucher habis).
+//  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
+//  - Target server-arrival adalah 0ms (T=0).
 //  - Captcha dipakai sekali untuk semua user, di-cache 23 jam.
-//  - Hard cap MAX_TOTAL_INQUIRIES untuk hindari transaction suspecious.
 // ======================================================================
 if (php_sapi_name() !== 'cli') {
     die("Script ini hanya boleh dijalankan via CLI\n");
+}
+if (($argv[1] ?? '') === '--check-runtime') {
+    if (PHP_VERSION_ID < 70400) {
+        fwrite(STDERR, "PHP minimal 7.4\n");
+        exit(2);
+    }
+    if (!extension_loaded('curl') || !extension_loaded('json')) {
+        fwrite(STDERR, "Ekstensi curl/json wajib aktif\n");
+        exit(3);
+    }
+    $firstHandle = curl_init();
+    $secondHandle = curl_init();
+    if ($firstHandle === false || $secondHandle === false
+        || curlHandleKey($firstHandle) === curlHandleKey($secondHandle)
+    ) {
+        fwrite(STDERR, "Identitas cURL handle tidak aman\n");
+        exit(4);
+    }
+    $curlInfo = curl_version();
+    if (empty($curlInfo['ssl_version'])
+        || !in_array('https', $curlInfo['protocols'] ?? [], true)
+    ) {
+        fwrite(STDERR, "libcurl wajib mendukung HTTPS/TLS\n");
+        exit(5);
+    }
+    echo "__WDP_PHP_RUNTIME_OK__\n";
+    exit(0);
 }
 date_default_timezone_set('Asia/Jakarta');
 set_time_limit(0);
@@ -63,135 +85,29 @@ register_shutdown_function(function () use (&$LOG_FH) {
 // ----------------------------------------------------------------------
 // KONFIGURASI WAR
 // ----------------------------------------------------------------------
-// Lead fallback dibaca dari lead.txt (per-VPS). Format: 1 angka dalam ms.
+// Lead time dibaca dari lead.txt (per-VPS). Format: 1 angka dalam ms.
 // Konvensi: NEGATIF = fire SEBELUM war start (duluan).
 //           POSITIF = fire SETELAH war start (telat).
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
 const MINI_PROBE2_LEAD_MS    = 1500;         // Warm-up T-1.5s sebelum burst (warm TLS pool).
-const MINI_PROBE2_PARALLEL   = 5;            // Samakan dengan MAX_USERS supaya semua koneksi warm.
-const MAX_RETRY_PER_USER     = 9;
-const MAX_TOTAL_INQUIRIES    = 10;            // Hard cap: 11 inquiry call dalam 1 menit → HTTP 429.
-const MAX_USERS              = 5;             // Max user per VPS, sama seperti war.go.
-const TREAT_STOP_AS_RETRY    = false;         // PROD: out of stock → STOP global (hemat sisa kuota).
+const MINI_PROBE2_PARALLEL   = 4;            // 4 paralel supaya semua koneksi salvo warm.
+const MAX_USERS              = 10;             // Max user per VPS (2 = aman, hindari salvo terlalu lebar).
 const INQUIRY_CONNECT_TO_MS  = 2200;
 const INQUIRY_TIMEOUT_MS    = 5200;
 const PAYMENT_CONNECT_TO_MS = 2200;
 const PAYMENT_TIMEOUT_MS    = 5200;
-const TARGET_SRV_MS_DEFAULT = -10.0;            // Target arrival server, ms setelah T=0.
-const FINE_TUNE_START_BEFORE_MS = 12000;      // Mulai probe RTT sebelum warm-up T-1.5s.
-const FINE_TUNE_PROBE_INTERVAL_MS = 1000;
-const FINE_TUNE_PROBE_COUNT = 8;
-
-$WARMUP_MEDIAN_RTT_MS = null;             // Diisi dari miniProbe2ReWarm; dipakai untuk estimasi one-way.
-$WARMUP_MIN_RTT_MS    = null;             // RTT minimum warm-up; dipakai untuk dynamic lead.
-$FINE_TUNE_RTTS_MS    = [];               // RTT probe H-12..H-5; fallback kalau warm-up spike.
+const TARGET_SRV_MS_DEFAULT = 0.0;           // Target arrival server tepat T=0.
 
 // Pola pesan error dari endpoint inquiry
 const STOP_PATTERNS       = ['out of stock', 'sold out', 'kuota habis', 'voucher habis', 'stok habis', 'sudah habis'];
-const SKIP_USER_PATTERNS  = ['reached the redeem limit', 'already redeemed', 'sudah pernah', 'act_subscrip_no_config', 'subscrip_no_config'];
-const INVALID_USER_PATTERNS = ['role_null', 'role null', 'Error_Role_Null', 'error_role_null', 'invalid user', 'user not found', 'user_not_found', 'Error_InvalidZoneId', 'invalid zone'];
-const REGION_BLOCK_PATTERNS = ['regional restrictions', 'region restriction', 'outside region', 'outside regional', 'di luar region', 'diluar region', 'luar region', 'luar zona promo', 'zona promo'];
-const RETRY_PATTERNS      = ['not available', 'not yet', 'belum dimulai', 'belum tersedia', 'tidak tersedia', 'try again', 'temporarily', 'service unavailable'];
+const SKIP_USER_PATTERNS  = ['reached the redeem limit', 'already redeemed', 'sudah pernah', 'role_null', 'role null', 'invalid user', 'user not found', 'user_not_found', 'act_subscrip_no_config', 'subscrip_no_config'];
 
 // ----------------------------------------------------------------------
 // TIMING DARI waktu.txt
 // ----------------------------------------------------------------------
-function readTargetSrvMs(): float {
-    foreach (['target_srv.txt', 'target_arr.txt'] as $name) {
-        $path = __DIR__ . '/' . $name;
-        if (!file_exists($path)) {
-            continue;
-        }
-        $raw = trim((string) file_get_contents($path));
-        if (is_numeric($raw)) {
-            return (float) $raw;
-        }
-    }
-    return TARGET_SRV_MS_DEFAULT;
-}
-
-function avgRtt(array $rtts): float {
-    if (empty($rtts)) return 0.0;
-    return array_sum($rtts) / count($rtts);
-}
-
-function effectiveLeadRTT(): array {
-    global $WARMUP_MIN_RTT_MS, $WARMUP_MEDIAN_RTT_MS, $FINE_TUNE_RTTS_MS;
-
-    if ($WARMUP_MIN_RTT_MS === null || $WARMUP_MIN_RTT_MS <= 0) {
-        if ($WARMUP_MEDIAN_RTT_MS !== null && $WARMUP_MEDIAN_RTT_MS > 0) {
-            return [(float) $WARMUP_MEDIAN_RTT_MS, false];
-        }
-        return [0.0, false];
-    }
-
-    $fineTuneAvg = avgRtt($FINE_TUNE_RTTS_MS);
-    if ($fineTuneAvg > 0 && $WARMUP_MIN_RTT_MS > $fineTuneAvg) {
-        return [$fineTuneAvg, true];
-    }
-    return [(float) $WARMUP_MIN_RTT_MS, false];
-}
-
-function resolveLeadMs(int $fallbackLeadMs, float $targetSrvMs): int {
-    global $WARMUP_MIN_RTT_MS;
-
-    [$leadRTT, $usedFineTuneAvg] = effectiveLeadRTT();
-    $owEst = $leadRTT / 2.0;
-    if ($owEst <= 0) {
-        echo "[LEAD] Warm-up RTT tidak tersedia -> pakai lead.txt: {$fallbackLeadMs}ms\n";
-        return $fallbackLeadMs;
-    }
-
-    $dynamic = (int) round($targetSrvMs - $owEst);
-    if ($usedFineTuneAvg) {
-        echo sprintf(
-            "[LEAD] Dynamic: target_srv=%+.0fms | RTT_min=%.0fms > tune_avg=%.0fms -> pakai tune_avg | ow_est=%.0fms -> lead=%+dms\n",
-            $targetSrvMs,
-            (float) $WARMUP_MIN_RTT_MS,
-            $leadRTT,
-            $owEst,
-            $dynamic
-        );
-    } else {
-        echo sprintf(
-            "[LEAD] Dynamic: target_srv=%+.0fms | RTT_min=%.0fms | ow_est=%.0fms -> lead=%+dms\n",
-            $targetSrvMs,
-            (float) $WARMUP_MIN_RTT_MS,
-            $owEst,
-            $dynamic
-        );
-    }
-    echo "[LEAD] (lead.txt={$fallbackLeadMs}ms hanya dipakai sebagai fallback)\n";
-    return $dynamic;
-}
-
-function addMilliseconds(DateTimeImmutable $dt, int $ms): DateTimeImmutable {
-    if ($ms === 0) return $dt;
-    $sign = $ms > 0 ? '+' : '-';
-    return $dt->modify($sign . abs($ms) . ' milliseconds');
-}
-
-function dateTimeWallUs(DateTimeInterface $dt): int {
-    return ((int) $dt->format('U')) * 1_000_000 + (int) $dt->format('u');
-}
-
-function waitUntilWallUs(int $targetWallUs): void {
-    $remainingNs = max(0, (int) round(($targetWallUs - (microtime(true) * 1_000_000)) * 1000));
-    $targetMono = hrtime(true) + $remainingNs;
-    while (true) {
-        $remaining = $targetMono - hrtime(true);
-        if ($remaining <= 0) return;
-        $remainingUs = intdiv($remaining, 1000);
-        if ($remainingUs > 25000) usleep(12000);
-        elseif ($remainingUs > 10000) usleep(4000);
-        elseif ($remainingUs > 4000) usleep(1500);
-        else continue;
-    }
-}
-
-function waitForExactBurstTime(int $fallbackLeadMs, array $sampleOrder, string $captchaToken, ?callable $beforeBurst = null): bool {
-    global $WAR_START_WALL_US, $FINE_TUNE_RTTS_MS;
+function waitForExactBurstTime(int $leadMs, ?callable $beforeBurst = null): bool {
+    global $WAR_START_WALL_US;
     $file = 'waktu.txt';
     if (!file_exists($file)) die("❌ File 'waktu.txt' tidak ditemukan!\n");
     $content = trim(file_get_contents($file));
@@ -199,68 +115,61 @@ function waitForExactBurstTime(int $fallbackLeadMs, array $sampleOrder, string $
         die("❌ Format waktu.txt salah! Gunakan HH:MM atau HH:MM:SS\n");
     }
     $hour = (int)$m[1]; $minute = (int)$m[2]; $second = isset($m[3]) ? (int)$m[3] : 0;
-
-    $now = new DateTimeImmutable('now');
-    $target = $now->setTime($hour, $minute, $second, 0);
-    if ($target < $now) $target = $target->modify('+1 day');
-
-    $WAR_START_WALL_US = dateTimeWallUs($target);
-    $targetSrvMs = readTargetSrvMs();
-    $FINE_TUNE_RTTS_MS = [];
-
-    echo "[TIME] Target burst (T=0): " . $target->format('H:i:s.v') . " WIB | target_srv: "
-       . sprintf('%+.0fms', $targetSrvMs) . " | lead.txt fallback: {$fallbackLeadMs}ms\n";
-
-    $warmupAt = addMilliseconds($target, -MINI_PROBE2_LEAD_MS);
-    $warmupAtUs = dateTimeWallUs($warmupAt);
-    $untilWarmupMs = ($warmupAtUs - (microtime(true) * 1_000_000)) / 1000;
-    if ($untilWarmupMs > 15000) {
-        usleep((int) (($untilWarmupMs - FINE_TUNE_START_BEFORE_MS) * 1000));
-        echo "Masuk fase fine tuning (H-12s -> H-5s, " . FINE_TUNE_PROBE_COUNT . "x @ 1/detik)...\n";
-        doFineTuneProbes($sampleOrder, $captchaToken);
-    } elseif ($untilWarmupMs > 6000) {
-        usleep((int) (($untilWarmupMs - 6000) * 1000));
+    $target = new DateTime('now');
+    $target->setTime($hour, $minute, $second, 0);
+    if ($target < new DateTime('now')) $target->modify('+1 day');
+    // Simpan war start absolut (T=0) sebelum dimodify untuk lead
+    $WAR_START_WALL_US = $target->getTimestamp() * 1_000_000 + ((int) $target->format('v')) * 1000;
+    $target->modify($leadMs >= 0 ? "-{$leadMs} milliseconds" : "+" . abs($leadMs) . " milliseconds");
+    $leadDescription = $leadMs >= 0
+        ? "T-" . $leadMs . "ms (sebelum war)"
+        : "T+" . abs($leadMs) . "ms (setelah war start)";
+    echo "⏰ Target burst dari waktu.txt: {$content}.000 WIB\n";
+    echo "🎯 Target server-arrival     : " . sprintf('%.0fms (T=0)', TARGET_SRV_MS_DEFAULT) . "\n";
+    echo "⚡ Lead time eksekusi       : {$leadDescription}\n";
+    echo "⚡ Burst dieksekusi pada    : " . $target->format('Y-m-d H:i:s') . sprintf('.%03d', (int) $target->format('v')) . " WIB\n";
+    echo "Menunggu waktu tepat...\n\n";
+    $targetTimestamp = $target->getTimestamp();
+    $targetWallMicro = $targetTimestamp * 1_000_000;
+    // FIX: getTimestamp() ter-floor ke detik. Tambahkan komponen milidetik via format('v').
+    $targetWallMicro += ((int) $target->format('v')) * 1000;
+    $diff = $targetTimestamp - time();
+    if ($diff > 15) {
+        sleep($diff - 12);
+        echo "Masuk fase fine tuning (last 12 detik)...\n";
+    } elseif ($diff > 6) {
+        sleep($diff - 6);
         echo "Masuk fase fine tuning...\n";
     }
-
-    waitUntilWallUs($warmupAtUs);
-
-    if ($beforeBurst !== null) {
-        $remainingToTargetMs = (dateTimeWallUs($target) - (microtime(true) * 1_000_000)) / 1000;
-        $budgetMs = min(MINI_PROBE2_LEAD_MS - 200, (int) $remainingToTargetMs - 200);
-        if ($budgetMs >= 150) {
-            $beforeBurst($budgetMs);
-        } else {
-            echo "[WARM-UP] Skip - sisa waktu terlalu mepet, jaga burst tetap on-time\n";
+    $remainingNs = max(0, (int) round(($targetWallMicro - (microtime(true) * 1_000_000)) * 1000));
+    $targetMono = hrtime(true) + $remainingNs;
+    $warmupTriggered = false;
+    while (true) {
+        $remaining = $targetMono - hrtime(true);
+        if ($remaining <= 0) {
+            echo "? BURST START! [" . formatMicrotimeNow() . "] MULAI FULL FLOW!\n\n";
+            return true;
         }
+        $remainingUs = intdiv($remaining, 1000);
+        if (!$warmupTriggered && $beforeBurst !== null && $remainingUs <= MINI_PROBE2_LEAD_MS * 1000) {
+            $warmupTriggered = true;
+            // CRITICAL: warm-up tidak boleh menunda burst. Hitung budget = sisa waktu ke
+            // burst dikurangi safety margin 200ms. Warm-up curl di-cut kalau lewat budget,
+            // supaya VPS dengan koneksi cold/lambat tetap fire burst ON-TIME.
+            // (Bukti war 30 Mei: warm-up 2000ms → burst telat 500ms → zonk total.)
+            $budgetMs = intdiv($remainingUs, 1000) - 200;
+            if ($budgetMs >= 150) {
+                $beforeBurst($budgetMs);
+            } else {
+                echo "[WARM-UP] Skip — sisa waktu ke burst < 350ms (jaga burst tetap on-time)\n";
+            }
+            continue;
+        }
+        if ($remainingUs > 25000) usleep(12000);
+        elseif ($remainingUs > 10000) usleep(4000);
+        elseif ($remainingUs > 4000) usleep(1500);
+        else continue;
     }
-
-    $leadMs = resolveLeadMs($fallbackLeadMs, $targetSrvMs);
-    $execTarget = addMilliseconds($target, $leadMs);
-    if (dateTimeWallUs($execTarget) < (int) round(microtime(true) * 1_000_000)) {
-        echo "[LEAD] Dynamic lead {$leadMs}ms membuat exec di masa lalu -> fallback lead.txt {$fallbackLeadMs}ms\n";
-        $leadMs = $fallbackLeadMs;
-        $execTarget = addMilliseconds($target, $leadMs);
-    }
-
-    [$leadRTT] = effectiveLeadRTT();
-    $owEst = $leadRTT / 2.0;
-    if ($owEst > 0) {
-        $estSrv = $leadMs + $owEst;
-        echo sprintf(
-            "[TIME] Lead: %+dms | Exec: %s WIB | estimasi srv: %+.0fms\n",
-            $leadMs,
-            $execTarget->format('H:i:s.v'),
-            $estSrv
-        );
-    } else {
-        echo sprintf("[TIME] Lead: %+dms | Exec: %s WIB\n", $leadMs, $execTarget->format('H:i:s.v'));
-    }
-
-    waitUntilWallUs(dateTimeWallUs($execTarget));
-    echo "[BURST] START! [" . formatMicrotimeNow() . "] MULAI FULL FLOW!\n\n";
-    return true;
-
 }
 
 // ----------------------------------------------------------------------
@@ -309,19 +218,6 @@ function formatMicrotimeNow(): string {
     $sec = floor($now);
     $micros = (int)(($now - $sec) * 1_000_000);
     return date('H:i:s', (int)$sec) . '.' . str_pad((string)$micros, 6, '0', STR_PAD_LEFT);
-}
-
-function curlTimingMs($ch, array $info, string $timeTConst, string $secondsKey): ?float {
-    if (defined($timeTConst)) {
-        $value = curl_getinfo($ch, constant($timeTConst));
-        if ($value !== false && is_numeric($value)) {
-            return ((float) $value) / 1000;
-        }
-    }
-    if (isset($info[$secondsKey]) && is_numeric($info[$secondsKey])) {
-        return ((float) $info[$secondsKey]) * 1000;
-    }
-    return null;
 }
 
 function decodeResponseBody(string $resp): array {
@@ -395,6 +291,14 @@ function createCurlSession() {
     curl_setopt_array($ch, $baseOptions);
     attachShareToHandle($ch);
     return $ch;
+}
+
+/**
+ * PHP 7 memakai resource cURL, sedangkan PHP 8+ memakai object CurlHandle.
+ * Jangan cast object ke int: semua handle dapat kolaps ke key yang sama.
+ */
+function curlHandleKey($ch): int {
+    return is_object($ch) ? spl_object_id($ch) : (int) $ch;
 }
 
 function getSharedCurlHandle() {
@@ -508,74 +412,18 @@ function miniProbe2ReWarm(array $sampleOrder, string $captchaToken, int $maxMs =
     foreach ($handles as $ch) {
         $errno = curl_errno($ch);
         $info  = curl_getinfo($ch);
-        $totalMs = curlTimingMs($ch, $info, 'CURLINFO_TOTAL_TIME_T', 'total_time');
         curl_multi_remove_handle($mh, $ch);
         curl_close($ch);
         if ($errno) continue;
-        if ($totalMs !== null && $totalMs > 0) $rttMs[] = $totalMs;
+        $totalSec = (float) ($info['total_time'] ?? 0);
+        if ($totalSec > 0) $rttMs[] = $totalSec * 1000;
     }
     curl_multi_close($mh);
     return $rttMs;
 }
 
-function runInquiryProbe(array $sampleOrder, string $captchaToken, int $timeoutMs = INQUIRY_TIMEOUT_MS): array {
-    $headers = buildInquiryHeaders($captchaToken);
-    $body    = buildInquiryBody($sampleOrder);
-    $ch = createCurlSession();
-    $started = microtime(true);
-    configureCurlHandle(
-        $ch,
-        'https://gopay.co.id/games/v1/order/inquiry',
-        'POST',
-        $headers,
-        $body,
-        ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => $timeoutMs]
-    );
-    $resp = @curl_exec($ch);
-    $info = curl_getinfo($ch);
-    $code = (int) ($info['http_code'] ?? 0);
-    $errno = curl_errno($ch);
-    $err = curl_error($ch);
-    $totalMs = curlTimingMs($ch, $info, 'CURLINFO_TOTAL_TIME_T', 'total_time');
-    $elapsedMs = (microtime(true) - $started) * 1000;
-    curl_close($ch);
-
-    $payload = is_string($resp) && $resp !== '' ? decodeResponseBody($resp) : null;
-    $errText = $payload ? extractApiErrorMessage($payload) : ($errno ? "cURL[$errno] $err" : '');
-    $verdict = classifyInquiryResponse($code, $errText, $payload);
-
-    return [
-        'rtt' => (float) ($totalMs ?? $elapsedMs),
-        'http' => $code,
-        'status' => $verdict['status'],
-    ];
-}
-
-function doFineTuneProbes(array $sampleOrder, string $captchaToken): void {
-    global $FINE_TUNE_RTTS_MS;
-
-    echo "[FINE-TUNE] Probe RTT " . FINE_TUNE_PROBE_COUNT . "x @ 1 req/detik...\n";
-    $FINE_TUNE_RTTS_MS = [];
-    for ($i = 1; $i <= FINE_TUNE_PROBE_COUNT; $i++) {
-        if ($i > 1) {
-            usleep(FINE_TUNE_PROBE_INTERVAL_MS * 1000);
-        }
-        $probe = runInquiryProbe($sampleOrder, $captchaToken);
-        if ($probe['rtt'] > 0) {
-            $FINE_TUNE_RTTS_MS[] = $probe['rtt'];
-        }
-        echo sprintf(
-            "  fine-tune #%d | rtt %.0fms | HTTP %d | %s\n",
-            $i,
-            $probe['rtt'],
-            $probe['http'],
-            $probe['status']
-        );
-    }
-}
-
 // ----------------------------------------------------------------------
-// UTILITAS: percentile (dipakai di runAdaptiveInquiry summary)
+// UTILITAS: percentile (dipakai di ringkasan inquiry)
 // ----------------------------------------------------------------------
 function percentile(array $values, float $p): float {
     if (empty($values)) return 0.0;
@@ -588,8 +436,8 @@ function percentile(array $values, float $p): float {
 // ----------------------------------------------------------------------
 // CAPTCHA: ambil dari Google
 // ----------------------------------------------------------------------
-function getFreshCaptchaToken(bool $quiet = false): string {
-    if (!$quiet) echo "[CAPTCHA] Mengambil token captcha baru dari Google...\n";
+function getFreshCaptchaToken(): string {
+    echo "[CAPTCHA] Mengambil token captcha baru dari Google...\n";
     $url = "https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o";
     $headers = [
         'sec-ch-ua-platform' => '"Android"',
@@ -631,21 +479,21 @@ function getFreshCaptchaToken(bool $quiet = false): string {
     }
     if (preg_match('/"rresp","([^"]+)"/', $response, $matches)) {
         $token = $matches[1];
-        saveCaptchaToken($token, $quiet);
-        if (!$quiet) echo "[CAPTCHA] Token berhasil diambil (panjang: " . strlen($token) . " karakter)\n\n";
+        saveCaptchaToken($token);
+        echo "[CAPTCHA] Token berhasil diambil (panjang: " . strlen($token) . " karakter)\n\n";
         return $token;
     }
     throw new RuntimeException("Gagal parse captcha token dari response Google");
 }
 
-function saveCaptchaToken(string $token, bool $quiet = false): void {
+function saveCaptchaToken(string $token): void {
     file_put_contents('captcha_token.txt', $token);
-    if (!$quiet) echo "[CAPTCHA] Token baru disimpan ke captcha_token.txt\n";
+    echo "[CAPTCHA] Token baru disimpan ke captcha_token.txt\n";
 }
 
 // ----------------------------------------------------------------------
 // CLASSIFY RESPONSE INQUIRY
-// Return: ['status' => 'success'|'retry'|'stop'|'skip_user'|'user_invalid'|'region_block'|'unknown', 'orderId' => ?string]
+// Return: ['status' => 'success'|'stop'|'skip_user'|'unknown', 'orderId' => ?string]
 // ----------------------------------------------------------------------
 function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload): array {
     if (($code === 200 || $code === 201) && is_array($payload)) {
@@ -662,32 +510,11 @@ function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload)
             return ['status' => 'stop', 'orderId' => null];
         }
     }
-    foreach (INVALID_USER_PATTERNS as $p) {
-        if ($msg !== '' && strpos($msg, $p) !== false) {
-            return ['status' => 'user_invalid', 'orderId' => null];
-        }
-    }
     foreach (SKIP_USER_PATTERNS as $p) {
         if ($msg !== '' && strpos($msg, $p) !== false) {
             return ['status' => 'skip_user', 'orderId' => null];
         }
     }
-    foreach (REGION_BLOCK_PATTERNS as $p) {
-        if ($msg !== '' && strpos($msg, $p) !== false) {
-            return ['status' => 'region_block', 'orderId' => null];
-        }
-    }
-    foreach (RETRY_PATTERNS as $p) {
-        if ($msg !== '' && strpos($msg, $p) !== false) {
-            return ['status' => 'retry', 'orderId' => null];
-        }
-    }
-
-    // curl error atau HTTP 4xx/5xx tanpa pola dikenal -> retry konservatif
-    if ($code === 0 || ($code >= 400 && $code < 600)) {
-        return ['status' => 'retry', 'orderId' => null];
-    }
-
     return ['status' => 'unknown', 'orderId' => null];
 }
 
@@ -778,9 +605,9 @@ function buildInquiryBody(array $order): array {
 }
 
 // ----------------------------------------------------------------------
-// FIRE INQUIRY (attach satu handle ke multi)
+// FIRE INQUIRY (satu handle per user)
 // ----------------------------------------------------------------------
-function fireInquiry($mh, array $order, string $captchaToken, int $attempt): array {
+function fireInquiry($mh, array $order, string $captchaToken): array {
     $headers = buildInquiryHeaders($captchaToken);
     $body    = buildInquiryBody($order);
     $ch = createCurlSession();
@@ -797,40 +624,29 @@ function fireInquiry($mh, array $order, string $captchaToken, int $attempt): arr
         'ch'       => $ch,
         'order'    => $order,
         'headers'  => $headers,
-        'attempt'  => $attempt,
         'started'  => microtime(true),
     ];
 }
 
 // ----------------------------------------------------------------------
-// ADAPTIVE INQUIRY LOOP
+// SINGLE INQUIRY SALVO
 // ----------------------------------------------------------------------
-function runAdaptiveInquiry(array $orders, string $captchaToken): array {
+function runSingleInquiry(array $orders, string $captchaToken): array {
     $mh = curl_multi_init();
-    $active     = [];      // map: (int)$ch -> meta
-    $attempts   = [];      // userId|serverId -> attempt count
+    $active     = [];      // map: curlHandleKey($ch) -> meta
     $successMap = [];      // userId|serverId -> ['order','orderId','headers']
-    $skipUsers  = [];      // userId|serverId -> true (user sudah pernah claim, percuma retry)
-    $regionBlockedUsers = []; // userId|serverId -> true (di luar region promo, percuma retry)
-    $stopGlobal = false;
-    $totalInquiries = 0;
 
     $phaseStart = microtime(true);
-    $eventLog   = []; // [tRelMs, label]
-    $attemptStats = []; // [{user, try, rtt, srvArrival, http, verdict, status_eff}]
+    $inquiryStats = []; // [{user, rtt, srvArrival, http, verdict}]
 
-    // Salvo pertama: tembak semua user paralel
+    // Satu-satunya salvo: tembak semua user paralel.
     foreach ($orders as $ord) {
-        $key = $ord['userId'] . '|' . $ord['serverId'];
-        $attempts[$key] = 1;
-        $totalInquiries++;
-        $meta = fireInquiry($mh, $ord, $captchaToken, 1);
-        $active[(int) $meta['ch']] = $meta;
+        $meta = fireInquiry($mh, $ord, $captchaToken);
+        $active[curlHandleKey($meta['ch'])] = $meta;
     }
-    $eventLog[] = [0.0, "SALVO #1 fired (3 paralel)"];
-    echo "🔥 SALVO #1: tembak " . count($orders) . " user paralel @ [" . formatMicrotimeNow() . "]\n";
+    echo "? SALVO TUNGGAL: tembak " . count($orders) . " user paralel @ [" . formatMicrotimeNow() . "]\n";
 
-    // Pump multi handle, panen response begitu siap, langsung fire retry
+    // Pump multi handle dan panen setiap response tanpa mengirim ulang.
     $running = null;
     do {
         do {
@@ -842,7 +658,7 @@ function runAdaptiveInquiry(array $orders, string $captchaToken): array {
             if ($info['msg'] !== CURLMSG_DONE) continue;
 
             $ch  = $info['handle'];
-            $key = (int) $ch;
+            $key = curlHandleKey($ch);
             if (!isset($active[$key])) {
                 curl_multi_remove_handle($mh, $ch);
                 @curl_close($ch);
@@ -851,81 +667,46 @@ function runAdaptiveInquiry(array $orders, string $captchaToken): array {
             $meta = $active[$key];
             unset($active[$key]);
 
-            $resp         = curl_multi_getcontent($ch);
-            $curlInfo     = curl_getinfo($ch);
-            $code         = (int) ($curlInfo['http_code'] ?? 0);
-            $preTransferMs= curlTimingMs($ch, $curlInfo, 'CURLINFO_PRETRANSFER_TIME_T', 'pretransfer_time');
-            $totalTimeMs  = curlTimingMs($ch, $curlInfo, 'CURLINFO_TOTAL_TIME_T', 'total_time');
-            $curlErr      = curl_error($ch);
-            $curlErrno    = curl_errno($ch);
+            $resp     = curl_multi_getcontent($ch);
+            $code     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlErr  = curl_error($ch);
+            $curlErrno= curl_errno($ch);
             curl_multi_remove_handle($mh, $ch);
 
             $userKey  = $meta['order']['userId'] . '|' . $meta['order']['serverId'];
-            $elapsedPhpMs = (microtime(true) - $meta['started']) * 1000;
-            $elapsed  = (int) round($totalTimeMs ?? $elapsedPhpMs);
+            $elapsed  = (int) round((microtime(true) - $meta['started']) * 1000);
             $tRel     = (microtime(true) - $phaseStart) * 1000;
 
             // Estimasi waktu request sampai di server (relatif ke WAR_START / T=0).
-            // Hybrid bounded: one-way warm-up dipakai, tapi di-cap oleh rtt request ini / 2.
-            // Formula lama tetap dicatat sebagai pembanding: fire_wall + rtt PHP/2.
-            global $WAR_START_WALL_US, $WARMUP_MEDIAN_RTT_MS;
+            // Asumsi RTT simetris: server-arrival = fire_wall + (rtt/2)
+            global $WAR_START_WALL_US;
             $serverArrivalMs = null;
-            $oldServerArrivalMs = null;
-            $warmServerArrivalMs = null;
-            $fireOffsetMs = null;
-            $oneWayMs = null;
             if (!empty($WAR_START_WALL_US)) {
-                $fireWallUs = $meta['started'] * 1_000_000;
-                $fireOffsetMs = ($fireWallUs - $WAR_START_WALL_US) / 1000;
-                $oldServerArrivalUs = $fireWallUs + ($elapsedPhpMs * 1000 / 2);
-                $oldServerArrivalMs = ($oldServerArrivalUs - $WAR_START_WALL_US) / 1000;
-                $currentOneWayMs = ($totalTimeMs ?? $elapsedPhpMs) / 2;
-                $preMs = $preTransferMs ?? 0.0;
-
-                if ($WARMUP_MEDIAN_RTT_MS !== null) {
-                    $warmOneWayMs = ((float) $WARMUP_MEDIAN_RTT_MS) / 2;
-                    $warmServerArrivalMs = $fireOffsetMs + $preMs + $warmOneWayMs;
-                    $oneWayMs = min($warmOneWayMs, $currentOneWayMs);
-                } else {
-                    $oneWayMs = $currentOneWayMs;
-                }
-                $serverArrivalMs = $fireOffsetMs + $preMs + $oneWayMs;
+                $fireWallUs       = $meta['started'] * 1_000_000;
+                $serverArrivalUs  = $fireWallUs + ($elapsed * 1000 / 2);
+                $serverArrivalMs  = ($serverArrivalUs - $WAR_START_WALL_US) / 1000;
             }
             $sArr = $serverArrivalMs !== null
                 ? sprintf('srv%+.0fms', $serverArrivalMs)
                 : 'srv?';
-            $fireTag = $fireOffsetMs !== null ? sprintf('[fire%+.0fms]', $fireOffsetMs) : '[fire?]';
-            $preTag = $preTransferMs !== null ? sprintf('[pre %.0fms]', $preTransferMs) : '[pre ?]';
-            $owTag  = $oneWayMs !== null ? sprintf('[ow %.0fms]', $oneWayMs) : '[ow ?]';
-            $warmTag = $warmServerArrivalMs !== null ? sprintf('[warm%+.0fms]', $warmServerArrivalMs) : '[warm?]';
-            $oldTag = $oldServerArrivalMs !== null ? sprintf('[old%+.0fms]', $oldServerArrivalMs) : '[old?]';
 
             $payload  = $resp !== false && $resp !== null ? decodeResponseBody((string) $resp) : null;
             $errText  = $payload ? extractApiErrorMessage($payload) : ($curlErrno ? "cURL[$curlErrno] $curlErr" : '');
             $verdict  = classifyInquiryResponse((int) $code, $errText, $payload);
 
-            // TES MODE: paksa STOP -> RETRY supaya bisa ukur durasi penuh
-            $effectiveStatus = $verdict['status'];
-            if ($effectiveStatus === 'stop' && TREAT_STOP_AS_RETRY) {
-                $effectiveStatus = 'retry';
-            }
-
-            // Capture attempt stat untuk auto-summary
-            $attemptStats[] = [
+            // Capture hasil salvo tunggal untuk auto-summary.
+            $inquiryStats[] = [
                 'user'        => $userKey,
-                'try'         => $meta['attempt'],
                 'rtt'         => $elapsed,
                 'srv_arrival' => $serverArrivalMs,
                 'http'        => (int) $code,
                 'verdict'     => $verdict['status'],
-                'effective'   => $effectiveStatus,
             ];
 
-            $tag = "[+" . sprintf('%6.1f', $tRel) . "ms][$userKey][try {$meta['attempt']}/" . (MAX_RETRY_PER_USER + 1) . "][rtt {$elapsed}ms][$sArr][HTTP $code]{$fireTag}{$preTag}{$owTag}{$warmTag}{$oldTag}";
+            $tag = "[+" . sprintf('%6.1f', $tRel) . "ms][$userKey][single][rtt {$elapsed}ms][$sArr][HTTP $code]";
 
-            if ($effectiveStatus === 'success') {
+            if ($verdict['status'] === 'success') {
                 echo "$tag ✅ OrderID: {$verdict['orderId']}\n";
-                $eventLog[] = [$tRel, "[$userKey] response try {$meta['attempt']} → SUCCESS"];
                 $successMap[$userKey] = [
                     'order'   => $meta['order'],
                     'orderId' => $verdict['orderId'],
@@ -937,57 +718,7 @@ function runAdaptiveInquiry(array $orders, string $captchaToken): array {
 
             @curl_close($ch);
             $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
-            $verdictTag = $verdict['status'] === 'stop' && TREAT_STOP_AS_RETRY ? 'stop→retry(test)' : $verdict['status'];
-            echo "$tag ⚠️  $verdictTag: $shortErr\n";
-            $eventLog[] = [$tRel, "[$userKey] response try {$meta['attempt']} → $verdictTag"];
-
-            if ($effectiveStatus === 'stop') {
-                echo "🛑 STOP GLOBAL: voucher habis terdeteksi. Batalkan semua retry.\n";
-                $stopGlobal = true;
-                continue;
-            }
-
-            if ($effectiveStatus === 'skip_user') {
-                echo "[$userKey] ⏭️  SKIP USER: sudah pernah claim, tidak retry.\n";
-                $skipUsers[$userKey] = true;
-                continue;
-            }
-
-            if ($effectiveStatus === 'user_invalid') {
-                echo "[$userKey] ❌ USER ID SALAH (Error_Role_Null / invalid role): tidak retry.\n";
-                // jangan masukkan ke skipUsers (limit), ini user ID bermasalah
-                continue;
-            }
-
-            if ($effectiveStatus === 'region_block') {
-                echo "[$userKey] 🌐 USER ID DILUAR REGION: tidak retry.\n";
-                $regionBlockedUsers[$userKey] = true;
-                continue;
-            }
-
-            // status: retry / unknown -> coba lagi kalau masih ada budget
-            if ($stopGlobal) continue;
-            if (isset($successMap[$userKey])) continue;
-            if (isset($skipUsers[$userKey])) continue;
-            if (isset($regionBlockedUsers[$userKey])) continue;
-
-            $nextAttempt = $attempts[$userKey] + 1;
-            if ($nextAttempt > (MAX_RETRY_PER_USER + 1)) {
-                echo "[$userKey] ⛔ max retry tercapai\n";
-                continue;
-            }
-            if ($totalInquiries >= MAX_TOTAL_INQUIRIES) {
-                echo "[$userKey] ⛔ MAX_TOTAL_INQUIRIES (" . MAX_TOTAL_INQUIRIES . ") tercapai, hindari suspecious\n";
-                continue;
-            }
-
-            $attempts[$userKey] = $nextAttempt;
-            $totalInquiries++;
-            $newMeta = fireInquiry($mh, $meta['order'], $captchaToken, $nextAttempt);
-            $active[(int) $newMeta['ch']] = $newMeta;
-            $tFire = (microtime(true) - $phaseStart) * 1000;
-            echo "[+" . sprintf('%6.1f', $tFire) . "ms][$userKey] 🔁 retry #" . ($nextAttempt - 1) . " fired\n";
-            $eventLog[] = [$tFire, "[$userKey] fire try $nextAttempt"];
+            echo "$tag ⚠️  {$verdict['status']}: $shortErr\n";
         }
 
         if (!empty($active)) {
@@ -1005,44 +736,28 @@ function runAdaptiveInquiry(array $orders, string $captchaToken): array {
 
     $phaseElapsed = (microtime(true) - $phaseStart) * 1000;
 
-    echo "\n📊 Inquiry summary:\n";
+    echo "\n? Inquiry summary:\n";
     echo "   - success           : " . count($successMap) . "/" . count($orders) . "\n";
-    echo "   - total inquiry call: $totalInquiries\n";
+    echo "   - total inquiry call: " . count($orders) . "\n";
     echo "   - phase duration    : " . sprintf('%.1f ms', $phaseElapsed) . "\n";
-    echo "   - per-user attempts : ";
-    foreach ($attempts as $uk => $att) echo "$uk=$att  ";
-    echo "\n";
-    if (TREAT_STOP_AS_RETRY) {
-        echo "   ⚠️  TES MODE aktif: 'out of stock' diperlakukan sebagai retry. Ganti TREAT_STOP_AS_RETRY=false untuk produksi.\n";
-    }
 
     // ===== AUTO-SUMMARY untuk evaluasi VPS =====
-    if (!empty($attemptStats)) {
-        // Group by salvo number
-        $salvos = [];
-        foreach ($attemptStats as $s) {
-            $salvos[$s['try']][] = $s;
-        }
-        ksort($salvos);
+    if (!empty($inquiryStats)) {
+        $rtts        = array_column($inquiryStats, 'rtt');
+        $srvArr      = array_filter(array_column($inquiryStats, 'srv_arrival'), fn($v) => $v !== null);
+        $verdicts    = array_count_values(array_column($inquiryStats, 'verdict'));
+        $verdictStr  = implode(', ', array_map(fn($k, $v) => "$k=$v", array_keys($verdicts), $verdicts));
+        $rttStr      = empty($rtts) ? '-' : sprintf('min=%dms med=%dms max=%dms', min($rtts), percentile($rtts, 0.5), max($rtts));
+        $srvStr      = empty($srvArr) ? '-' : sprintf('min=%+dms med=%+dms max=%+dms', (int) min($srvArr), (int) percentile($srvArr, 0.5), (int) max($srvArr));
 
-        echo "\n📈 [VPS-EVAL] Per-salvo breakdown:\n";
-        foreach ($salvos as $tryNum => $list) {
-            $rtts        = array_column($list, 'rtt');
-            $srvArr      = array_filter(array_column($list, 'srv_arrival'), fn($v) => $v !== null);
-            $verdicts    = array_count_values(array_column($list, 'verdict'));
-            $verdictStr  = implode(', ', array_map(fn($k, $v) => "$k=$v", array_keys($verdicts), $verdicts));
-
-            $rttStr    = empty($rtts) ? '-' : sprintf('min=%dms med=%dms max=%dms', min($rtts), percentile($rtts, 0.5), max($rtts));
-            $srvStr    = empty($srvArr) ? '-' : sprintf('min=%+dms med=%+dms max=%+dms', (int) min($srvArr), (int) percentile($srvArr, 0.5), (int) max($srvArr));
-
-            echo sprintf("   - Salvo #%d (n=%d): rtt[%s] srvArrival[%s] verdicts[%s]\n",
-                $tryNum, count($list), $rttStr, $srvStr, $verdictStr);
-        }
+        echo "\n? [VPS-EVAL] Salvo tunggal:\n";
+        echo sprintf("   - n=%d: rtt[%s] srvArrival[%s] verdicts[%s]\n",
+            count($inquiryStats), $rttStr, $srvStr, $verdictStr);
 
         // Hitung first-success server-arrival (kalibrasi sweet spot)
         $firstSuccess = null;
         $firstStop    = null;
-        foreach ($attemptStats as $s) {
+        foreach ($inquiryStats as $s) {
             if ($firstSuccess === null && $s['verdict'] === 'success' && $s['srv_arrival'] !== null) {
                 $firstSuccess = $s;
             }
@@ -1050,7 +765,7 @@ function runAdaptiveInquiry(array $orders, string $captchaToken): array {
                 $firstStop = $s;
             }
         }
-        echo "\n📈 [VPS-EVAL] Window kalibrasi:\n";
+        echo "\n? [VPS-EVAL] Window kalibrasi:\n";
         if ($firstSuccess) {
             echo sprintf("   - First SUCCESS server-arrival: %+dms (sweet spot lower bound)\n", (int) $firstSuccess['srv_arrival']);
         } else {
@@ -1064,22 +779,21 @@ function runAdaptiveInquiry(array $orders, string $captchaToken): array {
         $successCount = count($successMap);
         $tier = '⚠️  POOR (zonk)';
         if ($successCount >= 3) $tier = '✅ EXCELLENT (3+ voucher)';
-        elseif ($successCount === 2) $tier = '🟢 GOOD (2 voucher)';
-        elseif ($successCount === 1) $tier = '🟡 OK (1 voucher)';
+        elseif ($successCount === 2) $tier = '? GOOD (2 voucher)';
+        elseif ($successCount === 1) $tier = '? OK (1 voucher)';
 
-        echo "\n📈 [VPS-EVAL] Verdict: $tier";
+        echo "\n? [VPS-EVAL] Verdict: $tier";
         if ($phaseElapsed > 1000) echo " | ⚠️  PHASE > 1s (kemungkinan kena window war yang ketat)";
         echo "\n";
 
-        // Salvo #1 RTT vs mini-probe (kalau ada)
-        $salvo1 = $salvos[1] ?? [];
-        if (!empty($salvo1)) {
-            $salvo1MedianRtt = percentile(array_column($salvo1, 'rtt'), 0.5);
+        // RTT salvo tunggal vs mini-probe (kalau ada)
+        if (!empty($inquiryStats)) {
+            $salvo1MedianRtt = percentile(array_column($inquiryStats, 'rtt'), 0.5);
             $rttTier = '✅ excellent';
-            if ($salvo1MedianRtt > 500)      $rttTier = '🔴 critical (replace VPS)';
-            elseif ($salvo1MedianRtt > 350)  $rttTier = '🟠 slow (consider replace)';
-            elseif ($salvo1MedianRtt > 250)  $rttTier = '🟡 acceptable';
-            echo "📈 [VPS-EVAL] Salvo #1 median RTT: {$salvo1MedianRtt}ms → $rttTier\n";
+            if ($salvo1MedianRtt > 500)      $rttTier = '? critical (replace VPS)';
+            elseif ($salvo1MedianRtt > 350)  $rttTier = '? slow (consider replace)';
+            elseif ($salvo1MedianRtt > 250)  $rttTier = '? acceptable';
+            echo "? [VPS-EVAL] Salvo tunggal median RTT: {$salvo1MedianRtt}ms → $rttTier\n";
         }
     }
     echo "\n";
@@ -1192,59 +906,6 @@ function runParallelPayment(array $inquirySuccess): int {
 }
 
 // ----------------------------------------------------------------------
-// PRE-WAR: tunggu sampai T-{secondsBefore}s sebelum war start (dari waktu.txt).
-// ----------------------------------------------------------------------
-function waitUntilPreWarTest(int $secondsBefore = 60): void {
-    $file = 'waktu.txt';
-    if (!file_exists($file)) die("❌ File 'waktu.txt' tidak ditemukan!\n");
-    $content = trim(file_get_contents($file));
-    if (!preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/', $content, $m)) {
-        die("❌ Format waktu.txt salah! Gunakan HH:MM atau HH:MM:SS\n");
-    }
-    $hour = (int)$m[1]; $minute = (int)$m[2]; $second = isset($m[3]) ? (int)$m[3] : 0;
-    $target = new DateTime('now');
-    $target->setTime($hour, $minute, $second, 0);
-    if ($target < new DateTime('now')) $target->modify('+1 day');
-
-    $testTs = $target->getTimestamp() - $secondsBefore;
-    $diff = $testTs - time();
-    if ($diff <= 0) {
-        // Script start sudah di dalam T-{secondsBefore}s → langsung jalankan tes.
-        return;
-    }
-    echo "Menunggu fase tes koneksi (T-{$secondsBefore}s sebelum war)...\n";
-    while (($d = $testTs - time()) > 0) {
-        if ($d > 5) sleep($d - 2);
-        else usleep(200000);
-    }
-}
-
-// ----------------------------------------------------------------------
-// PRE-WAR: pemanasan koneksi — hantam endpoint inquiry asli (voucher sama
-// seperti waktu H war) sebanyak $times kali secara sekuensial. War belum mulai
-// jadi response = "not available" dan TIDAK mengkonsumsi voucher. Tujuannya
-// menghangatkan TCP/TLS pool (share handle) sebelum burst.
-// ----------------------------------------------------------------------
-function preWarConnectionTest(array $sampleOrder, string $captchaToken, int $times = 10): void {
-    for ($i = 0; $i < $times; $i++) {
-        $headers = buildInquiryHeaders($captchaToken);
-        $body    = buildInquiryBody($sampleOrder);
-        $ch = createCurlSession();
-        configureCurlHandle(
-            $ch,
-            'https://gopay.co.id/games/v1/order/inquiry',
-            'POST',
-            $headers,
-            $body,
-            ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => INQUIRY_TIMEOUT_MS]
-        );
-        @curl_exec($ch);
-        curl_close($ch);
-    }
-    echo "Tes koneksi {$times}x selesai\n";
-}
-
-// ----------------------------------------------------------------------
 // MAIN
 // ----------------------------------------------------------------------
 function gpyPay(): void {
@@ -1262,67 +923,57 @@ function gpyPay(): void {
     }
 
     echo "✅ Loaded " . count($orders) . " order (max " . MAX_USERS . ")\n";
-    echo "🔧 Dynamic lead"
-       . " | MAX_RETRY_PER_USER=" . MAX_RETRY_PER_USER
-       . " | MAX_TOTAL_INQUIRIES=" . MAX_TOTAL_INQUIRIES . "\n\n";
+    echo "? Fixed lead from lead.txt"
+       . " | TARGET_SRV=" . sprintf('%.0fms', TARGET_SRV_MS_DEFAULT)
+       . " | SINGLE_INQUIRY\n\n";
 
     // Captcha 1× di-fetch saat script start
     $captchaToken = getFreshCaptchaToken();
 
-    // Lead fallback dibaca dari lead.txt. Konvensi:
+    // Lead time dibaca dari lead.txt. Konvensi:
     //   NEGATIF di lead.txt = fire SEBELUM war start (duluan).
     //   POSITIF di lead.txt = fire SETELAH war start (telat).
     //   0 atau file tidak ada = tepat di war start.
-    // Konvensi sama seperti Go: negatif = fire sebelum war, positif = setelah war.
+    // Internal `waitForExactBurstTime` pakai konvensi terbalik (positif = sebelum war),
+    // jadi negate.
     $leadFile = __DIR__ . '/lead.txt';
     if (file_exists($leadFile)) {
         $offsetMs = (int) trim(file_get_contents($leadFile));
     } else {
         $offsetMs = BURST_LEAD_MS_DEFAULT;
     }
-    $burstLeadMs = $offsetMs;
+    $burstLeadMs = -$offsetMs;
 
     if ($offsetMs > 0)      $desc = "+{$offsetMs}ms (setelah war)";
     elseif ($offsetMs < 0)  $desc = "{$offsetMs}ms (sebelum war)";
     else                    $desc = "0ms (tepat di war)";
-    echo "⚡ Lead fallback: {$desc} (dari " . (file_exists($leadFile) ? "lead.txt" : "default") . ")\n\n";
-
-    // ===================== PRE-WAR (T-60s) =====================
-    // 60 detik sebelum war: tes koneksi langsung ke API gopay dengan voucher
-    // (pemanasan retry 10x), lalu ambil captcha baru untuk dipakai saat war.
-    waitUntilPreWarTest(60);
-    preWarConnectionTest($orders[0], $captchaToken, 10);
-    $captchaToken = getFreshCaptchaToken(true);
-    echo "Captcha Baru diperbarui\n\n";
+    echo "⚡ Lead offset: {$desc} (dari " . (file_exists($leadFile) ? "lead.txt" : "default") . ")\n\n";
 
     // Tunggu dan fire — mini-probe2 T-1.5s untuk warm TLS pool sebelum burst.
     // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
-    waitForExactBurstTime($burstLeadMs, $orders[0], $captchaToken, static function (int $budgetMs = 1200) use ($orders, $captchaToken): void {
-        global $WARMUP_MEDIAN_RTT_MS, $WARMUP_MIN_RTT_MS;
+    waitForExactBurstTime($burstLeadMs, static function (int $budgetMs = 1200) use ($orders, $captchaToken): void {
         echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000) . "s re-warm TLS pool ("
            . MINI_PROBE2_PARALLEL . " call paralel, budget {$budgetMs}ms)...\n";
         $rtts = miniProbe2ReWarm($orders[0], $captchaToken, $budgetMs);
         if (!empty($rtts)) {
-            sort($rtts);
-            $min = $rtts[0];
             $median = percentile($rtts, 0.5);
-            $WARMUP_MEDIAN_RTT_MS = $median;
-            $WARMUP_MIN_RTT_MS = $min;
             echo "[WARM-UP] RTT: " . implode('ms, ', array_map(fn($v) => number_format($v, 0), $rtts)) . "ms"
-               . " | min: " . number_format($min, 0) . "ms"
                . " | median: " . number_format($median, 0) . "ms\n";
         } else {
             echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
         }
     });
 
-    // ===================== ADAPTIVE INQUIRY =====================
-    $inquirySuccess = runAdaptiveInquiry($orders, $captchaToken);
+    // ===================== SINGLE INQUIRY SALVO =====================
+    $inquirySuccess = runSingleInquiry($orders, $captchaToken);
 
     // ===================== PARALLEL PAYMENT =====================
     $success = runParallelPayment($inquirySuccess);
 
-    echo "\n🏁 FULL FLOW SELESAI! Berhasil: $success / " . count($orders) . "\n";
+    echo "\n? FULL FLOW SELESAI! Berhasil: $success / " . count($orders) . "\n";
 }
 
-gpyPay();
+// Aman untuk di-require oleh test/tooling tanpa menjalankan transaksi WAR.
+if (realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) === __FILE__) {
+    gpyPay();
+}

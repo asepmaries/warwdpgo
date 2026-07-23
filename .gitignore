@@ -6,3 +6,4 @@ publish.php
 data/orders.db
 .session_secret
 orderwdp.xlsx
+dist/

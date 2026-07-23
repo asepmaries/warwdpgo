@@ -87,6 +87,25 @@ case "$root_log" in
   *) printf 'bounded dpkg lock wait missing: %s\n' "$root_log" >&2; exit 1 ;;
 esac
 
+# Profil Linux PHP wajib meminta php-cli/php-curl bila runtime belum siap.
+php_runtime_ready() { return 1; }
+root_log=""
+run_root() { root_log="$root_log $*"; return 0; }
+PATH="$fake_bin:$PATH" linux_apt_base 1 >/dev/null
+case "$root_log" in
+  *" install "*" php-cli"*" php-curl"*) ;;
+  *) printf 'PHP dependency install command missing: %s\n' "$root_log" >&2; exit 1 ;;
+esac
+case "$root_log" in
+  *"golang"*|*" go1."*|*" snap "*)
+    printf 'PHP dependency path must not install Go: %s\n' "$root_log" >&2
+    exit 1
+    ;;
+esac
+case "$root_log" in
+  *" update "*) printf 'APT update must stay skipped with usable PHP candidates\n' >&2; exit 1 ;;
+esac
+
 TMP_DIR="$fake_bin/release"
 mkdir -p "$TMP_DIR"
 RELEASE_REPO="example/project"

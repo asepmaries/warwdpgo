@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # ======================================================================
-# WARWDPGO installer — auto detect Termux (Android) vs Linux/VPS
+# WARWDPGO installer — PHP default, Golang hanya bila diminta eksplisit
 #
 # Termux  : PHP only di /sdcard/wdp  (tanpa Golang — seperti install awal)
 # Linux   : file di $HOME (root → /root), TANPA subfolder wdp
-#           + timezone WIB + chrony sehat + binary GitHub Release terverifikasi
-#           (PHP CLI sengaja TIDAK di-install di Linux untuk saat ini)
+#           + PHP CLI/cURL + timezone WIB + chrony sehat
+# Golang  : hanya melalui --go-only; tidak dijalankan oleh install/update normal
 #
 # Jalankan:
 #   bash install.sh              # full auto sesuai platform
 #   bash install.sh --menu       # pilih menu manual
-#   bash install.sh --update     # sync paket + ganti binary secara atomik
+#   bash install.sh --update     # sync war.php/config tanpa menyentuh Golang
 #   bash install.sh --go-only    # Linux: build dari source secara eksplisit
 #   bash install.sh --clock-only # Linux: pasang/start chrony + tunggu sehat
 #   bash install.sh --verify-clock
@@ -18,8 +18,8 @@
 # ======================================================================
 set -Eeuo pipefail
 
-# Default mengambil paket + binary dari GitHub Release yang sama. RELEASE_TAG=latest
-# mengikuti release terbaru; pin tag (mis. v2026.07.21) untuk deployment reproducible.
+# Default mengambil paket source dari GitHub Release. RELEASE_TAG=latest mengikuti
+# release terbaru; pin tag (mis. v2026.07.23.2) untuk deployment reproducible.
 RELEASE_REPO="${RELEASE_REPO:-asepmaries/warwdpgo}"
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 RELEASE_PACKAGE_ASSET="${RELEASE_PACKAGE_ASSET:-warwdpgo-source.tar.gz}"
@@ -43,16 +43,16 @@ CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.050}"
 # membunuh pemeriksaan yang sebenarnya masih menunggu sinkronisasi sehat.
 CLOCK_CHECK_TIMEOUT_SEC="${CLOCK_CHECK_TIMEOUT_SEC:-45}"
 
-# File yang selalu di-sync dari paket
-# - Termux memakai war.php; war.go/go.mod ikut di-copy tapi tidak dijalankan di Android
-# - Linux memakai war.go (+ go.mod/go.sum) dan war.php cadangan
-CORE_FILES=(war.php install.sh go.mod go.sum)
+# Profil PHP hanya memasang runtime yang benar-benar dipakai besok.
+# File Golang tetap tersedia di paket, tetapi hanya disalin oleh --go-only.
+PHP_CORE_FILES=(war.php install.sh)
+GO_CORE_FILES=(go.mod go.sum)
 
 # Config: jangan di-overwrite kalau sudah ada isi (kecuali --force)
 CONFIG_FILES=(waktu.txt user_server_wdp.txt lead.txt reload.txt target_srv.txt)
 
 FORCE_OVERWRITE=0
-MODE="auto" # auto | menu | update | go-only | clock-only | verify-clock
+MODE="auto" # auto/update = PHP | go-only = Golang eksplisit
 BINARY_MODE="${BINARY_MODE:-release}" # release | source
 ALLOW_SOURCE_FALLBACK="${ALLOW_SOURCE_FALLBACK:-0}"
 RELEASE_CHECKSUM_FILE=""
@@ -164,7 +164,7 @@ parse_args() {
       --go-only)     MODE="go-only"; BINARY_MODE="source" ;;
       --clock-only)  MODE="clock-only" ;;
       --verify-clock) MODE="verify-clock" ;;
-      --build-from-source) BINARY_MODE="source" ;;
+      --build-from-source) MODE="go-only"; BINARY_MODE="source" ;;
       --allow-source-fallback) ALLOW_SOURCE_FALLBACK=1 ;;
       --release-tag)
         [ $# -ge 2 ] || die "--release-tag membutuhkan nilai"
@@ -181,14 +181,14 @@ parse_args() {
         cat <<'EOF'
 Usage: bash install.sh [options]
 
-  (default)               Full install; Linux memakai binary Release terverifikasi
+  (default)               Install PHP-only; Golang/binary war tidak disentuh
   --menu, -m              Tampilkan menu pilihan
-  --update, -u            Sync paket + ganti binary secara atomik
+  --update, -u            Sync war.php/config; tidak install/build Golang
   --go-only               Linux: install Go + build source secara eksplisit
   --clock-only            Linux: install/start chrony lalu tunggu clock sehat
   --verify-clock          Linux: read-only, gagal bila clock tidak sehat
-  --build-from-source     Jangan ambil prebuilt; compile war.go
-  --allow-source-fallback Jika prebuilt gagal, izinkan compile source
+  --build-from-source     Alias kompatibilitas untuk --go-only
+  --allow-source-fallback Kompatibilitas jalur Golang lama
   --release-tag TAG       Pin GitHub Release (default: latest)
   --force, -f             Overwrite config lokal
   --app-dir DIR           Folder instalasi (Termux:/sdcard/wdp Linux:$HOME)
@@ -197,7 +197,6 @@ Usage: bash install.sh [options]
 Env:
   RELEASE_REPO / RELEASE_TAG
   ARCHIVE_URL + ARCHIVE_SHA256  Override paket; keduanya wajib bersama
-                               Linux: wajib --build-from-source
   CLOCK_WAIT_TRIES / CLOCK_WAIT_INTERVAL_SEC
   CLOCK_MAX_CORRECTION_SEC / CLOCK_MAX_RMS_SEC / CLOCK_MAX_SKEW_PPM / CLOCK_MAX_ERROR_SEC
   CLOCK_CHECK_TIMEOUT_SEC
@@ -371,6 +370,7 @@ download_verified_release_asset() {
 
 download_package() {
   local tmp_dir archive_file extract_dir required
+  local -a required_files=(war.php install.sh)
   need_cmd curl
   need_cmd tar
   need_cmd sha256sum
@@ -378,9 +378,8 @@ download_package() {
   if [ -z "$ARCHIVE_URL" ] && [ -n "$ARCHIVE_SHA256" ]; then
     die "ARCHIVE_SHA256 tanpa ARCHIVE_URL tidak boleh diabaikan"
   fi
-  if [ -n "$ARCHIVE_URL" ] && [ "$IS_LINUX" -eq 1 ] \
-    && [ "$BINARY_MODE" != "source" ]; then
-    die "ARCHIVE_URL kustom di Linux wajib dipakai bersama --build-from-source"
+  if [ "$MODE" = "go-only" ]; then
+    required_files+=(war.go go.mod go.sum)
   fi
 
   tmp_dir="$(mktemp -d)"
@@ -424,7 +423,7 @@ download_package() {
       rmdir "$sub" 2>/dev/null || true
     fi
   fi
-  for required in war.go war.php install.sh go.mod go.sum; do
+  for required in "${required_files[@]}"; do
     [ -f "$extract_dir/$required" ] \
       || die "Tarball tidak lengkap; file wajib hilang: $required"
   done
@@ -471,20 +470,25 @@ copy_file_smart() {
 
 install_files_from_extract() {
   local extract_dir="$1"
+  local include_go="${2:-0}"
   local f src
 
   mkdir -p "$APP_DIR"
 
   log "Pasang file ke $APP_DIR"
-  # Semua file Go ikut agar build package "." konsisten dengan binary Release.
-  for src in "$extract_dir"/*.go; do
-    [ -f "$src" ] || continue
-    f="$(basename "$src")"
-    copy_file_smart "$src" "$APP_DIR/$f" 0
-  done
-  for f in "${CORE_FILES[@]}"; do
+  for f in "${PHP_CORE_FILES[@]}"; do
     copy_file_smart "$extract_dir/$f" "$APP_DIR/$f" 0
   done
+  if [ "$include_go" = "1" ]; then
+    for src in "$extract_dir"/*.go; do
+      [ -f "$src" ] || continue
+      f="$(basename "$src")"
+      copy_file_smart "$src" "$APP_DIR/$f" 0
+    done
+    for f in "${GO_CORE_FILES[@]}"; do
+      copy_file_smart "$extract_dir/$f" "$APP_DIR/$f" 0
+    done
+  fi
   for f in "${CONFIG_FILES[@]}"; do
     copy_file_smart "$extract_dir/$f" "$APP_DIR/$f" 1
   done
@@ -515,6 +519,82 @@ setup_termux_storage() {
   fi
 }
 
+php_runtime_ready() {
+  command -v php >/dev/null 2>&1 || return 1
+  php -r '
+    if (PHP_SAPI !== "cli" || PHP_VERSION_ID < 70400) exit(1);
+    if (!extension_loaded("curl") || !extension_loaded("json")) exit(1);
+    foreach ([
+      "curl_init", "curl_multi_init", "curl_share_init",
+      "json_encode", "hrtime", "random_bytes", "array_key_last"
+    ] as $function) {
+      if (!function_exists($function)) exit(1);
+    }
+    $curl = curl_version();
+    if (empty($curl["ssl_version"])) exit(1);
+    if (!in_array("https", $curl["protocols"] ?? [], true)) exit(1);
+  ' >/dev/null 2>&1
+}
+
+verify_php_runtime() {
+  need_cmd php
+  if ! php -r '
+    if (PHP_SAPI !== "cli") {
+      fwrite(STDERR, "PHP SAPI wajib cli\n");
+      exit(1);
+    }
+    if (PHP_VERSION_ID < 70400) {
+      fwrite(STDERR, "PHP minimal 7.4; didapat " . PHP_VERSION . "\n");
+      exit(2);
+    }
+    if (!extension_loaded("curl") || !extension_loaded("json")) {
+      fwrite(STDERR, "Ekstensi PHP curl/json wajib aktif\n");
+      exit(3);
+    }
+    foreach ([
+      "curl_init", "curl_multi_init", "curl_share_init",
+      "json_encode", "hrtime", "random_bytes", "array_key_last"
+    ] as $function) {
+      if (!function_exists($function)) {
+        fwrite(STDERR, "Fungsi PHP wajib tidak ada: {$function}\n");
+        exit(4);
+      }
+    }
+    $curl = curl_version();
+    if (empty($curl["ssl_version"])
+      || !in_array("https", $curl["protocols"] ?? [], true)
+    ) {
+      fwrite(STDERR, "libcurl PHP wajib mendukung HTTPS/TLS\n");
+      exit(5);
+    }
+  '; then
+    die "Runtime PHP belum memenuhi kebutuhan war.php"
+  fi
+  ok "Runtime PHP siap: $(php -r 'printf("PHP %s", PHP_VERSION);')"
+}
+
+verify_php_setup() {
+  local runtime_output
+  verify_php_runtime
+  [ -s "$APP_DIR/war.php" ] \
+    || die "Verify PHP gagal: $APP_DIR/war.php kosong/tidak ada"
+  [ -d "$APP_DIR" ] && [ -w "$APP_DIR" ] \
+    || die "Folder aplikasi tidak writable: $APP_DIR"
+  php -l "$APP_DIR/war.php" >/dev/null \
+    || die "Syntax war.php tidak valid"
+  if ! runtime_output="$(php "$APP_DIR/war.php" --check-runtime 2>&1)"; then
+    printf '%s\n' "$runtime_output" | sed 's/^/    /' >&2
+    die "Self-check runtime war.php gagal"
+  fi
+  printf '%s\n' "$runtime_output" \
+    | grep -Fxq "__WDP_PHP_RUNTIME_OK__" \
+    || die "Marker self-check runtime war.php tidak ditemukan"
+
+  printf '%s\n' "__WDP_PHP_SETUP_OK__"
+  printf '%s\n' "__WDP_INSTALL_OK__"
+  ok "Verify PHP: syntax, cURL multi, JSON, HTTPS/TLS siap"
+}
+
 install_termux_php() {
   log "Termux: update paket + install PHP (tanpa Golang)"
   if command -v apt >/dev/null 2>&1; then
@@ -525,7 +605,7 @@ install_termux_php() {
     pkg update -y
     pkg install -y php curl tar || die "Gagal install php (pkg)"
   fi
-  ok "PHP: $(php -v 2>/dev/null | head -n1 || echo unknown)"
+  verify_php_runtime
 }
 
 do_install_termux() {
@@ -534,6 +614,7 @@ do_install_termux() {
   download_package
   install_files_from_extract "$EXTRACT_DIR"
   cleanup_download
+  verify_php_setup
 
   cat <<EOF
 
@@ -612,6 +693,7 @@ linux_apt_candidate() {
 }
 
 linux_apt_base() {
+  local include_php="${1:-0}"
   local package candidate need_update=0 install_ok=0
   local -a packages=()
   local -a apt_cmd=()
@@ -635,12 +717,19 @@ linux_apt_base() {
   command -v curl >/dev/null 2>&1 || packages+=(curl)
   command -v tar >/dev/null 2>&1 || packages+=(tar)
   command -v chronyc >/dev/null 2>&1 || packages+=(chrony)
+  if [ "$include_php" = "1" ] && ! php_runtime_ready; then
+    packages+=(php-cli php-curl)
+  fi
   if ! command -v sha256sum >/dev/null 2>&1 \
     || ! command -v timeout >/dev/null 2>&1; then
     packages+=(coreutils)
   fi
   if [ "${#packages[@]}" -eq 0 ]; then
-    log "Linux: paket dasar + chrony sudah tersedia (skip APT)"
+    if [ "$include_php" = "1" ]; then
+      log "Linux: paket dasar + chrony + PHP sudah tersedia (skip APT)"
+    else
+      log "Linux: paket dasar + chrony sudah tersedia (skip APT)"
+    fi
     ok "Fast path dependency aktif"
     return 0
   fi
@@ -697,7 +786,12 @@ linux_apt_base() {
 
   need_cmd chronyc
   need_cmd sha256sum
-  ok "Paket dasar + chrony terpasang"
+  if [ "$include_php" = "1" ]; then
+    verify_php_runtime
+    ok "Paket dasar + chrony + PHP terpasang"
+  else
+    ok "Paket dasar + chrony terpasang"
+  fi
 }
 
 linux_start_chrony() {
@@ -813,7 +907,7 @@ linux_wait_clock_health() {
 }
 
 linux_prepare_clock() {
-  linux_apt_base
+  linux_apt_base "${1:-0}"
   linux_set_timezone
   linux_start_chrony
 }
@@ -1168,8 +1262,8 @@ setup_go_mod() {
   ok "go.mod + go.sum terverifikasi tanpa go get/tidy"
 }
 
-# linux_install_php() — DINONAKTIFKAN sementara (Linux fokus Golang saja).
-# Aktifkan lagi di do_install_linux() jika war.php dibutuhkan di VPS.
+# Jalur binary/prebuilt Golang dipertahankan untuk kompatibilitas internal.
+# Install/update normal tidak memanggil fungsi ini; --go-only membangun source.
 
 install_linux_war_binary() {
   local source_dir="$1" prebuilt_status
@@ -1276,7 +1370,7 @@ do_setup_golang_only() {
   linux_prepare_clock
   download_package
   linux_wait_clock_health
-  install_files_from_extract "$EXTRACT_DIR"
+  install_files_from_extract "$EXTRACT_DIR" 1
   linux_install_golang
   setup_go_mod "$EXTRACT_DIR"
   cleanup_download
@@ -1294,32 +1388,35 @@ EOF
 }
 
 do_install_linux() {
-  linux_prepare_clock
+  linux_prepare_clock 1
   download_package
   linux_wait_clock_health
   install_files_from_extract "$EXTRACT_DIR"
 
-  install_linux_war_binary "$EXTRACT_DIR"
   cleanup_download
-  verify_linux_setup
+  verify_php_setup
+  if [ -e "$APP_DIR/war" ] || [ -e "$APP_DIR/.wdp-war-release" ]; then
+    warn "Aset Golang lama dibiarkan utuh, tetapi tidak dipasang/dijalankan oleh mode PHP"
+  fi
 
   cat <<EOF
 
 ============================================================
-✓ LINUX/VPS siap — WAR Golang di $APP_DIR
+✓ LINUX/VPS siap — WAR PHP di $APP_DIR
 
 Yang sudah dikonfigurasi:
+  • PHP CLI + ekstensi cURL/JSON
   • timezone Asia/Jakarta + chrony fail-closed
-  • binary ${INSTALLED_BINARY_KIND:-unknown} terverifikasi dan diganti atomik
-  • source build hanya bila diminta eksplisit
+  • Golang, go mod, build, dan binary war tidak dijalankan
+  • Jalur Golang tetap tersedia hanya lewat --go-only
 
 Edit config:
   nano $APP_DIR/waktu.txt
   nano $APP_DIR/user_server_wdp.txt
 
-Jalankan (disarankan — TANPA download GitHub):
+Jalankan:
   cd $APP_DIR
-  ./war
+  php war.php
 
 Update dari GitHub Release:
   bash $APP_DIR/install.sh --update
@@ -1331,9 +1428,9 @@ EOF
 # Update-only
 # ----------------------------------------------------------------------
 do_update_files() {
-  log "Mode update: sync paket Release ke $APP_DIR"
+  log "Mode update PHP: sync war.php/config ke $APP_DIR"
   if [ "$IS_LINUX" -eq 1 ]; then
-    linux_prepare_clock
+    linux_prepare_clock 1
   fi
   download_package
 
@@ -1342,20 +1439,19 @@ do_update_files() {
   fi
   install_files_from_extract "$EXTRACT_DIR"
 
-  if [ "$IS_LINUX" -eq 1 ]; then
-    install_linux_war_binary "$EXTRACT_DIR"
-  fi
   cleanup_download
-
-  if [ "$IS_LINUX" -eq 1 ]; then
-    verify_linux_setup
+  verify_php_setup
+  if [ "$IS_LINUX" -eq 1 ] \
+    && { [ -e "$APP_DIR/war" ] || [ -e "$APP_DIR/.wdp-war-release" ]; }; then
+    warn "Aset Golang lama tidak diubah dan tidak dijalankan"
   fi
 
   cat <<EOF
 
 ============================================================
-✓ Update selesai → $APP_DIR
-  Binary Linux: ${INSTALLED_BINARY_KIND:-tidak berlaku}
+✓ Update PHP selesai → $APP_DIR
+  Runtime aktif: php war.php
+  Golang/binary war: tidak disentuh
   (config berisi data lokal tidak di-overwrite; pakai --force untuk ganti)
 ============================================================
 EOF
@@ -1385,17 +1481,17 @@ show_menu() {
   Platform : $PLATFORM
   APP_DIR  : $APP_DIR
 ============================================================
-  1) Full install otomatis (disarankan)
-  2) Update file dari GitHub saja
-  3) Setup Golang saja (Linux/VPS only)
-  4) Force overwrite config + full install
+  1) Full install PHP otomatis (disarankan)
+  2) Update war.php + config dari GitHub
+  3) Setup Golang eksplisit (Linux/VPS only)
+  4) Force overwrite config + full install PHP
   5) Setup + verifikasi chrony saja (Linux/VPS only)
   0) Keluar
 ============================================================
 EOF
   printf 'Pilih [1]: '
   local choice
-  if [ -r /dev/tty ]; then
+  if [ -r /dev/tty ] && [ -t 0 ] 2>/dev/null; then
     read -r choice < /dev/tty || choice="1"
   else
     read -r choice || choice="1"
