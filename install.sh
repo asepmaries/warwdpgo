@@ -2,9 +2,9 @@
 # ======================================================================
 # WARWDPGO installer — PHP default, Golang hanya bila diminta eksplisit
 #
-# Termux  : PHP only di /sdcard/wdp  (tanpa Golang — seperti install awal)
-# Linux   : file di $HOME (root → /root), TANPA subfolder wdp
-#           + PHP CLI/cURL + timezone WIB + chrony sehat
+# Termux  : PHP only di /sdcard/wdp1
+# Linux   : PHP only di $HOME/wdp1 + timezone WIB + chrony sehat
+# macOS   : PHP only di $HOME/wdp1 (PHP Homebrew bila belum tersedia)
 # Golang  : hanya melalui --go-only; tidak dijalankan oleh install/update normal
 #
 # Jalankan:
@@ -43,8 +43,8 @@ CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.050}"
 # membunuh pemeriksaan yang sebenarnya masih menunggu sinkronisasi sehat.
 CLOCK_CHECK_TIMEOUT_SEC="${CLOCK_CHECK_TIMEOUT_SEC:-45}"
 
-# Profil PHP hanya memasang runtime yang benar-benar dipakai besok.
-# File Golang tetap tersedia di paket, tetapi hanya disalin oleh --go-only.
+# Profil PHP hanya menyiapkan runtime yang benar-benar dipakai besok.
+# Semua file paket disalin ke wdp1; file Go hanya aset dorman dan tidak diproses.
 PHP_CORE_FILES=(war.php install.sh)
 GO_CORE_FILES=(go.mod go.sum)
 
@@ -52,11 +52,13 @@ GO_CORE_FILES=(go.mod go.sum)
 CONFIG_FILES=(waktu.txt user_server_wdp.txt lead.txt reload.txt target_srv.txt)
 
 FORCE_OVERWRITE=0
+APP_DIR_EXPLICIT=0
 MODE="auto" # auto/update = PHP | go-only = Golang eksplisit
 BINARY_MODE="${BINARY_MODE:-release}" # release | source
 ALLOW_SOURCE_FALLBACK="${ALLOW_SOURCE_FALLBACK:-0}"
 RELEASE_CHECKSUM_FILE=""
 RELEASE_CHECKSUM_TAG=""
+CLOCK_GATE_PASSED=0
 
 # ----------------------------------------------------------------------
 # Util
@@ -121,9 +123,16 @@ run_root() {
 # ----------------------------------------------------------------------
 IS_TERMUX=0
 IS_LINUX=0
+IS_MACOS=0
 PLATFORM="unknown"
 
 detect_platform() {
+  local kernel
+  IS_TERMUX=0
+  IS_LINUX=0
+  IS_MACOS=0
+  PLATFORM="unknown"
+  kernel="$(uname -s 2>/dev/null || true)"
   if [ -n "${PREFIX:-}" ] && [ -d "/data/data/com.termux" ] 2>/dev/null; then
     IS_TERMUX=1
     PLATFORM="termux"
@@ -133,23 +142,30 @@ detect_platform() {
   elif command -v termux-setup-storage >/dev/null 2>&1; then
     IS_TERMUX=1
     PLATFORM="termux"
-  elif [ "$(uname -s 2>/dev/null || true)" = "Linux" ]; then
+  elif [ "$kernel" = "Linux" ]; then
     IS_LINUX=1
     PLATFORM="linux"
+  elif [ "$kernel" = "Darwin" ]; then
+    IS_MACOS=1
+    PLATFORM="macos"
   else
-    # fallback: anggap Linux-like
-    IS_LINUX=1
-    PLATFORM="linux"
+    PLATFORM="unsupported:${kernel:-unknown}"
   fi
 }
 
 default_app_dir() {
   if [ "$IS_TERMUX" -eq 1 ]; then
-    # Termux/Android: PHP di storage (seperti install awal)
-    printf '%s' "/sdcard/wdp"
+    printf '%s' "/sdcard/wdp1"
   else
-    # Linux/VPS: langsung di home user (root → /root), tanpa subfolder wdp
-    printf '%s' "${HOME:-/root}"
+    [ -n "${HOME:-}" ] && [ "${HOME:-}" != "/" ] \
+      || die "HOME user tidak valid; gunakan --app-dir /path/wdp1"
+    if [ "$MODE" = "go-only" ]; then
+      # Perubahan target wdp1 hanya untuk profil PHP. Jalur Go eksplisit tetap
+      # memakai lokasi lama di HOME agar kompatibel dengan instalasi sebelumnya.
+      printf '%s' "${HOME%/}"
+    else
+      printf '%s/wdp1' "${HOME%/}"
+    fi
   fi
 }
 
@@ -176,6 +192,7 @@ parse_args() {
         [ $# -ge 2 ] || die "--app-dir membutuhkan DIR"
         shift
         APP_DIR="$1"
+        APP_DIR_EXPLICIT=1
         ;;
       --help|-h)
         cat <<'EOF'
@@ -191,8 +208,11 @@ Usage: bash install.sh [options]
   --allow-source-fallback Kompatibilitas jalur Golang lama
   --release-tag TAG       Pin GitHub Release (default: latest)
   --force, -f             Overwrite config lokal
-  --app-dir DIR           Folder instalasi (Termux:/sdcard/wdp Linux:$HOME)
+  --app-dir DIR           Target persis (default: HOME/wdp1; Termux:/sdcard/wdp1)
   --help, -h              Bantuan
+
+Jalankan sebagai user login biasa (tanpa "sudo bash"). Installer memakai sudo
+hanya untuk dependency sistem, sehingga HOME/wdp1 tetap milik user tersebut.
 
 Env:
   RELEASE_REPO / RELEASE_TAG
@@ -312,10 +332,31 @@ ensure_release_checksums() {
   RELEASE_CHECKSUM_TAG="$RELEASE_TAG"
 }
 
+have_sha256_tool() {
+  command -v sha256sum >/dev/null 2>&1 \
+    || command -v shasum >/dev/null 2>&1
+}
+
+file_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    return 127
+  fi
+}
+
+need_sha256_tool() {
+  have_sha256_tool \
+    || die "Butuh sha256sum (Linux) atau shasum (macOS) untuk verifikasi paket"
+}
+
 verify_file_sha256() {
   local file="$1" expected="$2" actual
   is_sha256 "$expected" || return 1
-  actual="$(sha256sum "$file" | awk '{print $1}')" || return 1
+  actual="$(file_sha256 "$file")" || return 1
   [ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" = \
     "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ]
 }
@@ -369,11 +410,13 @@ download_verified_release_asset() {
 }
 
 download_package() {
-  local tmp_dir archive_file extract_dir required
+  local tmp_dir archive_file extract_dir fallback_dir required strip_ok
+  local restore_dotglob=0 restore_nullglob=0
+  local -a extracted_entries=()
   local -a required_files=(war.php install.sh)
   need_cmd curl
   need_cmd tar
-  need_cmd sha256sum
+  need_sha256_tool
 
   if [ -z "$ARCHIVE_URL" ] && [ -n "$ARCHIVE_SHA256" ]; then
     die "ARCHIVE_SHA256 tanpa ARCHIVE_URL tidak boleh diabaikan"
@@ -409,25 +452,41 @@ download_package() {
       || die "Gagal download/verifikasi $RELEASE_PACKAGE_ASSET"
   fi
 
-  # Release bundle punya satu top-level directory. Override kustom boleh flat.
-  if ! tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1 2>/dev/null; then
-    tar -xzf "$archive_file" -C "$extract_dir" || die "Gagal extract tarball"
-  fi
-  # Kalau strip menghasilkan folder kosong tapi ada subdir, ambil isinya
-  if [ ! -f "$extract_dir/war.php" ] && [ ! -f "$extract_dir/war.go" ]; then
-    sub="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n1 || true)"
-    if [ -n "$sub" ] && [ -d "$sub" ]; then
-      # pindahkan isi subdir ke extract_dir
-      shopt -s dotglob 2>/dev/null || true
-      mv "$sub"/* "$extract_dir"/ 2>/dev/null || true
-      rmdir "$sub" 2>/dev/null || true
+  # Release bundle biasanya punya satu top-level directory. GNU/BSD tar dapat
+  # exit 0 walau --strip-components=1 membuang seluruh isi arsip flat, jadi
+  # kelengkapan hasil wajib dicek sebelum hasil strip diterima.
+  strip_ok=1
+  tar -xzf "$archive_file" -C "$extract_dir" --strip-components=1 2>/dev/null \
+    || strip_ok=0
+  for required in "${required_files[@]}"; do
+    [ -f "$extract_dir/$required" ] || strip_ok=0
+  done
+
+  if [ "$strip_ok" -ne 1 ]; then
+    fallback_dir="${tmp_dir}/extract-flat"
+    mkdir -p "$fallback_dir"
+    tar -xzf "$archive_file" -C "$fallback_dir" \
+      || die "Gagal extract tarball"
+    extract_dir="$fallback_dir"
+
+    # Arsip tanpa strip dapat flat atau memiliki tepat satu root directory.
+    if [ ! -f "$extract_dir/war.php" ]; then
+      shopt -q dotglob || restore_dotglob=1
+      shopt -q nullglob || restore_nullglob=1
+      shopt -s dotglob nullglob
+      extracted_entries=("$extract_dir"/*)
+      [ "$restore_dotglob" -eq 0 ] || shopt -u dotglob
+      [ "$restore_nullglob" -eq 0 ] || shopt -u nullglob
+      if [ "${#extracted_entries[@]}" -eq 1 ] \
+        && [ -d "${extracted_entries[0]}" ]; then
+        extract_dir="${extracted_entries[0]}"
+      fi
     fi
   fi
   for required in "${required_files[@]}"; do
     [ -f "$extract_dir/$required" ] \
       || die "Tarball tidak lengkap; file wajib hilang: $required"
   done
-
   # Ekspor path extract untuk caller (via global)
   EXTRACT_DIR="$extract_dir"
   TMP_DIR="$tmp_dir"
@@ -451,6 +510,8 @@ copy_file_smart() {
   local base
   base="$(basename "$dest")"
 
+  [ ! -L "$dest" ] \
+    || die "Menolak overwrite symlink tujuan: $dest"
   if [ ! -f "$src" ]; then
     warn "Skip (tidak ada di paket): $base"
     return 0
@@ -470,27 +531,38 @@ copy_file_smart() {
 
 install_files_from_extract() {
   local extract_dir="$1"
-  local include_go="${2:-0}"
-  local f src
+  local f src config is_config
+  local restore_dotglob=0 restore_nullglob=0
+  local -a package_files=()
 
+  [ ! -L "$APP_DIR" ] \
+    || die "Folder instalasi tidak boleh berupa symlink: $APP_DIR"
+  if [ -e "$APP_DIR" ] && [ ! -d "$APP_DIR" ]; then
+    die "Target instalasi bukan folder: $APP_DIR"
+  fi
   mkdir -p "$APP_DIR"
 
-  log "Pasang file ke $APP_DIR"
-  for f in "${PHP_CORE_FILES[@]}"; do
-    copy_file_smart "$extract_dir/$f" "$APP_DIR/$f" 0
-  done
-  if [ "$include_go" = "1" ]; then
-    for src in "$extract_dir"/*.go; do
-      [ -f "$src" ] || continue
-      f="$(basename "$src")"
-      copy_file_smart "$src" "$APP_DIR/$f" 0
+  log "Pasang seluruh file paket ke $APP_DIR"
+  shopt -q dotglob || restore_dotglob=1
+  shopt -q nullglob || restore_nullglob=1
+  shopt -s dotglob nullglob
+  package_files=("$extract_dir"/*)
+  [ "$restore_dotglob" -eq 0 ] || shopt -u dotglob
+  [ "$restore_nullglob" -eq 0 ] || shopt -u nullglob
+
+  for src in "${package_files[@]}"; do
+    [ -f "$src" ] || continue
+    [ ! -L "$src" ] \
+      || die "Menolak symlink di dalam paket: $(basename "$src")"
+    f="$(basename "$src")"
+    is_config=0
+    for config in "${CONFIG_FILES[@]}"; do
+      if [ "$f" = "$config" ]; then
+        is_config=1
+        break
+      fi
     done
-    for f in "${GO_CORE_FILES[@]}"; do
-      copy_file_smart "$extract_dir/$f" "$APP_DIR/$f" 0
-    done
-  fi
-  for f in "${CONFIG_FILES[@]}"; do
-    copy_file_smart "$extract_dir/$f" "$APP_DIR/$f" 1
+    copy_file_smart "$src" "$APP_DIR/$f" "$is_config"
   done
 
   # Pastikan config kosong tetap dibuat kalau belum ada
@@ -574,25 +646,26 @@ verify_php_runtime() {
 }
 
 verify_php_setup() {
-  local runtime_output
+  local required
   verify_php_runtime
-  [ -s "$APP_DIR/war.php" ] \
-    || die "Verify PHP gagal: $APP_DIR/war.php kosong/tidak ada"
+  log "Verifikasi akhir paket PHP (war.php tidak akan dijalankan)"
   [ -d "$APP_DIR" ] && [ -w "$APP_DIR" ] \
     || die "Folder aplikasi tidak writable: $APP_DIR"
+  for required in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}"; do
+    [ ! -L "$APP_DIR/$required" ] \
+      || die "Verify paket PHP menolak symlink: $APP_DIR/$required"
+    [ -f "$APP_DIR/$required" ] \
+      || die "Verify paket PHP gagal: $APP_DIR/$required tidak ada"
+  done
+  [ -s "$APP_DIR/war.php" ] \
+    || die "Verify PHP gagal: $APP_DIR/war.php kosong"
   php -l "$APP_DIR/war.php" >/dev/null \
     || die "Syntax war.php tidak valid"
-  if ! runtime_output="$(php "$APP_DIR/war.php" --check-runtime 2>&1)"; then
-    printf '%s\n' "$runtime_output" | sed 's/^/    /' >&2
-    die "Self-check runtime war.php gagal"
-  fi
-  printf '%s\n' "$runtime_output" \
-    | grep -Fxq "__WDP_PHP_RUNTIME_OK__" \
-    || die "Marker self-check runtime war.php tidak ditemukan"
-
   printf '%s\n' "__WDP_PHP_SETUP_OK__"
-  printf '%s\n' "__WDP_INSTALL_OK__"
+  ok "Seluruh file paket PHP/config lengkap di $APP_DIR"
+  ok "Syntax war.php valid"
   ok "Verify PHP: syntax, cURL multi, JSON, HTTPS/TLS siap"
+  ok "Installer tidak menjalankan flow transaksi war.php"
 }
 
 install_termux_php() {
@@ -623,7 +696,8 @@ do_install_termux() {
 
 Yang terpasang:
   • PHP + curl + tar
-  • war.php + config (Golang tidak dipakai di Android)
+  • seluruh file paket di wdp1
+  • file Go hanya aset; toolchain/build Go tidak dijalankan
 
 Edit config:
   nano $APP_DIR/waktu.txt
@@ -637,6 +711,67 @@ Update file nanti:
   bash $APP_DIR/install.sh --update
 ============================================================
 EOF
+  print_install_success
+}
+
+# ----------------------------------------------------------------------
+# macOS / MacBook — PHP only, tanpa APT/Chrony/Golang
+# ----------------------------------------------------------------------
+macos_prepare_php() {
+  local brew_bin="" php_prefix
+
+  if php_runtime_ready; then
+    ok "macOS: runtime PHP sudah tersedia"
+  else
+    if command -v brew >/dev/null 2>&1; then
+      brew_bin="$(command -v brew)"
+    elif [ -x /opt/homebrew/bin/brew ]; then
+      brew_bin="/opt/homebrew/bin/brew"
+    elif [ -x /usr/local/bin/brew ]; then
+      brew_bin="/usr/local/bin/brew"
+    else
+      die "PHP CLI/cURL belum siap. Pasang Homebrew lalu ulangi installer tanpa sudo."
+    fi
+    log "macOS: install/upgrade PHP melalui Homebrew"
+    "$brew_bin" install php || die "Homebrew gagal memasang PHP"
+    php_prefix="$("$brew_bin" --prefix php 2>/dev/null || true)"
+    if [ -n "$php_prefix" ]; then
+      export PATH="$php_prefix/bin:$php_prefix/sbin:$PATH"
+      hash -r
+    fi
+  fi
+
+  need_cmd curl
+  need_cmd tar
+  need_sha256_tool
+  verify_php_runtime
+  ok "macOS: dependency PHP-only siap (Chrony/Golang tidak dijalankan)"
+}
+
+do_install_macos() {
+  macos_prepare_php
+  download_package
+  install_files_from_extract "$EXTRACT_DIR"
+  cleanup_download
+  verify_php_setup
+
+  cat <<EOF
+
+============================================================
+✓ macOS siap — WAR PHP di $APP_DIR
+
+Seluruh file paket dipasang di folder wdp1 milik user aktif.
+File Go hanya aset; Chrony/toolchain/build Go tidak dijalankan pada macOS.
+
+Jalankan:
+  cd $APP_DIR
+  php war.php
+
+Update:
+  bash $APP_DIR/install.sh --update
+============================================================
+EOF
+  print_install_success
 }
 
 # ----------------------------------------------------------------------
@@ -869,6 +1004,7 @@ clock_tracking_is_healthy() {
 
 linux_wait_clock_health() {
   local wait_output tracking
+  CLOCK_GATE_PASSED=0
   need_cmd chronyc
   need_cmd awk
   require_positive_integer "CLOCK_WAIT_TRIES" "$CLOCK_WAIT_TRIES"
@@ -902,8 +1038,22 @@ linux_wait_clock_health() {
     die "Metrik chrony di luar policy"
   fi
 
-  printf '%s\n' "__WDP_CLOCK_HEALTHY__"
+  CLOCK_GATE_PASSED=1
   ok "Chrony sinkron; correction/error/skew di dalam batas"
+}
+
+print_clock_success_marker() {
+  [ "$IS_LINUX" -eq 1 ] || return 0
+  [ "$CLOCK_GATE_PASSED" -eq 1 ] \
+    || die "Marker sukses ditolak karena clock gate belum lulus"
+  # Marker ini hanya untuk Linux dan menjamin gate Chrony sudah lulus.
+  printf '%s\n' "__WDP_CLOCK_HEALTHY__"
+}
+
+print_install_success() {
+  ok "Selesai; installer keluar normal dan tidak membuka shell tambahan"
+  printf '%s\n' "__WDP_INSTALL_OK__"
+  print_clock_success_marker
 }
 
 linux_prepare_clock() {
@@ -1365,7 +1515,8 @@ verify_golang_setup() {
 }
 
 do_setup_golang_only() {
-  [ "$IS_LINUX" -eq 1 ] || die "--go-only hanya untuk Linux/VPS (Termux Android pakai PHP saja)"
+  [ "$IS_LINUX" -eq 1 ] \
+    || die "--go-only hanya untuk Linux/VPS; macOS/Termux memakai profil PHP"
   BINARY_MODE="source"
   linux_prepare_clock
   download_package
@@ -1385,6 +1536,7 @@ Jalankan war (langsung, tanpa download):
   ./war
 ============================================================
 EOF
+  print_clock_success_marker
 }
 
 do_install_linux() {
@@ -1407,7 +1559,8 @@ do_install_linux() {
 Yang sudah dikonfigurasi:
   • PHP CLI + ekstensi cURL/JSON
   • timezone Asia/Jakarta + chrony fail-closed
-  • Golang, go mod, build, dan binary war tidak dijalankan
+  • seluruh file paket disalin; file Go tetap hanya aset dorman
+  • toolchain, go mod, build, dan binary war tidak dijalankan
   • Jalur Golang tetap tersedia hanya lewat --go-only
 
 Edit config:
@@ -1422,6 +1575,7 @@ Update dari GitHub Release:
   bash $APP_DIR/install.sh --update
 ============================================================
 EOF
+  print_install_success
 }
 
 # ----------------------------------------------------------------------
@@ -1431,6 +1585,10 @@ do_update_files() {
   log "Mode update PHP: sync war.php/config ke $APP_DIR"
   if [ "$IS_LINUX" -eq 1 ]; then
     linux_prepare_clock 1
+  elif [ "$IS_MACOS" -eq 1 ]; then
+    macos_prepare_php
+  elif [ "$IS_TERMUX" -eq 1 ] && ! php_runtime_ready; then
+    install_termux_php
   fi
   download_package
 
@@ -1451,16 +1609,19 @@ do_update_files() {
 ============================================================
 ✓ Update PHP selesai → $APP_DIR
   Runtime aktif: php war.php
-  Golang/binary war: tidak disentuh
+  Toolchain/build/binary Go: tidak dijalankan
+  Seluruh file paket: disinkronkan ke wdp1
   (config berisi data lokal tidak di-overwrite; pakai --force untuk ganti)
 ============================================================
 EOF
+  print_install_success
 }
 
 do_clock_only() {
   [ "$IS_LINUX" -eq 1 ] || die "--clock-only hanya untuk Linux/VPS"
   linux_prepare_clock
   linux_wait_clock_health
+  print_clock_success_marker
 }
 
 do_verify_clock() {
@@ -1468,6 +1629,7 @@ do_verify_clock() {
   [ "$(date +%z 2>/dev/null || true)" = "+0700" ] \
     || die "Timezone aktif bukan Asia/Jakarta (+0700)"
   linux_wait_clock_health
+  print_clock_success_marker
 }
 
 # ----------------------------------------------------------------------
@@ -1514,17 +1676,30 @@ EOF
 # ----------------------------------------------------------------------
 main() {
   trap 'on_unexpected_error "$?" "$LINENO"' ERR
+  if [ -n "${APP_DIR:-}" ]; then
+    APP_DIR_EXPLICIT=1
+  fi
   parse_args "$@"
   detect_platform
+  case "$PLATFORM" in
+    unsupported:*) die "Platform tidak didukung: ${PLATFORM#unsupported:}" ;;
+  esac
 
   APP_DIR="${APP_DIR:-$(default_app_dir)}"
   # Normalisasi trailing slash
   APP_DIR="${APP_DIR%/}"
+  [ -n "$APP_DIR" ] && [ "$APP_DIR" != "/" ] \
+    || die "APP_DIR tidak boleh kosong atau root filesystem"
 
   log "Deteksi platform: $PLATFORM | APP_DIR=$APP_DIR | mode=$MODE"
 
   if [ "$MODE" = "menu" ]; then
     show_menu
+    if [ "$APP_DIR_EXPLICIT" -eq 0 ]; then
+      APP_DIR="$(default_app_dir)"
+      APP_DIR="${APP_DIR%/}"
+      log "Target sesuai pilihan menu: APP_DIR=$APP_DIR | mode=$MODE"
+    fi
   fi
 
   case "$MODE" in
@@ -1543,6 +1718,8 @@ main() {
     auto)
       if [ "$IS_TERMUX" -eq 1 ]; then
         do_install_termux
+      elif [ "$IS_MACOS" -eq 1 ]; then
+        do_install_macos
       else
         do_install_linux
       fi
@@ -1551,12 +1728,6 @@ main() {
       die "Mode internal tidak dikenal: $MODE"
       ;;
   esac
-
-  # Termux: drop ke shell interaktif seperti install lama
-  if [ "$IS_TERMUX" -eq 1 ] && [ -r /dev/tty ] && [ -t 0 ] 2>/dev/null; then
-    cd "$APP_DIR" 2>/dev/null || true
-    exec bash -i < /dev/tty
-  fi
 }
 
 if [ -z "${BASH_SOURCE[0]-}" ] || [ "${BASH_SOURCE[0]-}" = "$0" ]; then
