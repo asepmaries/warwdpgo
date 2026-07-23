@@ -33,7 +33,7 @@ import (
 
 // ======================================================================
 // GOPAY MLBB WDP - WAR EDITION (GOLANG + FASTHTTP)
-// Target: 4 user berbeda | Single salvo tanpa retry | 4 dedicated TLS lanes
+// Target: 1-4 user berbeda | Single salvo tanpa retry | 1 lane TLS per user
 // ======================================================================
 
 const (
@@ -55,7 +55,7 @@ const (
 	CLOCK_SKEW_LIMIT_PPM       = 100.0
 	MIN_FIXED_LEAD_MS          = -499
 	MAX_FIXED_LEAD_MS          = 499
-	PROGRAM_VERSION            = "2026.07.22-timing-v3"
+	PROGRAM_VERSION            = "2026.07.21-timing-v3"
 )
 
 // Pola error (sama persis dengan PHP)
@@ -458,9 +458,9 @@ func newInquiryLane(id int) *inquiryLane {
 	return lane
 }
 
-func initFastHTTPClients() {
+func initFastHTTPClients(orderCount int) {
 	sessionUA, sessionSecCH = getRandomUserAgent()
-	inquiryLanes = make([]*inquiryLane, MAX_USERS)
+	inquiryLanes = make([]*inquiryLane, orderCount)
 	for i := range inquiryLanes {
 		inquiryLanes[i] = newInquiryLane(i + 1)
 	}
@@ -946,8 +946,11 @@ func loadOrders() []Order {
 			orders = append(orders, order)
 		}
 	}
-	if len(orders) != MAX_USERS {
-		log.Fatalf("❌ VPS wajib memiliki tepat %d User ID berbeda; ditemukan %d", MAX_USERS, len(orders))
+	if len(orders) == 0 {
+		log.Fatal("❌ VPS wajib memiliki minimal 1 User ID yang valid")
+	}
+	if len(orders) > MAX_USERS {
+		log.Fatalf("❌ VPS hanya dapat memproses maksimal %d User ID berbeda; ditemukan %d", MAX_USERS, len(orders))
 	}
 	logf("✅ Loaded %d order(s) (max %d)\n", len(orders), MAX_USERS)
 	return orders
@@ -1540,9 +1543,9 @@ type paymentPipeline struct {
 	success atomic.Int32
 }
 
-func startPaymentPipeline() *paymentPipeline {
-	p := &paymentPipeline{jobs: make(chan SuccessEntry, MAX_USERS)}
-	for i := 0; i < MAX_USERS; i++ {
+func startPaymentPipeline(workerCount int) *paymentPipeline {
+	p := &paymentPipeline{jobs: make(chan SuccessEntry, workerCount)}
+	for i := 0; i < workerCount; i++ {
 		p.workers.Add(1)
 		go func() {
 			defer p.workers.Done()
@@ -1820,7 +1823,7 @@ func runFixedLeadSingleSalvo(target time.Time, leadMs int, orders []Order) ([]Su
 
 	spinWaitUntil(prebuildAt)
 	prebuilt := prebuildInquiryRequests(orders, captcha)
-	payments := startPaymentPipeline()
+	payments := startPaymentPipeline(len(orders))
 	inquiryDeadline := execTarget.Add(time.Duration(INQUIRY_TIMEOUT_MS) * time.Millisecond)
 	salvo := prepareSingleSalvo(prebuilt, payments, inquiryDeadline)
 	oldGCPercent := debug.SetGCPercent(-1)
@@ -1961,7 +1964,7 @@ func main() {
 	}
 
 	logf("=== GOPAY MLBB WDP WAR (GOLANG + FASTHTTP) ===\n")
-	logf("VERSION=%s | MODE=SINGLE_SALVO | MAX_USERS=%d | RETRY=OFF | LANES=4xH1 | LEAD=FIXED\n\n",
+	logf("VERSION=%s | MODE=SINGLE_SALVO | MAX_USERS=%d | RETRY=OFF | LANES=DYNAMIC_1_TO_4xH1 | LEAD=FIXED\n\n",
 		PROGRAM_VERSION, MAX_USERS)
 
 	orders := loadOrders()
@@ -1985,7 +1988,7 @@ func main() {
 	target := anchorMonotonic(targetWall)
 	logf("[CLOCK] Deadline T=0 sudah di-anchor ke monotonic clock.\n")
 
-	initFastHTTPClients()
+	initFastHTTPClients(len(orders))
 	inquirySuccess, paymentSuccess := runFixedLeadSingleSalvo(target, leadMs, orders)
 
 	logf("\n📊 Inquiry selesai: %d/%d sukses\n", len(inquirySuccess), len(orders))
