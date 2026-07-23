@@ -14,33 +14,6 @@
 if (php_sapi_name() !== 'cli') {
     die("Script ini hanya boleh dijalankan via CLI\n");
 }
-if (($argv[1] ?? '') === '--check-runtime') {
-    if (PHP_VERSION_ID < 70400) {
-        fwrite(STDERR, "PHP minimal 7.4\n");
-        exit(2);
-    }
-    if (!extension_loaded('curl') || !extension_loaded('json')) {
-        fwrite(STDERR, "Ekstensi curl/json wajib aktif\n");
-        exit(3);
-    }
-    $firstHandle = curl_init();
-    $secondHandle = curl_init();
-    if ($firstHandle === false || $secondHandle === false
-        || curlHandleKey($firstHandle) === curlHandleKey($secondHandle)
-    ) {
-        fwrite(STDERR, "Identitas cURL handle tidak aman\n");
-        exit(4);
-    }
-    $curlInfo = curl_version();
-    if (empty($curlInfo['ssl_version'])
-        || !in_array('https', $curlInfo['protocols'] ?? [], true)
-    ) {
-        fwrite(STDERR, "libcurl wajib mendukung HTTPS/TLS\n");
-        exit(5);
-    }
-    echo "__WDP_PHP_RUNTIME_OK__\n";
-    exit(0);
-}
 date_default_timezone_set('Asia/Jakarta');
 set_time_limit(0);
 ignore_user_abort(true);
@@ -100,8 +73,28 @@ const PAYMENT_TIMEOUT_MS    = 5200;
 const TARGET_SRV_MS_DEFAULT = 0.0;           // Target arrival server tepat T=0.
 
 // Pola pesan error dari endpoint inquiry
-const STOP_PATTERNS       = ['out of stock', 'sold out', 'kuota habis', 'voucher habis', 'stok habis', 'sudah habis'];
-const SKIP_USER_PATTERNS  = ['reached the redeem limit', 'already redeemed', 'sudah pernah', 'role_null', 'role null', 'invalid user', 'user not found', 'user_not_found', 'act_subscrip_no_config', 'subscrip_no_config'];
+const STOP_PATTERNS = [
+    'out of stock', 'sold out', 'kuota habis', 'voucher habis',
+    'stok habis', 'sudah habis', 'Transaction is suspicous',
+];
+const INVALID_USER_PATTERNS = [
+    'role_null', 'role null', 'error_role_null',
+    'invalid user', 'user not found', 'user_not_found',
+    'error_invalidzoneid', 'invalid zone',
+];
+const SKIP_USER_PATTERNS = [
+    'reached the redeem limit', 'already redeemed', 'sudah pernah',
+    'act_subscrip_no_config', 'subscrip_no_config',
+];
+const REGION_BLOCK_PATTERNS = [
+    'regional restrictions', 'region restriction', 'outside region',
+    'outside regional', 'di luar region', 'diluar region', 'luar region',
+    'luar zona promo', 'zona promo',
+];
+const RETRY_PATTERNS = [
+    'not available', 'not yet', 'belum dimulai', 'belum tersedia',
+    'tidak tersedia', 'try again', 'temporarily', 'service unavailable',
+];
 
 // ----------------------------------------------------------------------
 // TIMING DARI waktu.txt
@@ -293,14 +286,6 @@ function createCurlSession() {
     return $ch;
 }
 
-/**
- * PHP 7 memakai resource cURL, sedangkan PHP 8+ memakai object CurlHandle.
- * Jangan cast object ke int: semua handle dapat kolaps ke key yang sama.
- */
-function curlHandleKey($ch): int {
-    return is_object($ch) ? spl_object_id($ch) : (int) $ch;
-}
-
 function getSharedCurlHandle() {
     static $share = null;
     if ($share !== null) return $share;
@@ -326,6 +311,7 @@ function attachShareToHandle($ch): void {
 }
 
 function configureCurlHandle($ch, string $url, string $method, array $headers, $body = null, array $options = []): void {
+    $method = strtoupper($method);
     $headerLines = buildHeaderLines($headers, true);
     if ($body !== null && !array_key_exists('content-type', array_change_key_case($headers, CASE_LOWER))) {
         $headerLines[] = 'Content-Type: application/json';
@@ -335,7 +321,7 @@ function configureCurlHandle($ch, string $url, string $method, array $headers, $
     $curlOptions = [
         CURLOPT_URL => $url,
         CURLOPT_HTTPHEADER => $headerLines,
-        CURLOPT_CUSTOMREQUEST => strtoupper($method),
+        CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_CONNECTTIMEOUT_MS => $connectTimeoutMs,
         CURLOPT_TIMEOUT_MS => $timeoutMs,
     ];
@@ -343,6 +329,11 @@ function configureCurlHandle($ch, string $url, string $method, array $headers, $
         $curlOptions[CURLOPT_POSTFIELDS] = is_array($body) ? json_encode($body) : $body;
     } else {
         $curlOptions[CURLOPT_POSTFIELDS] = null;
+    }
+    if ($method === 'GET') {
+        // Pastikan handle yang pernah dipakai POST benar-benar kembali menjadi
+        // GET tanpa request body.
+        $curlOptions[CURLOPT_HTTPGET] = true;
     }
     curl_setopt_array($ch, $curlOptions);
 }
@@ -367,30 +358,42 @@ function warmUpBurstSession(array $baseHeaders): void {
 }
 
 /**
- * Warm-up T-MINI_PROBE2_LEAD_MS sebelum burst (default 1.5s): hantam endpoint
- * inquiry asli pakai MINI_PROBE2_PARALLEL koneksi paralel supaya TCP/TLS pool
- * benar-benar warm saat salvo war fire. Tidak konsumsi voucher (response =
- * "not available", war belum mulai). RTT yang dilaporkan hanya untuk informasi
- * di log, tidak dipakai untuk re-tune lead.
+ * Warm-up T-MINI_PROBE2_LEAD_MS sebelum burst (default 1.5s): GET endpoint
+ * inquiry tanpa body/order/voucher, memakai MINI_PROBE2_PARALLEL koneksi
+ * paralel supaya TCP/TLS pool benar-benar warm saat salvo war fire.
+ * RTT yang dilaporkan hanya untuk informasi di log, tidak dipakai untuk
+ * re-tune lead.
  *
  * $maxMs: budget timeout. Warm-up call di-cut kalau melebihi budget supaya
  *         TIDAK menunda burst (VPS koneksi cold/lambat tetap fire on-time).
  */
-function miniProbe2ReWarm(array $sampleOrder, string $captchaToken, int $maxMs = 1200): array {
+function miniProbe2ReWarm(int $maxMs = 1200): array {
     $maxMs = max(150, $maxMs);
     $connectTo = min(INQUIRY_CONNECT_TO_MS, $maxMs);
     $mh = curl_multi_init();
     $handles = [];
     for ($i = 0; $i < MINI_PROBE2_PARALLEL; $i++) {
-        $headers = buildInquiryHeaders($captchaToken);
-        $body    = buildInquiryBody($sampleOrder);
+        $ua = getRandomUserAgent();
+        $headers = [
+            'user-agent' => $ua['user-agent'],
+            'sec-ch-ua' => $ua['sec-ch-ua'],
+            'sec-ch-ua-platform' => '"Android"',
+            'sec-ch-ua-mobile' => '?1',
+            'accept' => '*/*',
+            'origin' => 'https://gopay.co.id',
+            'referer' => 'https://gopay.co.id/games/mobile-legends-bang-bang',
+            'sec-fetch-site' => 'same-origin',
+            'sec-fetch-mode' => 'cors',
+            'sec-fetch-dest' => 'empty',
+            'accept-language' => 'en-US,en;q=0.9',
+        ];
         $ch = createCurlSession();
         configureCurlHandle(
             $ch,
             'https://gopay.co.id/games/v1/order/inquiry',
-            'POST',
+            'GET',
             $headers,
-            $body,
+            null,
             ['connect_timeout_ms' => $connectTo, 'timeout_ms' => $maxMs]
         );
         curl_multi_add_handle($mh, $ch);
@@ -493,21 +496,33 @@ function saveCaptchaToken(string $token): void {
 
 // ----------------------------------------------------------------------
 // CLASSIFY RESPONSE INQUIRY
-// Return: ['status' => 'success'|'stop'|'skip_user'|'unknown', 'orderId' => ?string]
+// Status "retry" hanya label klasifikasi agar sama dengan war.go.
+// runSingleInquiry tetap single-shot dan tidak mengirim inquiry ulang.
+// Return: ['status' => 'success'|'stop'|'user_invalid'|'skip_user'|'region_block'|'retry'|'unknown', 'orderId' => ?string]
 // ----------------------------------------------------------------------
 function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload): array {
     if (($code === 200 || $code === 201) && is_array($payload)) {
         $orderId = $payload['data']['orderId'] ?? $payload['orderId'] ?? null;
-        if ($orderId) {
-            return ['status' => 'success', 'orderId' => (string) $orderId];
+        if (is_string($orderId) && $orderId !== '') {
+            return ['status' => 'success', 'orderId' => $orderId];
         }
     }
 
-    $msg = strtolower((string) $errorText);
+    // war.go mencocokkan pola terhadap seluruh response body, bukan hanya
+    // pesan error yang berhasil diekstrak.
+    $payloadText = is_array($payload)
+        ? json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+        : '';
+    $msg = strtolower(trim((string) $errorText . ' ' . ($payloadText !== false ? $payloadText : '')));
 
     foreach (STOP_PATTERNS as $p) {
         if ($msg !== '' && strpos($msg, $p) !== false) {
             return ['status' => 'stop', 'orderId' => null];
+        }
+    }
+    foreach (INVALID_USER_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'user_invalid', 'orderId' => null];
         }
     }
     foreach (SKIP_USER_PATTERNS as $p) {
@@ -515,6 +530,20 @@ function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload)
             return ['status' => 'skip_user', 'orderId' => null];
         }
     }
+    foreach (REGION_BLOCK_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'region_block', 'orderId' => null];
+        }
+    }
+    foreach (RETRY_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'retry', 'orderId' => null];
+        }
+    }
+    if ($code === 0 || ($code >= 400 && $code < 600)) {
+        return ['status' => 'retry', 'orderId' => null];
+    }
+
     return ['status' => 'unknown', 'orderId' => null];
 }
 
@@ -633,7 +662,7 @@ function fireInquiry($mh, array $order, string $captchaToken): array {
 // ----------------------------------------------------------------------
 function runSingleInquiry(array $orders, string $captchaToken): array {
     $mh = curl_multi_init();
-    $active     = [];      // map: curlHandleKey($ch) -> meta
+    $active     = [];      // map: (int)$ch -> meta
     $successMap = [];      // userId|serverId -> ['order','orderId','headers']
 
     $phaseStart = microtime(true);
@@ -642,7 +671,7 @@ function runSingleInquiry(array $orders, string $captchaToken): array {
     // Satu-satunya salvo: tembak semua user paralel.
     foreach ($orders as $ord) {
         $meta = fireInquiry($mh, $ord, $captchaToken);
-        $active[curlHandleKey($meta['ch'])] = $meta;
+        $active[(int) $meta['ch']] = $meta;
     }
     echo "? SALVO TUNGGAL: tembak " . count($orders) . " user paralel @ [" . formatMicrotimeNow() . "]\n";
 
@@ -658,7 +687,7 @@ function runSingleInquiry(array $orders, string $captchaToken): array {
             if ($info['msg'] !== CURLMSG_DONE) continue;
 
             $ch  = $info['handle'];
-            $key = curlHandleKey($ch);
+            $key = (int) $ch;
             if (!isset($active[$key])) {
                 curl_multi_remove_handle($mh, $ch);
                 @curl_close($ch);
@@ -951,10 +980,10 @@ function gpyPay(): void {
 
     // Tunggu dan fire — mini-probe2 T-1.5s untuk warm TLS pool sebelum burst.
     // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
-    waitForExactBurstTime($burstLeadMs, static function (int $budgetMs = 1200) use ($orders, $captchaToken): void {
-        echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000) . "s re-warm TLS pool ("
+    waitForExactBurstTime($burstLeadMs, static function (int $budgetMs = 1200): void {
+        echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000) . "s re-warm TLS pool via GET tanpa voucher ("
            . MINI_PROBE2_PARALLEL . " call paralel, budget {$budgetMs}ms)...\n";
-        $rtts = miniProbe2ReWarm($orders[0], $captchaToken, $budgetMs);
+        $rtts = miniProbe2ReWarm($budgetMs);
         if (!empty($rtts)) {
             $median = percentile($rtts, 0.5);
             echo "[WARM-UP] RTT: " . implode('ms, ', array_map(fn($v) => number_format($v, 0), $rtts)) . "ms"
@@ -973,7 +1002,4 @@ function gpyPay(): void {
     echo "\n? FULL FLOW SELESAI! Berhasil: $success / " . count($orders) . "\n";
 }
 
-// Aman untuk di-require oleh test/tooling tanpa menjalankan transaksi WAR.
-if (realpath((string) ($_SERVER['SCRIPT_FILENAME'] ?? '')) === __FILE__) {
-    gpyPay();
-}
+gpyPay();

@@ -226,6 +226,20 @@ parse_args --build-from-source
 [ "$MODE" = "go-only" ] || fail "--build-from-source bukan alias --go-only"
 [ "$BINARY_MODE" = "source" ] || fail "--build-from-source tidak memilih source"
 
+# Paket aktual harus lolos verifikasi tanpa pernah menjalankan entrypoint WAR.
+APP_DIR="$test_root/actual-wdp1"
+mkdir -p "$APP_DIR"
+cp "$repo_root/war.php" "$APP_DIR/war.php"
+cp "$repo_root/install.sh" "$APP_DIR/install.sh"
+for file in "${CONFIG_FILES[@]}"; do
+  cp "$repo_root/$file" "$APP_DIR/$file"
+done
+actual_verify_output="$(verify_php_setup)"
+printf '%s\n' "$actual_verify_output" | grep -Fxq "__WDP_PHP_SETUP_OK__" \
+  || fail "paket aktual gagal verifikasi PHP"
+[ ! -e "$APP_DIR/loghasil.txt" ] \
+  || fail "verifikasi installer menjalankan war.php aktual"
+
 # Verifikasi hanya lint dan tidak boleh mengeksekusi flow aplikasi.
 APP_DIR="$test_root/no-exec-wdp1"
 mkdir -p "$APP_DIR"
@@ -273,13 +287,14 @@ mkdir -p "$APP_DIR" "$missing_config_extract"
 cp "$extract_dir/war.php" "$missing_config_extract/war.php"
 cp "$extract_dir/install.sh" "$missing_config_extract/install.sh"
 outside_config="$test_root/outside-lead.txt"
+printf 'outside-config-safe\n' > "$outside_config"
 ln -s "$outside_config" "$APP_DIR/lead.txt"
 if [ -L "$APP_DIR/lead.txt" ]; then
   if (install_files_from_extract "$missing_config_extract") >/dev/null 2>&1; then
     fail "symlink config tanpa source diterima"
   fi
-  [ ! -e "$outside_config" ] \
-    || fail "referent luar config symlink dibuat/diubah"
+  [ "$(cat "$outside_config")" = "outside-config-safe" ] \
+    || fail "referent luar config symlink berubah"
 fi
 
 printf 'php-only default/update routing: ok\n'

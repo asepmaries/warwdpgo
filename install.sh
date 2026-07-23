@@ -567,6 +567,8 @@ install_files_from_extract() {
 
   # Pastikan config kosong tetap dibuat kalau belum ada
   for f in "${CONFIG_FILES[@]}"; do
+    [ ! -L "$APP_DIR/$f" ] \
+      || die "Menolak symlink config tujuan: $APP_DIR/$f"
     if [ ! -f "$APP_DIR/$f" ]; then
       : > "$APP_DIR/$f"
       ok "Buat kosong: $f"
