@@ -85,6 +85,26 @@ do_update_files >"$update_output"
 [ "$(sha256sum "$APP_DIR/war" | awk '{print $1}')" = "$legacy_hash" ] \
   || fail "binary Go lama berubah saat update PHP"
 
+# Pilihan Go tetap tersedia, tetapi wajib memakai toolchain + binary release
+# tanpa menyentuh build source war.go.
+trace=""
+linux_prepare_clock() {
+  [ $# -eq 0 ] || fail "setup Go tidak boleh meminta dependency PHP"
+  trace="$trace clock"
+}
+linux_install_golang_toolchain() { trace="$trace go-toolchain"; }
+install_linux_war_binary() {
+  [ "$BINARY_MODE" = "release" ] || fail "pilihan Go tidak memakai release"
+  trace="$trace release-binary"
+}
+verify_golang_setup() { trace="$trace go-verify"; }
+go_output="$test_root/go-output.txt"
+do_setup_golang_only >"$go_output"
+[ "$trace" = " clock download wait files-main files-wdp1 go-toolchain release-binary cleanup go-verify" ] \
+  || fail "urutan setup Go release salah:$trace"
+[ "$(tail -n 1 "$go_output")" = "__WDP_CLOCK_HEALTHY__" ] \
+  || fail "marker clock bukan output terakhir setup Go"
+
 # macOS memasang paket di HOME dan HOME/wdp1 tanpa APT/Chrony/Golang.
 trace=""
 IS_LINUX=0
@@ -119,16 +139,13 @@ WDP1_DIR="$APP_DIR/wdp1"
 install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
 install_files_from_extract "$extract_dir" "$WDP1_DIR" >/dev/null
 for target in "$APP_DIR" "$WDP1_DIR"; do
-  for file in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}" war.go "${GO_CORE_FILES[@]}"; do
+  for file in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}"; do
     [ -f "$target/$file" ] || fail "file paket hilang dari $target: $file"
   done
+  for file in war.go go.mod go.sum; do
+    [ ! -e "$target/$file" ] || fail "aset Go ikut terpasang di $target: $file"
+  done
 done
-
-APP_DIR="$test_root/go-app"
-install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
-[ -f "$APP_DIR/war.go" ] || fail "profil Go tidak menyalin war.go"
-[ -f "$APP_DIR/go.mod" ] || fail "profil Go tidak menyalin go.mod"
-[ -f "$APP_DIR/go.sum" ] || fail "profil Go tidak menyalin go.sum"
 
 # Default portable: paket utama tetap di HOME dan salinan berada di HOME/wdp1.
 IS_TERMUX=0
@@ -147,9 +164,6 @@ IS_TERMUX=1
 [ "$(default_app_dir)" = "/sdcard/wdp" ] \
   || fail "direktori utama Termux bukan /sdcard/wdp"
 IS_TERMUX=0
-MODE="go-only"
-[ "$(default_app_dir)" = "/Users/codex" ] \
-  || fail "mode Go eksplisit berubah ikut ke folder wdp1"
 MODE="auto"
 
 # Pemilihan menu mempertahankan HOME sebagai direktori utama.
@@ -166,13 +180,15 @@ MODE="auto"
   }
   show_menu() {
     MODE="go-only"
-    BINARY_MODE="source"
+    BINARY_MODE="release"
   }
   do_setup_golang_only() {
     [ "$APP_DIR" = "/home/menu-user" ] \
       || fail "menu Go tidak memakai direktori utama: $APP_DIR"
     [ "$WDP1_DIR" = "/home/menu-user/wdp1" ] \
       || fail "folder salinan menu salah: $WDP1_DIR"
+    [ "$BINARY_MODE" = "release" ] \
+      || fail "menu Go tidak memilih binary release"
   }
   main --menu >/dev/null
 )
@@ -186,7 +202,7 @@ unset -f uname
 [ "$IS_MACOS" -eq 1 ] && [ "$PLATFORM" = "macos" ] \
   || fail "Darwin tidak dideteksi sebagai macOS"
 
-# Arsip PHP-only sah untuk default/update, tetapi ditolak profil Go.
+# Arsip PHP-only sah untuk default/update.
 php_archive_root="$test_root/php-archive/warwdpgo"
 php_archive="$test_root/php-only.tar.gz"
 mkdir -p "$php_archive_root"
@@ -221,7 +237,8 @@ cleanup_download
 # Jalur default wajib mengambil arsip dan checksum dari pasangan objek R2,
 # bukan diam-diam kembali ke GitHub Release.
 r2_checksum="$test_root/R2-SHA256SUMS"
-printf '%s  warwdpgo.tar.gz\n' \
+# Simulasikan publisher Windows lama (CRLF); parser Linux wajib tetap menerima.
+printf '%s  warwdpgo.tar.gz\r\n' \
   "$(sha256sum "$php_archive" | awk '{print $1}')" > "$r2_checksum"
 ARCHIVE_URL=""
 ARCHIVE_SHA256=""
@@ -249,21 +266,17 @@ if (
 ) >/dev/null 2>&1; then
   fail "paket R2 diterima walau checksum arsip tidak cocok"
 fi
-printf '%s  warwdpgo.tar.gz\n' \
+printf '%s  warwdpgo.tar.gz\r\n' \
   "$(sha256sum "$php_archive" | awk '{print $1}')" > "$r2_checksum"
-
-if (
-  MODE="go-only"
-  download_package
-) >/dev/null 2>&1; then
-  fail "profil Go menerima arsip tanpa war.go/go.mod/go.sum"
-fi
 
 MODE="auto"
 BINARY_MODE="release"
-parse_args --build-from-source
-[ "$MODE" = "go-only" ] || fail "--build-from-source bukan alias --go-only"
-[ "$BINARY_MODE" = "source" ] || fail "--build-from-source tidak memilih source"
+parse_args --go-only
+[ "$MODE" = "go-only" ] || fail "--go-only tidak memilih profil Go"
+[ "$BINARY_MODE" = "release" ] || fail "--go-only tidak memilih binary release"
+if (parse_args --build-from-source) >/dev/null 2>&1; then
+  fail "--build-from-source masih diterima oleh installer PHP-only"
+fi
 
 # Paket aktual harus lolos verifikasi tanpa pernah menjalankan entrypoint WAR.
 APP_DIR="$test_root/actual-main"

@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 # ======================================================================
-# WARWDPGO installer — PHP default, Golang hanya bila diminta eksplisit
+# WARWDPGO installer — PHP-only
 #
 # Termux  : paket utama di /sdcard/wdp + salinan di /sdcard/wdp/wdp1
 # Linux   : paket utama di $HOME + salinan di $HOME/wdp1
 # macOS   : paket utama di $HOME + salinan di $HOME/wdp1
-# Golang  : hanya melalui --go-only; tidak dijalankan oleh install/update normal
+# Golang  : pilihan eksplisit memakai binary release; source war.go tidak dibawa
 #
 # Jalankan:
 #   bash install.sh              # full auto sesuai platform
 #   bash install.sh --menu       # pilih menu manual
 #   bash install.sh --update     # sync war.php/config tanpa menyentuh Golang
-#   bash install.sh --go-only    # Linux: build dari source secara eksplisit
 #   bash install.sh --clock-only # Linux: pasang/start chrony + tunggu sehat
 #   bash install.sh --verify-clock
 #   APP_DIR=/path bash install.sh
 # ======================================================================
 set -Eeuo pipefail
 
-# Paket PHP/source default selalu berasal dari arsip R2 yang dipublikasikan
-# bersama checksum-nya. GitHub Release tetap dipakai hanya oleh jalur binary Go.
+# Paket PHP selalu berasal dari arsip R2 yang dipublikasikan bersama checksum-nya.
 R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://pub-453249fbfe80408a8bb5bf8cce54f391.r2.dev}"
 R2_PACKAGE_KEY="${R2_PACKAGE_KEY:-warwdpgo/warwdpgo.tar.gz}"
 R2_CHECKSUM_KEY="${R2_CHECKSUM_KEY:-warwdpgo/SHA256SUMS}"
@@ -46,17 +44,16 @@ CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.050}"
 # membunuh pemeriksaan yang sebenarnya masih menunggu sinkronisasi sehat.
 CLOCK_CHECK_TIMEOUT_SEC="${CLOCK_CHECK_TIMEOUT_SEC:-45}"
 
-# Profil PHP hanya menyiapkan runtime yang benar-benar dipakai besok.
-# Semua file paket disalin ke wdp1; file Go hanya aset dorman dan tidak diproses.
+# Profil PHP hanya menyiapkan runtime yang benar-benar dipakai.
+# Aset Go sengaja dikecualikan dari paket dan tujuan instalasi.
 PHP_CORE_FILES=(war.php install.sh)
-GO_CORE_FILES=(go.mod go.sum)
 
 # Config: jangan di-overwrite kalau sudah ada isi (kecuali --force)
 CONFIG_FILES=(waktu.txt user_server_wdp.txt lead.txt reload.txt target_srv.txt)
 
 FORCE_OVERWRITE=0
 APP_DIR_EXPLICIT=0
-MODE="auto" # auto/update = PHP | go-only = Golang eksplisit
+MODE="auto" # auto/update = PHP
 BINARY_MODE="${BINARY_MODE:-release}" # release | source
 ALLOW_SOURCE_FALLBACK="${ALLOW_SOURCE_FALLBACK:-0}"
 RELEASE_CHECKSUM_FILE=""
@@ -175,11 +172,11 @@ parse_args() {
     case "$1" in
       --menu|-m)     MODE="menu" ;;
       --update|-u)   MODE="update" ;;
-      --go-only)     MODE="go-only"; BINARY_MODE="source" ;;
+      --go-only)     MODE="go-only"; BINARY_MODE="release" ;;
       --clock-only)  MODE="clock-only" ;;
       --verify-clock) MODE="verify-clock" ;;
-      --build-from-source) MODE="go-only"; BINARY_MODE="source" ;;
-      --allow-source-fallback) ALLOW_SOURCE_FALLBACK=1 ;;
+      --build-from-source) die "--build-from-source tidak tersedia: installer ini PHP-only" ;;
+      --allow-source-fallback) die "--allow-source-fallback tidak tersedia: installer ini PHP-only" ;;
       --release-tag)
         [ $# -ge 2 ] || die "--release-tag membutuhkan nilai"
         shift
@@ -199,11 +196,9 @@ Usage: bash install.sh [options]
   (default)               Install PHP-only; Golang/binary war tidak disentuh
   --menu, -m              Tampilkan menu pilihan
   --update, -u            Sync war.php/config; tidak install/build Golang
-  --go-only               Linux: install Go + build source secara eksplisit
+  --go-only               Linux: install Go + binary war dari GitHub Release
   --clock-only            Linux: install/start chrony lalu tunggu clock sehat
   --verify-clock          Linux: read-only, gagal bila clock tidak sehat
-  --build-from-source     Alias kompatibilitas untuk --go-only
-  --allow-source-fallback Kompatibilitas jalur Golang lama
   --release-tag TAG       Pin GitHub Release (default: latest)
   --force, -f             Overwrite config lokal
   --app-dir DIR           Direktori utama (default: HOME; Termux:/sdcard/wdp)
@@ -389,7 +384,11 @@ download_verified_r2_package() {
     || die "Gagal download checksum R2: $R2_CHECKSUM_KEY"
 
   matches="$(awk -v asset="$asset" '
-    $2 == asset || $2 == "*" asset { print $1 }
+    {
+      name = $2
+      sub(/\r$/, "", name)
+      if (name == asset || name == "*" asset) print $1
+    }
   ' "$sums")"
   count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
   [ "$count" = "1" ] \
@@ -417,7 +416,11 @@ download_verified_release_asset() {
   sums="$RELEASE_CHECKSUM_FILE"
 
   matches="$(awk -v asset="$asset" '
-    $2 == asset || $2 == "*" asset { print $1 }
+    {
+      name = $2
+      sub(/\r$/, "", name)
+      if (name == asset || name == "*" asset) print $1
+    }
   ' "$sums")"
   count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
   if [ "$count" = "0" ]; then
@@ -466,10 +469,6 @@ download_package() {
   if [ -z "$ARCHIVE_URL" ] && [ -n "$ARCHIVE_SHA256" ]; then
     die "ARCHIVE_SHA256 tanpa ARCHIVE_URL tidak boleh diabaikan"
   fi
-  if [ "$MODE" = "go-only" ]; then
-    required_files+=(war.go go.mod go.sum)
-  fi
-
   tmp_dir="$(mktemp -d)"
   TMP_DIR="$tmp_dir"
   RELEASE_CHECKSUM_FILE=""
@@ -604,6 +603,12 @@ install_files_from_extract() {
     [ ! -L "$src" ] \
       || die "Menolak symlink di dalam paket: $(basename "$src")"
     f="$(basename "$src")"
+    case "$f" in
+      war.go|go.mod|go.sum)
+        ok "Lewati aset Go (installer PHP-only): $f"
+        continue
+        ;;
+    esac
     is_config=0
     for config in "${CONFIG_FILES[@]}"; do
       if [ "$f" = "$config" ]; then
@@ -762,7 +767,7 @@ do_install_termux() {
 Yang terpasang:
   • PHP + curl + tar
   • seluruh file paket tersedia di kedua lokasi
-  • file Go hanya aset; toolchain/build Go tidak dijalankan
+  • aset Go tidak disertakan; toolchain/build Go tidak dijalankan
 
 Edit config:
   nano $WDP1_DIR/waktu.txt
@@ -828,8 +833,8 @@ do_install_macos() {
   Paket utama : $APP_DIR
   Salinan wdp1: $WDP1_DIR
 
-Seluruh file paket tersedia di kedua lokasi.
-File Go hanya aset; Chrony/toolchain/build Go tidak dijalankan pada macOS.
+Seluruh file paket PHP tersedia di kedua lokasi.
+Aset Go tidak disertakan; Chrony/toolchain/build Go tidak dijalankan pada macOS.
 
 Jalankan:
   cd $WDP1_DIR
@@ -1246,6 +1251,24 @@ linux_install_golang() {
   linux_install_golang_official
 }
 
+# Pilihan Go tanpa source package memakai versi resmi yang dipin dan binary
+# release. Dengan demikian war.go/go.mod/go.sum tidak perlu dibawa ke VPS.
+linux_install_golang_toolchain() {
+  export PATH="/usr/local/go/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+  local gobin actual required="$GO_OFFICIAL_VERSION"
+
+  if gobin="$(resolve_go_bin 2>/dev/null)"; then
+    actual="$("$gobin" env GOVERSION 2>/dev/null || true)"
+    if [ -n "$actual" ] && go_version_at_least "$actual" "$required"; then
+      ok "Go sudah memenuhi versi installer: $actual (minimum go$required)"
+      return 0
+    fi
+    warn "Go ${actual:-unknown} lebih lama dari go$required; upgrade resmi"
+  fi
+
+  linux_install_golang_official
+}
+
 # GOPATH/GOMODCACHE HARUS di luar APP_DIR (folder yang berisi go.mod).
 # Kalau APP_DIR=/root dan GOPATH default=/root/go, go mod tidy mengira
 # cache adalah package modul → error "import path should not have @version".
@@ -1480,8 +1503,8 @@ setup_go_mod() {
   ok "go.mod + go.sum terverifikasi tanpa go get/tidy"
 }
 
-# Jalur binary/prebuilt Golang dipertahankan untuk kompatibilitas internal.
-# Install/update normal tidak memanggil fungsi ini; --go-only membangun source.
+# Jalur binary/prebuilt Golang dipertahankan untuk pilihan instalasi Go.
+# Install/update PHP normal tidak memanggil fungsi ini.
 
 install_linux_war_binary() {
   local source_dir="$1" prebuilt_status
@@ -1500,7 +1523,7 @@ install_linux_war_binary() {
               warn "Prebuilt tidak tersedia; source fallback diizinkan eksplisit"
               ;;
             0)
-              die "Prebuilt tidak tersedia. Ulangi dengan --allow-source-fallback atau --build-from-source"
+              die "Prebuilt tidak tersedia; publish binary Linux melalui menu 6 publish.php"
               ;;
             *)
               die "ALLOW_SOURCE_FALLBACK hanya boleh 0 atau 1"
@@ -1585,19 +1608,22 @@ verify_golang_setup() {
 do_setup_golang_only() {
   [ "$IS_LINUX" -eq 1 ] \
     || die "--go-only hanya untuk Linux/VPS; macOS/Termux memakai profil PHP"
-  BINARY_MODE="source"
+  BINARY_MODE="release"
+  ALLOW_SOURCE_FALLBACK=0
   linux_prepare_clock
   download_package
   linux_wait_clock_health
   install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
-  linux_install_golang
-  setup_go_mod "$EXTRACT_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
+  linux_install_golang_toolchain
+  install_linux_war_binary "$EXTRACT_DIR"
   cleanup_download
   verify_golang_setup
   cat <<EOF
 
 ============================================================
-✓ Golang setup selesai di $APP_DIR
+✓ Golang + binary release selesai di $APP_DIR
+  Source war.go/go.mod/go.sum tidak disertakan
 
 Jalankan war (langsung, tanpa download):
   cd $APP_DIR
@@ -1630,9 +1656,9 @@ do_install_linux() {
 Yang sudah dikonfigurasi:
   • PHP CLI + ekstensi cURL/JSON
   • timezone Asia/Jakarta + chrony fail-closed
-  • seluruh file paket tersedia di direktori utama dan wdp1
+  • seluruh file paket PHP tersedia di direktori utama dan wdp1
+  • war.go, go.mod, dan go.sum tidak disertakan
   • toolchain, go mod, build, dan binary war tidak dijalankan
-  • Jalur Golang tetap tersedia hanya lewat --go-only
 
 Edit config:
   nano $WDP1_DIR/waktu.txt
@@ -1684,7 +1710,8 @@ do_update_files() {
   Salinan wdp1: $WDP1_DIR
   Runtime aktif: cd $WDP1_DIR && php war.php
   Toolchain/build/binary Go: tidak dijalankan
-  Seluruh file paket: tersedia di kedua lokasi
+  Seluruh file paket PHP: tersedia di kedua lokasi
+  Aset war.go/go.mod/go.sum: tidak disertakan
   (config berisi data lokal tidak di-overwrite; pakai --force untuk ganti)
 ============================================================
 EOF
@@ -1719,8 +1746,8 @@ show_menu() {
   Salinan  : $WDP1_DIR
 ============================================================
   1) Full install PHP otomatis (disarankan)
-  2) Update war.php + config dari GitHub
-  3) Setup Golang eksplisit (Linux/VPS only)
+  2) Update war.php + config dari R2
+  3) Setup Golang + binary release (Linux/VPS only)
   4) Force overwrite config + full install PHP
   5) Setup + verifikasi chrony saja (Linux/VPS only)
   0) Keluar
@@ -1738,7 +1765,7 @@ EOF
   case "$choice" in
     1) MODE="auto" ;;
     2) MODE="update" ;;
-    3) MODE="go-only"; BINARY_MODE="source" ;;
+    3) MODE="go-only"; BINARY_MODE="release" ;;
     4) FORCE_OVERWRITE=1; MODE="auto" ;;
     5) MODE="clock-only" ;;
     0) exit 0 ;;
