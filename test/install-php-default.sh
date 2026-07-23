@@ -34,8 +34,11 @@ linux_wait_clock_health() {
   trace="$trace wait"
 }
 install_files_from_extract() {
-  [ "${2:-0}" = "0" ] || fail "Default PHP tidak boleh memilih profil setup Go"
-  trace="$trace files"
+  case "${2:-$APP_DIR}" in
+    "$APP_DIR") trace="$trace files-main" ;;
+    "$WDP1_DIR") trace="$trace files-wdp1" ;;
+    *) fail "Target copy tidak dikenal: ${2:-}" ;;
+  esac
 }
 cleanup_download() { trace="$trace cleanup"; }
 verify_php_setup() { trace="$trace verify"; }
@@ -56,6 +59,7 @@ IS_TERMUX=0
 IS_MACOS=0
 PLATFORM="linux"
 APP_DIR="$test_root/app"
+WDP1_DIR="$APP_DIR/wdp1"
 BINARY_MODE="source"
 ALLOW_SOURCE_FALLBACK=1
 mkdir -p "$APP_DIR"
@@ -64,7 +68,7 @@ legacy_hash="$(sha256sum "$APP_DIR/war" | awk '{print $1}')"
 
 install_output="$test_root/install-output.txt"
 do_install_linux >"$install_output"
-[ "$trace" = " clock download wait files cleanup verify" ] \
+[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify" ] \
   || fail "urutan full install salah:$trace"
 [ "$(tail -n 1 "$install_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir full install"
@@ -74,23 +78,24 @@ do_install_linux >"$install_output"
 trace=""
 update_output="$test_root/update-output.txt"
 do_update_files >"$update_output"
-[ "$trace" = " clock download wait files cleanup verify" ] \
+[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify" ] \
   || fail "urutan update salah:$trace"
 [ "$(tail -n 1 "$update_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir update"
 [ "$(sha256sum "$APP_DIR/war" | awk '{print $1}')" = "$legacy_hash" ] \
   || fail "binary Go lama berubah saat update PHP"
 
-# macOS memakai HOME/wdp1, tanpa APT/Chrony/Golang, dan tetap selesai normal.
+# macOS memasang paket di HOME dan HOME/wdp1 tanpa APT/Chrony/Golang.
 trace=""
 IS_LINUX=0
 IS_MACOS=1
 PLATFORM="macos"
-APP_DIR="$test_root/macos-home/wdp1"
+APP_DIR="$test_root/macos-home"
+WDP1_DIR="$APP_DIR/wdp1"
 macos_prepare_php() { trace="$trace mac"; }
 mac_output="$test_root/macos-output.txt"
 do_install_macos >"$mac_output"
-[ "$trace" = " mac download files cleanup verify" ] \
+[ "$trace" = " mac download files-main files-wdp1 cleanup verify" ] \
   || fail "urutan install macOS salah:$trace"
 [ "$(tail -n 1 "$mac_output")" = "__WDP_INSTALL_OK__" ] \
   || fail "marker install bukan output terakhir macOS"
@@ -109,47 +114,45 @@ for file in "${CONFIG_FILES[@]}"; do
   printf 'config:%s\n' "$file" > "$extract_dir/$file"
 done
 
-APP_DIR="$test_root/php-app"
-install_files_from_extract "$extract_dir" >/dev/null
-[ -f "$APP_DIR/war.php" ] || fail "war.php tidak disalin"
-[ -f "$APP_DIR/install.sh" ] || fail "install.sh tidak disalin"
-[ -f "$APP_DIR/war.go" ] || fail "war.go dari paket tidak disalin ke wdp1"
-[ -f "$APP_DIR/go.mod" ] || fail "go.mod dari paket tidak disalin ke wdp1"
-[ -f "$APP_DIR/go.sum" ] || fail "go.sum dari paket tidak disalin ke wdp1"
-for file in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}" war.go "${GO_CORE_FILES[@]}"; do
-  [ -f "$APP_DIR/$file" ] || fail "file paket hilang dari wdp1: $file"
+APP_DIR="$test_root/php-main"
+WDP1_DIR="$APP_DIR/wdp1"
+install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
+install_files_from_extract "$extract_dir" "$WDP1_DIR" >/dev/null
+for target in "$APP_DIR" "$WDP1_DIR"; do
+  for file in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}" war.go "${GO_CORE_FILES[@]}"; do
+    [ -f "$target/$file" ] || fail "file paket hilang dari $target: $file"
+  done
 done
 
 APP_DIR="$test_root/go-app"
-install_files_from_extract "$extract_dir" 1 >/dev/null
+install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
 [ -f "$APP_DIR/war.go" ] || fail "profil Go tidak menyalin war.go"
 [ -f "$APP_DIR/go.mod" ] || fail "profil Go tidak menyalin go.mod"
 [ -f "$APP_DIR/go.sum" ] || fail "profil Go tidak menyalin go.sum"
 
-# Default portable: setiap user mendapat folder wdp1 di home masing-masing.
+# Default portable: paket utama tetap di HOME dan salinan berada di HOME/wdp1.
 IS_TERMUX=0
 MODE="auto"
 HOME="/root"
-[ "$(default_app_dir)" = "/root/wdp1" ] \
-  || fail "default root bukan /root/wdp1"
+[ "$(default_app_dir)" = "/root" ] \
+  || fail "direktori utama root bukan /root"
 HOME="/home/ubuntu"
-[ "$(default_app_dir)" = "/home/ubuntu/wdp1" ] \
-  || fail "default ubuntu bukan /home/ubuntu/wdp1"
+[ "$(default_app_dir)" = "/home/ubuntu" ] \
+  || fail "direktori utama ubuntu bukan /home/ubuntu"
 IS_MACOS=1
 HOME="/Users/codex"
-[ "$(default_app_dir)" = "/Users/codex/wdp1" ] \
-  || fail "default macOS bukan /Users/codex/wdp1"
+[ "$(default_app_dir)" = "/Users/codex" ] \
+  || fail "direktori utama macOS bukan /Users/codex"
 IS_TERMUX=1
-[ "$(default_app_dir)" = "/sdcard/wdp1" ] \
-  || fail "default Termux bukan /sdcard/wdp1"
+[ "$(default_app_dir)" = "/sdcard/wdp" ] \
+  || fail "direktori utama Termux bukan /sdcard/wdp"
 IS_TERMUX=0
 MODE="go-only"
 [ "$(default_app_dir)" = "/Users/codex" ] \
   || fail "mode Go eksplisit berubah ikut ke folder wdp1"
 MODE="auto"
 
-# Pemilihan Go dari menu dihitung ulang setelah MODE berubah, bukan tertinggal
-# di HOME/wdp1 yang ditampilkan saat menu pertama dibuka.
+# Pemilihan menu mempertahankan HOME sebagai direktori utama.
 (
   unset APP_DIR
   HOME="/home/menu-user"
@@ -167,7 +170,9 @@ MODE="auto"
   }
   do_setup_golang_only() {
     [ "$APP_DIR" = "/home/menu-user" ] \
-      || fail "menu Go memakai target PHP wdp1: $APP_DIR"
+      || fail "menu Go tidak memakai direktori utama: $APP_DIR"
+    [ "$WDP1_DIR" = "/home/menu-user/wdp1" ] \
+      || fail "folder salinan menu salah: $WDP1_DIR"
   }
   main --menu >/dev/null
 )
@@ -213,6 +218,40 @@ download_package >/dev/null
   || fail "arsip flat tidak diekstrak dengan benar"
 cleanup_download
 
+# Jalur default wajib mengambil arsip dan checksum dari pasangan objek R2,
+# bukan diam-diam kembali ke GitHub Release.
+r2_checksum="$test_root/R2-SHA256SUMS"
+printf '%s  warwdpgo.tar.gz\n' \
+  "$(sha256sum "$php_archive" | awk '{print $1}')" > "$r2_checksum"
+ARCHIVE_URL=""
+ARCHIVE_SHA256=""
+R2_PUBLIC_BASE_URL="https://r2.example.invalid"
+R2_PACKAGE_KEY="warwdpgo/warwdpgo.tar.gz"
+R2_CHECKSUM_KEY="warwdpgo/SHA256SUMS"
+curl_download() {
+  case "$1" in
+    *"/SHA256SUMS?v="*) cp "$r2_checksum" "$2" ;;
+    *"/warwdpgo.tar.gz?v="*) cp "$php_archive" "$2" ;;
+    *) fail "URL default bukan pasangan objek R2: $1" ;;
+  esac
+}
+MODE="auto"
+download_package >/dev/null
+[ -f "$EXTRACT_DIR/war.php" ] \
+  || fail "paket default R2 tidak berhasil diekstrak"
+[ "$PACKAGE_WAR_SHA256" = "$(sha256sum "$repo_root/war.php" | awk '{print $1}')" ] \
+  || fail "checksum war.php hasil ekstrak berbeda"
+cleanup_download
+
+if (
+  printf '%064d  warwdpgo.tar.gz\n' 0 > "$r2_checksum"
+  download_package
+) >/dev/null 2>&1; then
+  fail "paket R2 diterima walau checksum arsip tidak cocok"
+fi
+printf '%s  warwdpgo.tar.gz\n' \
+  "$(sha256sum "$php_archive" | awk '{print $1}')" > "$r2_checksum"
+
 if (
   MODE="go-only"
   download_package
@@ -227,29 +266,37 @@ parse_args --build-from-source
 [ "$BINARY_MODE" = "source" ] || fail "--build-from-source tidak memilih source"
 
 # Paket aktual harus lolos verifikasi tanpa pernah menjalankan entrypoint WAR.
-APP_DIR="$test_root/actual-wdp1"
-mkdir -p "$APP_DIR"
-cp "$repo_root/war.php" "$APP_DIR/war.php"
-cp "$repo_root/install.sh" "$APP_DIR/install.sh"
-for file in "${CONFIG_FILES[@]}"; do
-  cp "$repo_root/$file" "$APP_DIR/$file"
+APP_DIR="$test_root/actual-main"
+WDP1_DIR="$APP_DIR/wdp1"
+PACKAGE_WAR_SHA256="$(sha256sum "$repo_root/war.php" | awk '{print $1}')"
+for target in "$APP_DIR" "$WDP1_DIR"; do
+  mkdir -p "$target"
+  cp "$repo_root/war.php" "$target/war.php"
+  cp "$repo_root/install.sh" "$target/install.sh"
+  for file in "${CONFIG_FILES[@]}"; do
+    cp "$repo_root/$file" "$target/$file"
+  done
 done
 actual_verify_output="$(verify_php_setup)"
 printf '%s\n' "$actual_verify_output" | grep -Fxq "__WDP_PHP_SETUP_OK__" \
   || fail "paket aktual gagal verifikasi PHP"
-[ ! -e "$APP_DIR/loghasil.txt" ] \
+[ ! -e "$APP_DIR/loghasil.txt" ] && [ ! -e "$WDP1_DIR/loghasil.txt" ] \
   || fail "verifikasi installer menjalankan war.php aktual"
 
 # Verifikasi hanya lint dan tidak boleh mengeksekusi flow aplikasi.
-APP_DIR="$test_root/no-exec-wdp1"
-mkdir -p "$APP_DIR"
+APP_DIR="$test_root/no-exec-main"
+WDP1_DIR="$APP_DIR/wdp1"
 executed_marker="$test_root/war-was-executed"
-printf '%s\n' '<?php' "file_put_contents('$executed_marker', 'ran');" \
-  > "$APP_DIR/war.php"
-printf '%s\n' '#!/usr/bin/env bash' > "$APP_DIR/install.sh"
-for file in "${CONFIG_FILES[@]}"; do
-  : > "$APP_DIR/$file"
+for target in "$APP_DIR" "$WDP1_DIR"; do
+  mkdir -p "$target"
+  printf '%s\n' '<?php' "file_put_contents('$executed_marker', 'ran');" \
+    > "$target/war.php"
+  printf '%s\n' '#!/usr/bin/env bash' > "$target/install.sh"
+  for file in "${CONFIG_FILES[@]}"; do
+    : > "$target/$file"
+  done
 done
+PACKAGE_WAR_SHA256="$(sha256sum "$APP_DIR/war.php" | awk '{print $1}')"
 verify_php_runtime() { :; }
 verify_php_setup >/dev/null
 [ ! -e "$executed_marker" ] \

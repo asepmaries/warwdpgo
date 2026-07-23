@@ -2,9 +2,9 @@
 # ======================================================================
 # WARWDPGO installer — PHP default, Golang hanya bila diminta eksplisit
 #
-# Termux  : PHP only di /sdcard/wdp1
-# Linux   : PHP only di $HOME/wdp1 + timezone WIB + chrony sehat
-# macOS   : PHP only di $HOME/wdp1 (PHP Homebrew bila belum tersedia)
+# Termux  : paket utama di /sdcard/wdp + salinan di /sdcard/wdp/wdp1
+# Linux   : paket utama di $HOME + salinan di $HOME/wdp1
+# macOS   : paket utama di $HOME + salinan di $HOME/wdp1
 # Golang  : hanya melalui --go-only; tidak dijalankan oleh install/update normal
 #
 # Jalankan:
@@ -18,8 +18,11 @@
 # ======================================================================
 set -Eeuo pipefail
 
-# Default mengambil paket source dari GitHub Release. RELEASE_TAG=latest mengikuti
-# release terbaru; pin tag (mis. v2026.07.23.2) untuk deployment reproducible.
+# Paket PHP/source default selalu berasal dari arsip R2 yang dipublikasikan
+# bersama checksum-nya. GitHub Release tetap dipakai hanya oleh jalur binary Go.
+R2_PUBLIC_BASE_URL="${R2_PUBLIC_BASE_URL:-https://pub-453249fbfe80408a8bb5bf8cce54f391.r2.dev}"
+R2_PACKAGE_KEY="${R2_PACKAGE_KEY:-warwdpgo/warwdpgo.tar.gz}"
+R2_CHECKSUM_KEY="${R2_CHECKSUM_KEY:-warwdpgo/SHA256SUMS}"
 RELEASE_REPO="${RELEASE_REPO:-asepmaries/warwdpgo}"
 RELEASE_TAG="${RELEASE_TAG:-latest}"
 RELEASE_PACKAGE_ASSET="${RELEASE_PACKAGE_ASSET:-warwdpgo-source.tar.gz}"
@@ -58,6 +61,7 @@ BINARY_MODE="${BINARY_MODE:-release}" # release | source
 ALLOW_SOURCE_FALLBACK="${ALLOW_SOURCE_FALLBACK:-0}"
 RELEASE_CHECKSUM_FILE=""
 RELEASE_CHECKSUM_TAG=""
+PACKAGE_WAR_SHA256=""
 CLOCK_GATE_PASSED=0
 
 # ----------------------------------------------------------------------
@@ -155,17 +159,11 @@ detect_platform() {
 
 default_app_dir() {
   if [ "$IS_TERMUX" -eq 1 ]; then
-    printf '%s' "/sdcard/wdp1"
+    printf '%s' "/sdcard/wdp"
   else
     [ -n "${HOME:-}" ] && [ "${HOME:-}" != "/" ] \
       || die "HOME user tidak valid; gunakan --app-dir /path/wdp1"
-    if [ "$MODE" = "go-only" ]; then
-      # Perubahan target wdp1 hanya untuk profil PHP. Jalur Go eksplisit tetap
-      # memakai lokasi lama di HOME agar kompatibel dengan instalasi sebelumnya.
-      printf '%s' "${HOME%/}"
-    else
-      printf '%s/wdp1' "${HOME%/}"
-    fi
+    printf '%s' "${HOME%/}"
   fi
 }
 
@@ -208,13 +206,14 @@ Usage: bash install.sh [options]
   --allow-source-fallback Kompatibilitas jalur Golang lama
   --release-tag TAG       Pin GitHub Release (default: latest)
   --force, -f             Overwrite config lokal
-  --app-dir DIR           Target persis (default: HOME/wdp1; Termux:/sdcard/wdp1)
+  --app-dir DIR           Direktori utama (default: HOME; Termux:/sdcard/wdp)
   --help, -h              Bantuan
 
 Jalankan sebagai user login biasa (tanpa "sudo bash"). Installer memakai sudo
-hanya untuk dependency sistem, sehingga HOME/wdp1 tetap milik user tersebut.
+hanya untuk dependency sistem. Paket juga disalin ke subfolder APP_DIR/wdp1.
 
 Env:
+  R2_PUBLIC_BASE_URL / R2_PACKAGE_KEY / R2_CHECKSUM_KEY
   RELEASE_REPO / RELEASE_TAG
   ARCHIVE_URL + ARCHIVE_SHA256  Override paket; keduanya wajib bersama
   CLOCK_WAIT_TRIES / CLOCK_WAIT_INTERVAL_SEC
@@ -353,12 +352,58 @@ need_sha256_tool() {
     || die "Butuh sha256sum (Linux) atau shasum (macOS) untuk verifikasi paket"
 }
 
+r2_asset_url() {
+  local key="$1"
+  case "$R2_PUBLIC_BASE_URL" in
+    https://*) ;;
+    *) die "R2_PUBLIC_BASE_URL wajib HTTPS" ;;
+  esac
+  printf '%s\n' "$key" | grep -Eq '^[A-Za-z0-9._/-]+$' \
+    || die "Key R2 tidak valid: $key"
+  case "/$key/" in
+    *"/../"*|*"//"*) die "Key R2 tidak aman: $key" ;;
+  esac
+  printf '%s/%s' "${R2_PUBLIC_BASE_URL%/}" "${key#/}"
+}
+
 verify_file_sha256() {
   local file="$1" expected="$2" actual
   is_sha256 "$expected" || return 1
   actual="$(file_sha256 "$file")" || return 1
   [ "$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')" = \
     "$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')" ]
+}
+
+download_verified_r2_package() {
+  local dest="$1"
+  local sums asset expected matches count cache_token checksum_url package_url
+  sums="${TMP_DIR}/R2-SHA256SUMS"
+  asset="${R2_PACKAGE_KEY##*/}"
+  cache_token="$(date +%s 2>/dev/null || printf '%s' "$$")-$$"
+  checksum_url="$(r2_asset_url "$R2_CHECKSUM_KEY")?v=$cache_token"
+  package_url="$(r2_asset_url "$R2_PACKAGE_KEY")?v=$cache_token"
+
+  log "Download paket R2 + verifikasi SHA-256"
+  printf '    Arsip: %s\n' "$(r2_asset_url "$R2_PACKAGE_KEY")"
+  curl_download "$checksum_url" "$sums" \
+    || die "Gagal download checksum R2: $R2_CHECKSUM_KEY"
+
+  matches="$(awk -v asset="$asset" '
+    $2 == asset || $2 == "*" asset { print $1 }
+  ' "$sums")"
+  count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "$count" = "1" ] \
+    || die "Checksum R2 untuk $asset harus tepat satu (ditemukan: $count)"
+  expected="$(printf '%s\n' "$matches" | sed -n '1p')"
+  is_sha256 "$expected" \
+    || die "Format checksum R2 invalid untuk $asset"
+
+  curl_download "$package_url" "$dest" \
+    || die "Gagal download paket R2: $R2_PACKAGE_KEY"
+  verify_file_sha256 "$dest" "$expected" \
+    || die "SHA-256 paket R2 tidak cocok; publish belum konsisten/cache stale"
+  VERIFIED_ASSET_SHA256="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+  ok "Paket R2 cocok dengan checksum: $VERIFIED_ASSET_SHA256"
 }
 
 download_verified_release_asset() {
@@ -429,6 +474,8 @@ download_package() {
   TMP_DIR="$tmp_dir"
   RELEASE_CHECKSUM_FILE=""
   RELEASE_CHECKSUM_TAG=""
+  PACKAGE_WAR_SHA256=""
+  VERIFIED_ASSET_SHA256=""
   trap cleanup_download EXIT
   archive_file="${tmp_dir}/warwdpgo.tar.gz"
   extract_dir="${tmp_dir}/extract"
@@ -443,13 +490,9 @@ download_package() {
       || die "Gagal download ARCHIVE_URL"
     verify_file_sha256 "$archive_file" "$ARCHIVE_SHA256" \
       || die "SHA-256 ARCHIVE_URL tidak cocok"
+    VERIFIED_ASSET_SHA256="$(printf '%s' "$ARCHIVE_SHA256" | tr '[:upper:]' '[:lower:]')"
   else
-    validate_release_settings
-    resolve_latest_release_tag
-    log "Download paket GitHub Release + verifikasi SHA-256"
-    printf '    Release: %s @ %s\n' "$RELEASE_REPO" "$RELEASE_TAG"
-    download_verified_release_asset "$RELEASE_PACKAGE_ASSET" "$archive_file" \
-      || die "Gagal download/verifikasi $RELEASE_PACKAGE_ASSET"
+    download_verified_r2_package "$archive_file"
   fi
 
   # Release bundle biasanya punya satu top-level directory. GNU/BSD tar dapat
@@ -487,6 +530,11 @@ download_package() {
     [ -f "$extract_dir/$required" ] \
       || die "Tarball tidak lengkap; file wajib hilang: $required"
   done
+  PACKAGE_WAR_SHA256="$(file_sha256 "$extract_dir/war.php")" \
+    || die "Tidak bisa menghitung checksum war.php dari paket"
+  is_sha256 "$PACKAGE_WAR_SHA256" \
+    || die "Checksum war.php dari paket invalid"
+  ok "SHA-256 war.php paket: $PACKAGE_WAR_SHA256"
   # Ekspor path extract untuk caller (via global)
   EXTRACT_DIR="$extract_dir"
   TMP_DIR="$tmp_dir"
@@ -531,18 +579,19 @@ copy_file_smart() {
 
 install_files_from_extract() {
   local extract_dir="$1"
+  local target_dir="${2:-$APP_DIR}"
   local f src config is_config
   local restore_dotglob=0 restore_nullglob=0
   local -a package_files=()
 
-  [ ! -L "$APP_DIR" ] \
-    || die "Folder instalasi tidak boleh berupa symlink: $APP_DIR"
-  if [ -e "$APP_DIR" ] && [ ! -d "$APP_DIR" ]; then
-    die "Target instalasi bukan folder: $APP_DIR"
+  [ ! -L "$target_dir" ] \
+    || die "Folder instalasi tidak boleh berupa symlink: $target_dir"
+  if [ -e "$target_dir" ] && [ ! -d "$target_dir" ]; then
+    die "Target instalasi bukan folder: $target_dir"
   fi
-  mkdir -p "$APP_DIR"
+  mkdir -p "$target_dir"
 
-  log "Pasang seluruh file paket ke $APP_DIR"
+  log "Pasang seluruh file paket ke $target_dir"
   shopt -q dotglob || restore_dotglob=1
   shopt -q nullglob || restore_nullglob=1
   shopt -s dotglob nullglob
@@ -562,20 +611,20 @@ install_files_from_extract() {
         break
       fi
     done
-    copy_file_smart "$src" "$APP_DIR/$f" "$is_config"
+    copy_file_smart "$src" "$target_dir/$f" "$is_config"
   done
 
   # Pastikan config kosong tetap dibuat kalau belum ada
   for f in "${CONFIG_FILES[@]}"; do
-    [ ! -L "$APP_DIR/$f" ] \
-      || die "Menolak symlink config tujuan: $APP_DIR/$f"
-    if [ ! -f "$APP_DIR/$f" ]; then
-      : > "$APP_DIR/$f"
+    [ ! -L "$target_dir/$f" ] \
+      || die "Menolak symlink config tujuan: $target_dir/$f"
+    if [ ! -f "$target_dir/$f" ]; then
+      : > "$target_dir/$f"
       ok "Buat kosong: $f"
     fi
   done
 
-  chmod +x "$APP_DIR/install.sh" 2>/dev/null || true
+  chmod +x "$target_dir/install.sh" 2>/dev/null || true
 }
 
 # ----------------------------------------------------------------------
@@ -647,25 +696,36 @@ verify_php_runtime() {
   ok "Runtime PHP siap: $(php -r 'printf("PHP %s", PHP_VERSION);')"
 }
 
-verify_php_setup() {
-  local required
-  verify_php_runtime
-  log "Verifikasi akhir paket PHP (war.php tidak akan dijalankan)"
-  [ -d "$APP_DIR" ] && [ -w "$APP_DIR" ] \
-    || die "Folder aplikasi tidak writable: $APP_DIR"
+verify_php_install_dir() {
+  local verify_dir="$1" required installed_war_sha
+  [ -d "$verify_dir" ] && [ -w "$verify_dir" ] \
+    || die "Folder aplikasi tidak writable: $verify_dir"
   for required in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}"; do
-    [ ! -L "$APP_DIR/$required" ] \
-      || die "Verify paket PHP menolak symlink: $APP_DIR/$required"
-    [ -f "$APP_DIR/$required" ] \
-      || die "Verify paket PHP gagal: $APP_DIR/$required tidak ada"
+    [ ! -L "$verify_dir/$required" ] \
+      || die "Verify paket PHP menolak symlink: $verify_dir/$required"
+    [ -f "$verify_dir/$required" ] \
+      || die "Verify paket PHP gagal: $verify_dir/$required tidak ada"
   done
-  [ -s "$APP_DIR/war.php" ] \
-    || die "Verify PHP gagal: $APP_DIR/war.php kosong"
-  php -l "$APP_DIR/war.php" >/dev/null \
-    || die "Syntax war.php tidak valid"
+  [ -s "$verify_dir/war.php" ] \
+    || die "Verify PHP gagal: $verify_dir/war.php kosong"
+  php -l "$verify_dir/war.php" >/dev/null \
+    || die "Syntax war.php tidak valid: $verify_dir/war.php"
+  is_sha256 "${PACKAGE_WAR_SHA256:-}" \
+    || die "Checksum war.php paket tidak tersedia saat verifikasi"
+  installed_war_sha="$(file_sha256 "$verify_dir/war.php")" \
+    || die "Tidak bisa menghitung checksum: $verify_dir/war.php"
+  [ "$installed_war_sha" = "$PACKAGE_WAR_SHA256" ] \
+    || die "war.php berbeda dari paket R2 di $verify_dir"
+  ok "Paket dan war.php identik (SHA-256 $installed_war_sha): $verify_dir"
+}
+
+verify_php_setup() {
+  verify_php_runtime
+  log "Verifikasi dua salinan paket (war.php tidak akan dijalankan)"
+  verify_php_install_dir "$APP_DIR"
+  verify_php_install_dir "$WDP1_DIR"
   printf '%s\n' "__WDP_PHP_SETUP_OK__"
-  ok "Seluruh file paket PHP/config lengkap di $APP_DIR"
-  ok "Syntax war.php valid"
+  ok "Direktori utama dan folder wdp1 sama-sama siap"
   ok "Verify PHP: syntax, cURL multi, JSON, HTTPS/TLS siap"
   ok "Installer tidak menjalankan flow transaksi war.php"
 }
@@ -687,26 +747,29 @@ do_install_termux() {
   setup_termux_storage
   install_termux_php
   download_package
-  install_files_from_extract "$EXTRACT_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
 
   cat <<EOF
 
 ============================================================
-✓ TERMUX/Android siap — WAR PHP di $APP_DIR
+✓ TERMUX/Android siap
+  Paket utama : $APP_DIR
+  Salinan wdp1: $WDP1_DIR
 
 Yang terpasang:
   • PHP + curl + tar
-  • seluruh file paket di wdp1
+  • seluruh file paket tersedia di kedua lokasi
   • file Go hanya aset; toolchain/build Go tidak dijalankan
 
 Edit config:
-  nano $APP_DIR/waktu.txt
-  nano $APP_DIR/user_server_wdp.txt
+  nano $WDP1_DIR/waktu.txt
+  nano $WDP1_DIR/user_server_wdp.txt
 
 Jalankan:
-  cd $APP_DIR
+  cd $WDP1_DIR
   php war.php
 
 Update file nanti:
@@ -753,20 +816,23 @@ macos_prepare_php() {
 do_install_macos() {
   macos_prepare_php
   download_package
-  install_files_from_extract "$EXTRACT_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
 
   cat <<EOF
 
 ============================================================
-✓ macOS siap — WAR PHP di $APP_DIR
+✓ macOS siap
+  Paket utama : $APP_DIR
+  Salinan wdp1: $WDP1_DIR
 
-Seluruh file paket dipasang di folder wdp1 milik user aktif.
+Seluruh file paket tersedia di kedua lokasi.
 File Go hanya aset; Chrony/toolchain/build Go tidak dijalankan pada macOS.
 
 Jalankan:
-  cd $APP_DIR
+  cd $WDP1_DIR
   php war.php
 
 Update:
@@ -1523,7 +1589,7 @@ do_setup_golang_only() {
   linux_prepare_clock
   download_package
   linux_wait_clock_health
-  install_files_from_extract "$EXTRACT_DIR" 1
+  install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
   linux_install_golang
   setup_go_mod "$EXTRACT_DIR"
   cleanup_download
@@ -1545,7 +1611,8 @@ do_install_linux() {
   linux_prepare_clock 1
   download_package
   linux_wait_clock_health
-  install_files_from_extract "$EXTRACT_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
 
   cleanup_download
   verify_php_setup
@@ -1556,24 +1623,26 @@ do_install_linux() {
   cat <<EOF
 
 ============================================================
-✓ LINUX/VPS siap — WAR PHP di $APP_DIR
+✓ LINUX/VPS siap
+  Paket utama : $APP_DIR
+  Salinan wdp1: $WDP1_DIR
 
 Yang sudah dikonfigurasi:
   • PHP CLI + ekstensi cURL/JSON
   • timezone Asia/Jakarta + chrony fail-closed
-  • seluruh file paket disalin; file Go tetap hanya aset dorman
+  • seluruh file paket tersedia di direktori utama dan wdp1
   • toolchain, go mod, build, dan binary war tidak dijalankan
   • Jalur Golang tetap tersedia hanya lewat --go-only
 
 Edit config:
-  nano $APP_DIR/waktu.txt
-  nano $APP_DIR/user_server_wdp.txt
+  nano $WDP1_DIR/waktu.txt
+  nano $WDP1_DIR/user_server_wdp.txt
 
 Jalankan:
-  cd $APP_DIR
+  cd $WDP1_DIR
   php war.php
 
-Update dari GitHub Release:
+Update dari paket R2:
   bash $APP_DIR/install.sh --update
 ============================================================
 EOF
@@ -1584,7 +1653,7 @@ EOF
 # Update-only
 # ----------------------------------------------------------------------
 do_update_files() {
-  log "Mode update PHP: sync war.php/config ke $APP_DIR"
+  log "Mode update PHP: sync paket R2 ke $APP_DIR dan $WDP1_DIR"
   if [ "$IS_LINUX" -eq 1 ]; then
     linux_prepare_clock 1
   elif [ "$IS_MACOS" -eq 1 ]; then
@@ -1597,7 +1666,8 @@ do_update_files() {
   if [ "$IS_LINUX" -eq 1 ]; then
     linux_wait_clock_health
   fi
-  install_files_from_extract "$EXTRACT_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
+  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
 
   cleanup_download
   verify_php_setup
@@ -1609,10 +1679,12 @@ do_update_files() {
   cat <<EOF
 
 ============================================================
-✓ Update PHP selesai → $APP_DIR
-  Runtime aktif: php war.php
+✓ Update PHP selesai
+  Paket utama : $APP_DIR
+  Salinan wdp1: $WDP1_DIR
+  Runtime aktif: cd $WDP1_DIR && php war.php
   Toolchain/build/binary Go: tidak dijalankan
-  Seluruh file paket: disinkronkan ke wdp1
+  Seluruh file paket: tersedia di kedua lokasi
   (config berisi data lokal tidak di-overwrite; pakai --force untuk ganti)
 ============================================================
 EOF
@@ -1643,7 +1715,8 @@ show_menu() {
 ============================================================
   WARWDPGO installer
   Platform : $PLATFORM
-  APP_DIR  : $APP_DIR
+  Utama    : $APP_DIR
+  Salinan  : $WDP1_DIR
 ============================================================
   1) Full install PHP otomatis (disarankan)
   2) Update war.php + config dari GitHub
@@ -1692,15 +1765,17 @@ main() {
   APP_DIR="${APP_DIR%/}"
   [ -n "$APP_DIR" ] && [ "$APP_DIR" != "/" ] \
     || die "APP_DIR tidak boleh kosong atau root filesystem"
+  WDP1_DIR="$APP_DIR/wdp1"
 
-  log "Deteksi platform: $PLATFORM | APP_DIR=$APP_DIR | mode=$MODE"
+  log "Deteksi platform: $PLATFORM | utama=$APP_DIR | salinan=$WDP1_DIR | mode=$MODE"
 
   if [ "$MODE" = "menu" ]; then
     show_menu
     if [ "$APP_DIR_EXPLICIT" -eq 0 ]; then
       APP_DIR="$(default_app_dir)"
       APP_DIR="${APP_DIR%/}"
-      log "Target sesuai pilihan menu: APP_DIR=$APP_DIR | mode=$MODE"
+      WDP1_DIR="$APP_DIR/wdp1"
+      log "Target sesuai pilihan menu: utama=$APP_DIR | salinan=$WDP1_DIR | mode=$MODE"
     fi
   fi
 
