@@ -1,11 +1,13 @@
 <?php
 // ======================================================================
-// GOPAY MLBB WDP - WAR EDITION (Fixed Lead + Single Inquiry)
+// GOPAY MLBB WDP - WAR EDITION (Fixed Lead + Staggered Inquiry)
 //
 // Strategi:
 //  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
 //    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
+//  - Inquiry ditembak bertahap dari lead sampai tepat di akhir_lead.
+//    Jeda = (akhir_lead - lead) / (jumlah user - 1).
 //  - Warm-up tunggal T-1.5s (4 paralel) untuk warm TLS pool sebelum burst.
 //  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
 //  - Target server-arrival adalah 0ms (T=0).
@@ -63,9 +65,10 @@ register_shutdown_function(function () use (&$LOG_FH) {
 //           POSITIF = fire SETELAH war start (telat).
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
+const END_LEAD_MS_DEFAULT    = -100;         // Fallback kalau akhir_lead.txt tidak ada.
 const MINI_PROBE2_LEAD_MS    = 1500;         // Warm-up T-1.5s sebelum burst (warm TLS pool).
-const MINI_PROBE2_PARALLEL   = 4;            // 4 paralel supaya semua koneksi salvo warm.
-const MAX_USERS              = 10;             // Max user per VPS (2 = aman, hindari salvo terlalu lebar).
+const MINI_PROBE2_PARALLEL   = 4;            // 4 koneksi paralel untuk warm-up TLS.
+const MAX_USERS              = 10;           // Max user per VPS.
 const INQUIRY_CONNECT_TO_MS  = 2200;
 const INQUIRY_TIMEOUT_MS    = 5200;
 const PAYMENT_CONNECT_TO_MS = 2200;
@@ -99,7 +102,24 @@ const RETRY_PATTERNS = [
 // ----------------------------------------------------------------------
 // TIMING DARI waktu.txt
 // ----------------------------------------------------------------------
-function waitForExactBurstTime(int $leadMs, ?callable $beforeBurst = null): bool {
+function readOffsetMs(string $path, int $defaultMs, string $label): array {
+    if (!file_exists($path)) {
+        return [$defaultMs, false];
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $raw = trim((string) ($lines[0] ?? ''));
+    if (!preg_match('/^[+-]?\d+$/', $raw)) {
+        die("❌ Nilai {$label} tidak valid. Baris pertama harus berupa angka milidetik.\n");
+    }
+    return [(int) $raw, true];
+}
+
+function waitForExactBurstTime(
+    int $leadMs,
+    ?callable $beforeBurst = null,
+    ?callable $prepareBurst = null
+): bool {
     global $WAR_START_WALL_US;
     $file = 'waktu.txt';
     if (!file_exists($file)) die("❌ File 'waktu.txt' tidak ditemukan!\n");
@@ -136,31 +156,37 @@ function waitForExactBurstTime(int $leadMs, ?callable $beforeBurst = null): bool
     }
     $remainingNs = max(0, (int) round(($targetWallMicro - (microtime(true) * 1_000_000)) * 1000));
     $targetMono = hrtime(true) + $remainingNs;
-    $warmupTriggered = false;
+    $preBurstTriggered = false;
     while (true) {
         $remaining = $targetMono - hrtime(true);
         if ($remaining <= 0) {
-            echo "? BURST START! [" . formatMicrotimeNow() . "] MULAI FULL FLOW!\n\n";
+            if (!$preBurstTriggered && $prepareBurst !== null) {
+                $prepareBurst();
+            }
             return true;
         }
         $remainingUs = intdiv($remaining, 1000);
-        if (!$warmupTriggered && $beforeBurst !== null && $remainingUs <= MINI_PROBE2_LEAD_MS * 1000) {
-            $warmupTriggered = true;
+        if (!$preBurstTriggered && $remainingUs <= MINI_PROBE2_LEAD_MS * 1000) {
+            $preBurstTriggered = true;
             // CRITICAL: warm-up tidak boleh menunda burst. Hitung budget = sisa waktu ke
             // burst dikurangi safety margin 200ms. Warm-up curl di-cut kalau lewat budget,
             // supaya VPS dengan koneksi cold/lambat tetap fire burst ON-TIME.
             // (Bukti war 30 Mei: warm-up 2000ms → burst telat 500ms → zonk total.)
             $budgetMs = intdiv($remainingUs, 1000) - 200;
-            if ($budgetMs >= 150) {
+            if ($beforeBurst !== null && $budgetMs >= 150) {
                 $beforeBurst($budgetMs);
-            } else {
+            } elseif ($beforeBurst !== null) {
                 echo "[WARM-UP] Skip — sisa waktu ke burst < 350ms (jaga burst tetap on-time)\n";
+            }
+            // Siapkan seluruh handle setelah warm-up agar slot pertama hanya perlu
+            // add + curl_multi_exec, tanpa biaya membangun header/body/cURL.
+            if ($prepareBurst !== null) {
+                $prepareBurst();
             }
             continue;
         }
-        if ($remainingUs > 25000) usleep(12000);
-        elseif ($remainingUs > 10000) usleep(4000);
-        elseif ($remainingUs > 4000) usleep(1500);
+        if ($remainingUs > 50000) usleep(12000);
+        elseif ($remainingUs > 25000) usleep(4000);
         else continue;
     }
 }
@@ -211,6 +237,16 @@ function formatMicrotimeNow(): string {
     $sec = floor($now);
     $micros = (int)(($now - $sec) * 1_000_000);
     return date('H:i:s', (int)$sec) . '.' . str_pad((string)$micros, 6, '0', STR_PAD_LEFT);
+}
+
+function formatWallTime(float $timestamp, int $fractionDigits = 4): string {
+    $scale = 10 ** $fractionDigits;
+    $ticks = (int) round($timestamp * $scale);
+    $seconds = intdiv($ticks, $scale);
+    $fraction = $ticks % $scale;
+    return date('H:i:s', $seconds)
+        . '.'
+        . str_pad((string) $fraction, $fractionDigits, '0', STR_PAD_LEFT);
 }
 
 function decodeResponseBody(string $resp): array {
@@ -497,7 +533,7 @@ function saveCaptchaToken(string $token): void {
 // ----------------------------------------------------------------------
 // CLASSIFY RESPONSE INQUIRY
 // Status "retry" hanya label klasifikasi agar sama dengan war.go.
-// runSingleInquiry tetap single-shot dan tidak mengirim inquiry ulang.
+// runStaggeredInquiry tetap single-shot dan tidak mengirim inquiry ulang.
 // Return: ['status' => 'success'|'stop'|'user_invalid'|'skip_user'|'region_block'|'retry'|'unknown', 'orderId' => ?string]
 // ----------------------------------------------------------------------
 function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload): array {
@@ -634,9 +670,9 @@ function buildInquiryBody(array $order): array {
 }
 
 // ----------------------------------------------------------------------
-// FIRE INQUIRY (satu handle per user)
+// PREPARE INQUIRY (satu handle per user, belum dikirim)
 // ----------------------------------------------------------------------
-function fireInquiry($mh, array $order, string $captchaToken): array {
+function prepareInquiry(array $order, string $captchaToken): array {
     $headers = buildInquiryHeaders($captchaToken);
     $body    = buildInquiryBody($order);
     $ch = createCurlSession();
@@ -648,130 +684,215 @@ function fireInquiry($mh, array $order, string $captchaToken): array {
         $body,
         ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => INQUIRY_TIMEOUT_MS]
     );
+    // Satu multi handle per user memungkinkan easy handle dipasang sebelum
+    // jadwal. Pada slot tembak, curl_multi_exec tinggal mengaktifkan request.
+    $mh = curl_multi_init();
     curl_multi_add_handle($mh, $ch);
     return [
         'ch'       => $ch,
+        'mh'       => $mh,
         'order'    => $order,
         'headers'  => $headers,
-        'started'  => microtime(true),
+        'started'  => null,
     ];
 }
 
 // ----------------------------------------------------------------------
-// SINGLE INQUIRY SALVO
+// SINGLE INQUIRY BERTAHAP
 // ----------------------------------------------------------------------
-function runSingleInquiry(array $orders, string $captchaToken): array {
-    $mh = curl_multi_init();
-    $active     = [];      // map: (int)$ch -> meta
+function runStaggeredInquiry(
+    array $preparedInquiries,
+    int $leadOffsetMs,
+    int $endLeadOffsetMs
+): array {
+    global $WAR_START_WALL_US;
+
+    $totalUsers = count($preparedInquiries);
+    if ($totalUsers === 0) return [];
+
+    $distanceMs = $endLeadOffsetMs - $leadOffsetMs;
+    if ($distanceMs <= 0 && $totalUsers > 1) {
+        throw new InvalidArgumentException(
+            "akhir_lead ({$endLeadOffsetMs}ms) harus lebih besar dari lead ({$leadOffsetMs}ms)"
+        );
+    }
+    // Slot pertama tepat di lead dan slot terakhir tepat di akhir_lead.
+    // Satu user tidak membutuhkan jeda dan ditembak tepat di lead.
+    $intervalMs = $totalUsers > 1
+        ? $distanceMs / ($totalUsers - 1)
+        : 0.0;
+
     $successMap = [];      // userId|serverId -> ['order','orderId','headers']
 
+    // Petakan T=0 wall-clock ke monotonic clock satu kali. Semua slot dihitung
+    // dari anchor yang sama agar tidak terkena drift akibat usleep/RTT.
+    $clockSampleWallUs = microtime(true) * 1_000_000;
+    $clockSampleMonoNs = hrtime(true);
+    $warStartMonoNs = $clockSampleMonoNs
+        + (int) round(($WAR_START_WALL_US - $clockSampleWallUs) * 1000);
     $phaseStart = microtime(true);
     $inquiryStats = []; // [{user, rtt, srvArrival, http, verdict}]
+    $launched = [];
 
-    // Satu-satunya salvo: tembak semua user paralel.
-    foreach ($orders as $ord) {
-        $meta = fireInquiry($mh, $ord, $captchaToken);
-        $active[(int) $meta['ch']] = $meta;
-    }
-    echo "? SALVO TUNGGAL: tembak " . count($orders) . " user paralel @ [" . formatMicrotimeNow() . "]\n";
+    foreach ($preparedInquiries as $index => $meta) {
+        $plannedOffsetMs = $index === $totalUsers - 1 && $totalUsers > 1
+            ? (float) $endLeadOffsetMs
+            : $leadOffsetMs + ($intervalMs * $index);
+        $targetMonoNs = $warStartMonoNs + (int) round($plannedOffsetMs * 1_000_000);
 
-    // Pump multi handle dan panen setiap response tanpa mengirim ulang.
-    $running = null;
-    do {
+        // Sambil menunggu slot berikutnya, request yang sudah ditembak tetap
+        // dipompa oleh curl_multi. Dua puluh lima milidetik terakhir memakai
+        // busy-wait agar resolusi sleep OS tidak membuat slot meleset.
+        while (true) {
+            foreach ($launched as $launchedIndex) {
+                do {
+                    $status = curl_multi_exec(
+                        $preparedInquiries[$launchedIndex]['mh'],
+                        $running
+                    );
+                } while ($status === CURLM_CALL_MULTI_PERFORM);
+                $preparedInquiries[$launchedIndex]['running'] = $running;
+            }
+
+            $remainingNs = $targetMonoNs - hrtime(true);
+            if ($remainingNs <= 0) break;
+
+            $remainingUs = intdiv($remainingNs, 1000);
+            if ($remainingUs > 50000) {
+                usleep(12000);
+            } elseif ($remainingUs > 25000) {
+                usleep(4000);
+            } else {
+                continue;
+            }
+        }
+
+        $preparedInquiries[$index]['planned_offset_ms'] = $plannedOffsetMs;
+        $preparedInquiries[$index]['started'] = microtime(true);
+        $preparedInquiries[$index]['fired_offset_ms'] = (
+            $preparedInquiries[$index]['started'] * 1_000_000 - $WAR_START_WALL_US
+        ) / 1000;
         do {
-            $status = curl_multi_exec($mh, $running);
+            $status = curl_multi_exec($preparedInquiries[$index]['mh'], $running);
         } while ($status === CURLM_CALL_MULTI_PERFORM);
+        $preparedInquiries[$index]['running'] = $running;
+        $launched[] = $index;
+    }
 
-        // Panen handle yang selesai
-        while ($info = curl_multi_info_read($mh)) {
-            if ($info['msg'] !== CURLMSG_DONE) continue;
+    $scheduleSummary = sprintf(
+        "? INQUIRY BERTAHAP: %d user | lead=%+dms | akhir=%+dms | jarak=%dms | jeda=%.3fms\n",
+        $totalUsers,
+        $leadOffsetMs,
+        $endLeadOffsetMs,
+        $distanceMs,
+        $intervalMs
+    );
 
-            $ch  = $info['handle'];
-            $key = (int) $ch;
-            if (!isset($active[$key])) {
-                curl_multi_remove_handle($mh, $ch);
-                @curl_close($ch);
-                continue;
+    // Semua request sudah ditembak. Lanjutkan pump tanpa blocking select agar
+    // response selesai secepat mungkin.
+    do {
+        $hasRunning = false;
+        foreach ($launched as $launchedIndex) {
+            do {
+                $status = curl_multi_exec(
+                    $preparedInquiries[$launchedIndex]['mh'],
+                    $running
+                );
+            } while ($status === CURLM_CALL_MULTI_PERFORM);
+            $preparedInquiries[$launchedIndex]['running'] = $running;
+            if ($running > 0) {
+                $hasRunning = true;
             }
-            $meta = $active[$key];
-            unset($active[$key]);
+        }
+        if ($hasRunning) usleep(1000);
+    } while ($hasRunning);
 
-            $resp     = curl_multi_getcontent($ch);
-            $code     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $curlErr  = curl_error($ch);
-            $curlErrno= curl_errno($ch);
-            curl_multi_remove_handle($mh, $ch);
+    // Panen response setelah seluruh handle selesai, tanpa mengirim ulang.
+    foreach ($preparedInquiries as $meta) {
+        $ch = $meta['ch'];
+        $resp = curl_multi_getcontent($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr = curl_error($ch);
+        $curlErrno = curl_errno($ch);
 
-            $userKey  = $meta['order']['userId'] . '|' . $meta['order']['serverId'];
-            $elapsed  = (int) round((microtime(true) - $meta['started']) * 1000);
-            $tRel     = (microtime(true) - $phaseStart) * 1000;
+        $userKey = $meta['order']['userId'] . '|' . $meta['order']['serverId'];
+        // Pakai total_time milik cURL, bukan waktu panen response. Response
+        // user awal bisa sudah selesai saat scheduler masih menunggu slot lain.
+        $totalTimeSec = (float) curl_getinfo($ch, CURLINFO_TOTAL_TIME);
+        if ($totalTimeSec <= 0) {
+            $totalTimeSec = microtime(true) - $meta['started'];
+        }
+        $elapsed = (int) round($totalTimeSec * 1000);
+        $responseCompletedAt = $meta['started'] + $totalTimeSec;
+        $responseWallTime = formatWallTime($responseCompletedAt, 4);
+        $tRel = ($responseCompletedAt - $phaseStart) * 1000;
 
-            // Estimasi waktu request sampai di server (relatif ke WAR_START / T=0).
-            // Asumsi RTT simetris: server-arrival = fire_wall + (rtt/2)
-            global $WAR_START_WALL_US;
-            $serverArrivalMs = null;
-            if (!empty($WAR_START_WALL_US)) {
-                $fireWallUs       = $meta['started'] * 1_000_000;
-                $serverArrivalUs  = $fireWallUs + ($elapsed * 1000 / 2);
-                $serverArrivalMs  = ($serverArrivalUs - $WAR_START_WALL_US) / 1000;
-            }
-            $sArr = $serverArrivalMs !== null
-                ? sprintf('srv%+.0fms', $serverArrivalMs)
-                : 'srv?';
+        // Estimasi waktu request sampai di server (relatif ke WAR_START / T=0).
+        // Asumsi RTT simetris: server-arrival = fire_wall + (rtt/2)
+        $serverArrivalMs = null;
+        if (!empty($WAR_START_WALL_US)) {
+            $fireWallUs = $meta['started'] * 1_000_000;
+            $serverArrivalUs = $fireWallUs + ($elapsed * 1000 / 2);
+            $serverArrivalMs = ($serverArrivalUs - $WAR_START_WALL_US) / 1000;
+        }
+        $sArr = $serverArrivalMs !== null
+            ? sprintf('srv%+.0fms', $serverArrivalMs)
+            : 'srv?';
 
-            $payload  = $resp !== false && $resp !== null ? decodeResponseBody((string) $resp) : null;
-            $errText  = $payload ? extractApiErrorMessage($payload) : ($curlErrno ? "cURL[$curlErrno] $curlErr" : '');
-            $verdict  = classifyInquiryResponse((int) $code, $errText, $payload);
+        $payload = $resp !== false && $resp !== null
+            ? decodeResponseBody((string) $resp)
+            : null;
+        $errText = $payload
+            ? extractApiErrorMessage($payload)
+            : ($curlErrno ? "cURL[$curlErrno] $curlErr" : '');
+        $verdict = classifyInquiryResponse((int) $code, $errText, $payload);
 
-            // Capture hasil salvo tunggal untuk auto-summary.
-            $inquiryStats[] = [
-                'user'        => $userKey,
-                'rtt'         => $elapsed,
-                'srv_arrival' => $serverArrivalMs,
-                'http'        => (int) $code,
-                'verdict'     => $verdict['status'],
+        $inquiryStats[] = [
+            'user'         => $userKey,
+            'rtt'          => $elapsed,
+            'srv_arrival'  => $serverArrivalMs,
+            'http'         => (int) $code,
+            'verdict'      => $verdict['status'],
+            'planned_fire' => $meta['planned_offset_ms'],
+            'actual_fire'  => $meta['fired_offset_ms'],
+        ];
+
+        $tag = "[$responseWallTime][+" . sprintf('%6.1f', $tRel) . "ms][$userKey]"
+             . "[plan" . sprintf('%+.1f', $meta['planned_offset_ms']) . "ms]"
+             . "[fire" . sprintf('%+.1f', $meta['fired_offset_ms']) . "ms]"
+             . "[single][rtt {$elapsed}ms][$sArr][HTTP $code]";
+
+        if ($verdict['status'] === 'success') {
+            echo "$tag ✅ OrderID: {$verdict['orderId']}\n";
+            $successMap[$userKey] = [
+                'order'   => $meta['order'],
+                'orderId' => $verdict['orderId'],
+                'headers' => $meta['headers'],
             ];
-
-            $tag = "[+" . sprintf('%6.1f', $tRel) . "ms][$userKey][single][rtt {$elapsed}ms][$sArr][HTTP $code]";
-
-            if ($verdict['status'] === 'success') {
-                echo "$tag ✅ OrderID: {$verdict['orderId']}\n";
-                $successMap[$userKey] = [
-                    'order'   => $meta['order'],
-                    'orderId' => $verdict['orderId'],
-                    'headers' => $meta['headers'],
-                ];
-                @curl_close($ch);
-                continue;
-            }
-
-            @curl_close($ch);
+        } else {
             $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
             echo "$tag ⚠️  {$verdict['status']}: $shortErr\n";
         }
 
-        if (!empty($active)) {
-            $sel = curl_multi_select($mh, 0.05);
-            if ($sel === -1) usleep(1000);
-        }
-    } while (!empty($active));
-
-    // Cleanup sisa
-    foreach ($active as $key => $meta) {
-        curl_multi_remove_handle($mh, $meta['ch']);
-        @curl_close($meta['ch']);
+        curl_multi_remove_handle($meta['mh'], $ch);
+        curl_multi_close($meta['mh']);
+        @curl_close($ch);
     }
-    curl_multi_close($mh);
 
     $phaseElapsed = (microtime(true) - $phaseStart) * 1000;
 
-    echo "\n? Inquiry summary:\n";
-    echo "   - success           : " . count($successMap) . "/" . count($orders) . "\n";
-    echo "   - total inquiry call: " . count($orders) . "\n";
+    echo "\n" . $scheduleSummary;
+    echo "? Inquiry summary:\n";
+    echo "   - success           : " . count($successMap) . "/" . $totalUsers . "\n";
+    echo "   - total inquiry call: " . $totalUsers . "\n";
     echo "   - phase duration    : " . sprintf('%.1f ms', $phaseElapsed) . "\n";
 
     // ===== AUTO-SUMMARY untuk evaluasi VPS =====
     if (!empty($inquiryStats)) {
+        $fireDrifts = array_map(
+            fn($s) => $s['actual_fire'] - $s['planned_fire'],
+            $inquiryStats
+        );
         $rtts        = array_column($inquiryStats, 'rtt');
         $srvArr      = array_filter(array_column($inquiryStats, 'srv_arrival'), fn($v) => $v !== null);
         $verdicts    = array_count_values(array_column($inquiryStats, 'verdict'));
@@ -779,9 +900,15 @@ function runSingleInquiry(array $orders, string $captchaToken): array {
         $rttStr      = empty($rtts) ? '-' : sprintf('min=%dms med=%dms max=%dms', min($rtts), percentile($rtts, 0.5), max($rtts));
         $srvStr      = empty($srvArr) ? '-' : sprintf('min=%+dms med=%+dms max=%+dms', (int) min($srvArr), (int) percentile($srvArr, 0.5), (int) max($srvArr));
 
-        echo "\n? [VPS-EVAL] Salvo tunggal:\n";
+        echo "\n? [VPS-EVAL] Inquiry bertahap:\n";
         echo sprintf("   - n=%d: rtt[%s] srvArrival[%s] verdicts[%s]\n",
             count($inquiryStats), $rttStr, $srvStr, $verdictStr);
+        echo sprintf(
+            "   - presisi fire: drift min=%+.3fms med=%+.3fms max=%+.3fms\n",
+            min($fireDrifts),
+            percentile($fireDrifts, 0.5),
+            max($fireDrifts)
+        );
 
         // Hitung first-success server-arrival (kalibrasi sweet spot)
         $firstSuccess = null;
@@ -815,14 +942,14 @@ function runSingleInquiry(array $orders, string $captchaToken): array {
         if ($phaseElapsed > 1000) echo " | ⚠️  PHASE > 1s (kemungkinan kena window war yang ketat)";
         echo "\n";
 
-        // RTT salvo tunggal vs mini-probe (kalau ada)
+        // RTT inquiry bertahap vs mini-probe (kalau ada)
         if (!empty($inquiryStats)) {
             $salvo1MedianRtt = percentile(array_column($inquiryStats, 'rtt'), 0.5);
             $rttTier = '✅ excellent';
             if ($salvo1MedianRtt > 500)      $rttTier = '? critical (replace VPS)';
             elseif ($salvo1MedianRtt > 350)  $rttTier = '? slow (consider replace)';
             elseif ($salvo1MedianRtt > 250)  $rttTier = '? acceptable';
-            echo "? [VPS-EVAL] Salvo tunggal median RTT: {$salvo1MedianRtt}ms → $rttTier\n";
+            echo "? [VPS-EVAL] Inquiry bertahap median RTT: {$salvo1MedianRtt}ms → $rttTier\n";
         }
     }
     echo "\n";
@@ -954,10 +1081,7 @@ function gpyPay(): void {
     echo "✅ Loaded " . count($orders) . " order (max " . MAX_USERS . ")\n";
     echo "? Fixed lead from lead.txt"
        . " | TARGET_SRV=" . sprintf('%.0fms', TARGET_SRV_MS_DEFAULT)
-       . " | SINGLE_INQUIRY\n\n";
-
-    // Captcha 1× di-fetch saat script start
-    $captchaToken = getFreshCaptchaToken();
+       . " | STAGGERED_INQUIRY\n\n";
 
     // Lead time dibaca dari lead.txt. Konvensi:
     //   NEGATIF di lead.txt = fire SEBELUM war start (duluan).
@@ -966,35 +1090,69 @@ function gpyPay(): void {
     // Internal `waitForExactBurstTime` pakai konvensi terbalik (positif = sebelum war),
     // jadi negate.
     $leadFile = __DIR__ . '/lead.txt';
-    if (file_exists($leadFile)) {
-        $offsetMs = (int) trim(file_get_contents($leadFile));
-    } else {
-        $offsetMs = BURST_LEAD_MS_DEFAULT;
-    }
+    [$offsetMs, $leadFromFile] = readOffsetMs(
+        $leadFile,
+        BURST_LEAD_MS_DEFAULT,
+        'lead.txt'
+    );
     $burstLeadMs = -$offsetMs;
+
+    // akhir_lead.txt adalah waktu tembak user terakhir (batas inklusif).
+    // Jika file tidak tersedia, gunakan -100ms.
+    $endLeadFile = __DIR__ . '/akhir_lead.txt';
+    [$endOffsetMs, $endLeadFromFile] = readOffsetMs(
+        $endLeadFile,
+        END_LEAD_MS_DEFAULT,
+        'akhir_lead.txt'
+    );
+    if ($endOffsetMs <= $offsetMs && count($orders) > 1) {
+        die(
+            "❌ Konfigurasi lead tidak valid: akhir_lead ({$endOffsetMs}ms) "
+            . "harus lebih besar dari lead ({$offsetMs}ms)\n"
+        );
+    }
 
     if ($offsetMs > 0)      $desc = "+{$offsetMs}ms (setelah war)";
     elseif ($offsetMs < 0)  $desc = "{$offsetMs}ms (sebelum war)";
     else                    $desc = "0ms (tepat di war)";
-    echo "⚡ Lead offset: {$desc} (dari " . (file_exists($leadFile) ? "lead.txt" : "default") . ")\n\n";
+    $intervalMs = count($orders) > 1
+        ? ($endOffsetMs - $offsetMs) / (count($orders) - 1)
+        : 0.0;
+    echo "⚡ Lead offset : {$desc} (dari " . ($leadFromFile ? "lead.txt" : "default") . ")\n";
+    echo "⚡ Akhir lead  : " . sprintf('%+dms', $endOffsetMs)
+       . " (dari " . ($endLeadFromFile ? "akhir_lead.txt" : "default -100") . ")\n";
+    echo "⚡ Jeda tembak : " . sprintf('%.3fms', $intervalMs)
+       . " untuk " . count($orders) . " user\n\n";
+
+    // Captcha 1× di-fetch setelah konfigurasi timing dinyatakan valid.
+    $captchaToken = getFreshCaptchaToken();
 
     // Tunggu dan fire — mini-probe2 T-1.5s untuk warm TLS pool sebelum burst.
     // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
-    waitForExactBurstTime($burstLeadMs, static function (int $budgetMs = 1200): void {
-        echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000) . "s re-warm TLS pool via GET tanpa voucher ("
-           . MINI_PROBE2_PARALLEL . " call paralel, budget {$budgetMs}ms)...\n";
-        $rtts = miniProbe2ReWarm($budgetMs);
-        if (!empty($rtts)) {
-            $median = percentile($rtts, 0.5);
-            echo "[WARM-UP] RTT: " . implode('ms, ', array_map(fn($v) => number_format($v, 0), $rtts)) . "ms"
-               . " | median: " . number_format($median, 0) . "ms\n";
-        } else {
-            echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
+    $preparedInquiries = [];
+    waitForExactBurstTime(
+        $burstLeadMs,
+        static function (int $budgetMs = 1200): void {
+            echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000) . "s re-warm TLS pool via GET tanpa voucher ("
+               . MINI_PROBE2_PARALLEL . " call paralel, budget {$budgetMs}ms)...\n";
+            $rtts = miniProbe2ReWarm($budgetMs);
+            if (!empty($rtts)) {
+                $median = percentile($rtts, 0.5);
+                echo "[WARM-UP] RTT: " . implode('ms, ', array_map(fn($v) => number_format($v, 0), $rtts)) . "ms"
+                   . " | median: " . number_format($median, 0) . "ms\n";
+            } else {
+                echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
+            }
+        },
+        static function () use (&$preparedInquiries, $orders, $captchaToken): void {
+            foreach ($orders as $order) {
+                $preparedInquiries[] = prepareInquiry($order, $captchaToken);
+            }
         }
-    });
+    );
 
-    // ===================== SINGLE INQUIRY SALVO =====================
-    $inquirySuccess = runSingleInquiry($orders, $captchaToken);
+    // ===================== SINGLE INQUIRY BERTAHAP =====================
+    $inquirySuccess = runStaggeredInquiry($preparedInquiries, $offsetMs, $endOffsetMs);
 
     // ===================== PARALLEL PAYMENT =====================
     $success = runParallelPayment($inquirySuccess);
