@@ -6,8 +6,8 @@
 //  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
 //    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
-//  - Inquiry ditembak bertahap dari lead sampai tepat di akhir_lead.
-//    Jeda = (akhir_lead - lead) / (jumlah user - 1).
+//  - Inquiry ditembak bertahap dari lead dengan jeda tetap 75ms.
+//    Slot terakhir diturunkan otomatis dari lead dan jumlah user.
 //  - Warm-up tunggal T-1.5s (4 paralel) untuk warm TLS pool sebelum burst.
 //  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
 //  - Target server-arrival adalah 0ms (T=0).
@@ -65,7 +65,7 @@ register_shutdown_function(function () use (&$LOG_FH) {
 //           POSITIF = fire SETELAH war start (telat).
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
-const END_LEAD_MS_DEFAULT    = -100;         // Fallback kalau akhir_lead.txt tidak ada.
+const INQUIRY_STAGGER_MS     = 75;           // Jeda tetap antar-user; tidak memakai akhir_lead.txt.
 const MINI_PROBE2_LEAD_MS    = 1500;         // Warm-up T-1.5s sebelum burst (warm TLS pool).
 const MINI_PROBE2_PARALLEL   = 4;            // 4 koneksi paralel untuk warm-up TLS.
 const MAX_USERS              = 10;           // Max user per VPS.
@@ -113,6 +113,69 @@ function readOffsetMs(string $path, int $defaultMs, string $label): array {
         die("❌ Nilai {$label} tidak valid. Baris pertama harus berupa angka milidetik.\n");
     }
     return [(int) $raw, true];
+}
+
+function isPhpFunctionEnabled(string $name): bool {
+    if (!function_exists($name)) return false;
+    $disabled = array_filter(array_map(
+        'trim',
+        explode(',', (string) ini_get('disable_functions'))
+    ));
+    return !in_array($name, $disabled, true);
+}
+
+function trackingField(string $output, string $label): ?string {
+    $pattern = '/^' . preg_quote($label, '/') . '\s*:\s*(.+)$/mi';
+    if (!preg_match($pattern, $output, $match)) return null;
+    return preg_replace('/\s+/', ' ', trim($match[1]));
+}
+
+function logClockSyncStatus(): void {
+    $now = new DateTimeImmutable('now');
+    $base = "[CLOCK] local=" . $now->format('Y-m-d H:i:s.uP')
+          . " timezone=" . date_default_timezone_get();
+
+    // PHP memakai clock OS. Chrony, bila aktif, mendisiplinkan clock OS ini.
+    // Query dibatasi 2 detik dan dilakukan jauh sebelum fase war.
+    if (!isPhpFunctionEnabled('shell_exec')) {
+        echo $base . " chrony=not_checked(shell_exec_disabled)\n";
+        return;
+    }
+
+    $tracking = @shell_exec('LC_ALL=C timeout 2s chronyc -n tracking 2>&1');
+    if (is_string($tracking) && trackingField($tracking, 'Stratum') !== null) {
+        $fields = [
+            'stratum'         => trackingField($tracking, 'Stratum'),
+            'system_time'     => trackingField($tracking, 'System time'),
+            'last_offset'     => trackingField($tracking, 'Last offset'),
+            'rms_offset'      => trackingField($tracking, 'RMS offset'),
+            'root_delay'      => trackingField($tracking, 'Root delay'),
+            'root_dispersion' => trackingField($tracking, 'Root dispersion'),
+            'leap'            => trackingField($tracking, 'Leap status'),
+        ];
+        $parts = [];
+        foreach ($fields as $key => $value) {
+            if ($value !== null && $value !== '') {
+                $parts[] = $key . '="' . str_replace('"', '', $value) . '"';
+            }
+        }
+        echo $base . " source=chrony " . implode(' ', $parts) . "\n";
+        return;
+    }
+
+    $timedatectl = @shell_exec(
+        'LC_ALL=C timeout 2s timedatectl show -p NTP -p NTPSynchronized --no-pager 2>&1'
+    );
+    $timedatectl = is_string($timedatectl)
+        ? preg_replace('/\s+/', ' ', trim($timedatectl))
+        : '';
+    if ($timedatectl !== '' && stripos($timedatectl, 'not found') === false) {
+        echo $base . ' source=timedatectl status="'
+           . str_replace('"', '', $timedatectl) . "\"\n";
+        return;
+    }
+
+    echo $base . " source=os chrony=unavailable\n";
 }
 
 function waitForExactBurstTime(
@@ -372,6 +435,97 @@ function configureCurlHandle($ch, string $url, string $method, array $headers, $
         $curlOptions[CURLOPT_HTTPGET] = true;
     }
     curl_setopt_array($ch, $curlOptions);
+}
+
+function curlHttpVersionLabel(int $version): string {
+    $known = [
+        'CURL_HTTP_VERSION_1_0' => '1.0',
+        'CURL_HTTP_VERSION_1_1' => '1.1',
+        'CURL_HTTP_VERSION_2_0' => '2',
+        'CURL_HTTP_VERSION_2TLS' => '2',
+        'CURL_HTTP_VERSION_3' => '3',
+    ];
+    foreach ($known as $constantName => $label) {
+        if (defined($constantName) && $version === constant($constantName)) {
+            return $label;
+        }
+    }
+    return $version > 0 ? (string) $version : '?';
+}
+
+function collectCurlNetworkTiming($ch): array {
+    $info = curl_getinfo($ch);
+    $toMs = static fn($value): float => max(0.0, (float) $value * 1000.0);
+    $numConnects = isset($info['num_connects']) ? (int) $info['num_connects'] : null;
+    if (defined('CURLINFO_NUM_CONNECTS')) {
+        $reportedConnects = @curl_getinfo($ch, constant('CURLINFO_NUM_CONNECTS'));
+        if ($reportedConnects !== false) {
+            $numConnects = (int) $reportedConnects;
+        }
+    }
+
+    // Nilai *_time adalah timestamp kumulatif sejak curl dimulai.
+    $dnsAt      = $toMs($info['namelookup_time'] ?? 0);
+    $connectAt  = $toMs($info['connect_time'] ?? 0);
+    $tlsAt      = $toMs($info['appconnect_time'] ?? 0);
+    $readyAt    = $toMs($info['pretransfer_time'] ?? 0);
+    $firstByteAt = $toMs($info['starttransfer_time'] ?? 0);
+    $totalAt    = $toMs($info['total_time'] ?? 0);
+
+    $tcpMs = $connectAt > 0 ? max(0.0, $connectAt - $dnsAt) : 0.0;
+    $tlsMs = $tlsAt > 0 ? max(0.0, $tlsAt - $connectAt) : 0.0;
+    $requestReadyAt = max($dnsAt, $connectAt, $tlsAt, $readyAt);
+    $ttfbMs = $firstByteAt > 0
+        ? max(0.0, $firstByteAt - $requestReadyAt)
+        : null;
+    $bodyMs = $firstByteAt > 0 && $totalAt >= $firstByteAt
+        ? $totalAt - $firstByteAt
+        : null;
+
+    return [
+        'dns_ms'       => $dnsAt,
+        'tcp_ms'       => $tcpMs,
+        'tls_ms'       => $tlsMs,
+        'ttfb_ms'      => $ttfbMs,
+        'body_ms'      => $bodyMs,
+        'total_ms'     => $totalAt,
+        'num_connects' => $numConnects,
+        'http_version' => curlHttpVersionLabel((int) ($info['http_version'] ?? 0)),
+        'remote_ip'    => (string) ($info['primary_ip'] ?? '?'),
+        'remote_port'  => (int) ($info['primary_port'] ?? 0),
+        'local_ip'     => (string) ($info['local_ip'] ?? '?'),
+        'local_port'   => (int) ($info['local_port'] ?? 0),
+    ];
+}
+
+function formatOptionalMs(?float $value): string {
+    return $value === null ? '?' : sprintf('%.1fms', $value);
+}
+
+function formatCurlNetworkLog(
+    string $userKey,
+    float $plannedOffsetMs,
+    float $firedOffsetMs,
+    array $net,
+    int $curlErrno
+): string {
+    $connects = $net['num_connects'] === null ? '?' : (string) $net['num_connects'];
+    $reused = $net['num_connects'] === null
+        ? '?'
+        : ($net['num_connects'] === 0 ? 'yes' : 'no');
+    return "[NET][$userKey]"
+         . "[plan" . sprintf('%+.1f', $plannedOffsetMs) . "ms]"
+         . "[fire" . sprintf('%+.1f', $firedOffsetMs) . "ms]"
+         . "[dns" . formatOptionalMs($net['dns_ms']) . "]"
+         . "[tcp" . formatOptionalMs($net['tcp_ms']) . "]"
+         . "[tls" . formatOptionalMs($net['tls_ms']) . "]"
+         . "[ttfb" . formatOptionalMs($net['ttfb_ms']) . "]"
+         . "[body" . formatOptionalMs($net['body_ms']) . "]"
+         . "[total" . formatOptionalMs($net['total_ms']) . "]"
+         . "[connects=$connects reused=$reused http={$net['http_version']}]"
+         . "[remote={$net['remote_ip']}:{$net['remote_port']}]"
+         . "[local={$net['local_ip']}:{$net['local_port']}]"
+         . "[errno=$curlErrno]";
 }
 
 function runMultiHandles($mh): void {
@@ -702,25 +856,20 @@ function prepareInquiry(array $order, string $captchaToken): array {
 // ----------------------------------------------------------------------
 function runStaggeredInquiry(
     array $preparedInquiries,
-    int $leadOffsetMs,
-    int $endLeadOffsetMs
+    int $leadOffsetMs
 ): array {
     global $WAR_START_WALL_US;
 
     $totalUsers = count($preparedInquiries);
     if ($totalUsers === 0) return [];
 
-    $distanceMs = $endLeadOffsetMs - $leadOffsetMs;
-    if ($distanceMs <= 0 && $totalUsers > 1) {
-        throw new InvalidArgumentException(
-            "akhir_lead ({$endLeadOffsetMs}ms) harus lebih besar dari lead ({$leadOffsetMs}ms)"
-        );
-    }
-    // Slot pertama tepat di lead dan slot terakhir tepat di akhir_lead.
-    // Satu user tidak membutuhkan jeda dan ditembak tepat di lead.
-    $intervalMs = $totalUsers > 1
-        ? $distanceMs / ($totalUsers - 1)
-        : 0.0;
+    // Slot pertama tepat di lead. Slot berikutnya selalu maju 75ms.
+    // Contoh lead -460ms: -460, -385, -310, -235.
+    $intervalMs = (float) INQUIRY_STAGGER_MS;
+    $distanceMs = $totalUsers > 1
+        ? INQUIRY_STAGGER_MS * ($totalUsers - 1)
+        : 0;
+    $endLeadOffsetMs = $leadOffsetMs + $distanceMs;
 
     $successMap = [];      // userId|serverId -> ['order','orderId','headers']
 
@@ -735,9 +884,7 @@ function runStaggeredInquiry(
     $launched = [];
 
     foreach ($preparedInquiries as $index => $meta) {
-        $plannedOffsetMs = $index === $totalUsers - 1 && $totalUsers > 1
-            ? (float) $endLeadOffsetMs
-            : $leadOffsetMs + ($intervalMs * $index);
+        $plannedOffsetMs = $leadOffsetMs + ($intervalMs * $index);
         $targetMonoNs = $warStartMonoNs + (int) round($plannedOffsetMs * 1_000_000);
 
         // Sambil menunggu slot berikutnya, request yang sudah ditembak tetap
@@ -814,11 +961,12 @@ function runStaggeredInquiry(
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr = curl_error($ch);
         $curlErrno = curl_errno($ch);
+        $net = collectCurlNetworkTiming($ch);
 
         $userKey = $meta['order']['userId'] . '|' . $meta['order']['serverId'];
         // Pakai total_time milik cURL, bukan waktu panen response. Response
         // user awal bisa sudah selesai saat scheduler masih menunggu slot lain.
-        $totalTimeSec = (float) curl_getinfo($ch, CURLINFO_TOTAL_TIME);
+        $totalTimeSec = $net['total_ms'] / 1000.0;
         if ($totalTimeSec <= 0) {
             $totalTimeSec = microtime(true) - $meta['started'];
         }
@@ -855,6 +1003,11 @@ function runStaggeredInquiry(
             'verdict'      => $verdict['status'],
             'planned_fire' => $meta['planned_offset_ms'],
             'actual_fire'  => $meta['fired_offset_ms'],
+            'dns_ms'       => $net['dns_ms'],
+            'tcp_ms'       => $net['tcp_ms'],
+            'tls_ms'       => $net['tls_ms'],
+            'ttfb_ms'      => $net['ttfb_ms'],
+            'num_connects' => $net['num_connects'],
         ];
 
         $tag = "[$responseWallTime][+" . sprintf('%6.1f', $tRel) . "ms][$userKey]"
@@ -873,6 +1026,14 @@ function runStaggeredInquiry(
             $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
             echo "$tag ⚠️  {$verdict['status']}: $shortErr\n";
         }
+
+        echo formatCurlNetworkLog(
+            $userKey,
+            (float) $meta['planned_offset_ms'],
+            (float) $meta['fired_offset_ms'],
+            $net,
+            $curlErrno
+        ) . "\n";
 
         curl_multi_remove_handle($meta['mh'], $ch);
         curl_multi_close($meta['mh']);
@@ -908,6 +1069,29 @@ function runStaggeredInquiry(
             min($fireDrifts),
             percentile($fireDrifts, 0.5),
             max($fireDrifts)
+        );
+        $dnsValues = array_column($inquiryStats, 'dns_ms');
+        $tcpValues = array_column($inquiryStats, 'tcp_ms');
+        $tlsValues = array_column($inquiryStats, 'tls_ms');
+        $ttfbValues = array_values(array_filter(
+            array_column($inquiryStats, 'ttfb_ms'),
+            static fn($value) => $value !== null
+        ));
+        $knownConnects = array_values(array_filter(
+            array_column($inquiryStats, 'num_connects'),
+            static fn($value) => $value !== null
+        ));
+        $reusedCount = count(array_filter(
+            $knownConnects,
+            static fn($value) => $value === 0
+        ));
+        echo sprintf(
+            "   - curl median: dns=%.1fms tcp=%.1fms tls=%.1fms ttfb=%s | reused=%s\n",
+            percentile($dnsValues, 0.5),
+            percentile($tcpValues, 0.5),
+            percentile($tlsValues, 0.5),
+            empty($ttfbValues) ? '?' : sprintf('%.1fms', percentile($ttfbValues, 0.5)),
+            empty($knownConnects) ? '?' : "{$reusedCount}/" . count($knownConnects)
         );
 
         // Hitung first-success server-arrival (kalibrasi sweet spot)
@@ -1066,6 +1250,7 @@ function runParallelPayment(array $inquirySuccess): int {
 // ----------------------------------------------------------------------
 function gpyPay(): void {
     echo "=== PHASE 1: PRE-COMPUTATION ===\n";
+    logClockSyncStatus();
 
     $lines = file('user_server_wdp.txt', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
     $orders = [];
@@ -1097,30 +1282,14 @@ function gpyPay(): void {
     );
     $burstLeadMs = -$offsetMs;
 
-    // akhir_lead.txt adalah waktu tembak user terakhir (batas inklusif).
-    // Jika file tidak tersedia, gunakan -100ms.
-    $endLeadFile = __DIR__ . '/akhir_lead.txt';
-    [$endOffsetMs, $endLeadFromFile] = readOffsetMs(
-        $endLeadFile,
-        END_LEAD_MS_DEFAULT,
-        'akhir_lead.txt'
-    );
-    if ($endOffsetMs <= $offsetMs && count($orders) > 1) {
-        die(
-            "❌ Konfigurasi lead tidak valid: akhir_lead ({$endOffsetMs}ms) "
-            . "harus lebih besar dari lead ({$offsetMs}ms)\n"
-        );
-    }
-
     if ($offsetMs > 0)      $desc = "+{$offsetMs}ms (setelah war)";
     elseif ($offsetMs < 0)  $desc = "{$offsetMs}ms (sebelum war)";
     else                    $desc = "0ms (tepat di war)";
-    $intervalMs = count($orders) > 1
-        ? ($endOffsetMs - $offsetMs) / (count($orders) - 1)
-        : 0.0;
+    $intervalMs = count($orders) > 1 ? (float) INQUIRY_STAGGER_MS : 0.0;
+    $endOffsetMs = $offsetMs + (int) round($intervalMs * max(0, count($orders) - 1));
     echo "⚡ Lead offset : {$desc} (dari " . ($leadFromFile ? "lead.txt" : "default") . ")\n";
     echo "⚡ Akhir lead  : " . sprintf('%+dms', $endOffsetMs)
-       . " (dari " . ($endLeadFromFile ? "akhir_lead.txt" : "default -100") . ")\n";
+       . " (otomatis dari lead + jeda tetap)\n";
     echo "⚡ Jeda tembak : " . sprintf('%.3fms', $intervalMs)
        . " untuk " . count($orders) . " user\n\n";
 
@@ -1152,7 +1321,7 @@ function gpyPay(): void {
     );
 
     // ===================== SINGLE INQUIRY BERTAHAP =====================
-    $inquirySuccess = runStaggeredInquiry($preparedInquiries, $offsetMs, $endOffsetMs);
+    $inquirySuccess = runStaggeredInquiry($preparedInquiries, $offsetMs);
 
     // ===================== PARALLEL PAYMENT =====================
     $success = runParallelPayment($inquirySuccess);
