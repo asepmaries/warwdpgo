@@ -69,6 +69,12 @@ ok()   { printf '    [OK] %s\n' "$*"; }
 warn() { printf '    [!] %s\n' "$*" >&2; }
 die()  { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
 
+die_clock_unhealthy() {
+  printf '\n[ERROR] %s\n' "$*" >&2
+  printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
+  exit 1
+}
+
 on_unexpected_error() {
   local exit_code="${1:-1}" line="${2:-unknown}"
   trap - ERR
@@ -1096,19 +1102,16 @@ linux_wait_clock_health() {
     printf '%s\n' "$wait_output" | sed 's/^/    /' >&2
     LC_ALL=C chronyc -n tracking 2>&1 | sed 's/^/    /' >&2 || true
     LC_ALL=C chronyc -n sources -v 2>&1 | sed 's/^/    /' >&2 || true
-    printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
-    die "chronyc waitsync gagal/timeout"
+    die_clock_unhealthy "chronyc waitsync gagal/timeout"
   fi
 
   if ! tracking="$(LC_ALL=C chronyc -c tracking 2>&1)"; then
     printf '%s\n' "$tracking" | sed 's/^/    /' >&2
-    printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
-    die "chronyc tracking gagal"
+    die_clock_unhealthy "chronyc tracking gagal"
   fi
   if ! printf '%s\n' "$tracking" | clock_tracking_is_healthy; then
     LC_ALL=C chronyc -n tracking 2>&1 | sed 's/^/    /' >&2 || true
-    printf '%s\n' "__WDP_CLOCK_UNHEALTHY__" >&2
-    die "Metrik chrony di luar policy"
+    die_clock_unhealthy "Metrik chrony di luar policy"
   fi
 
   CLOCK_GATE_PASSED=1
@@ -1589,7 +1592,7 @@ verify_linux_setup() {
         ./war --check-clock 2>&1
   )"; then
     printf '%s\n' "$clock_output" | sed 's/^/    /' >&2
-    die "Runtime clock check gagal: war --check-clock"
+    die_clock_unhealthy "Runtime clock check gagal: war --check-clock"
   fi
   [ -z "$clock_output" ] || printf '%s\n' "$clock_output" | sed 's/^/    /'
 

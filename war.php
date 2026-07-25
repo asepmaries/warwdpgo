@@ -8,7 +8,7 @@
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
 //  - Inquiry ditembak bertahap dari lead dengan jeda tetap 75ms.
 //    Slot terakhir diturunkan otomatis dari lead dan jumlah user.
-//  - Warm-up tunggal T-1.5s (4 paralel) untuk warm TLS pool sebelum burst.
+//  - Warm-up tunggal T-2.5s (4 paralel) untuk warm TLS pool sebelum burst.
 //  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
 //  - Target server-arrival adalah 0ms (T=0).
 //  - Captcha dipakai sekali untuk semua user, di-cache 23 jam.
@@ -66,7 +66,7 @@ register_shutdown_function(function () use (&$LOG_FH) {
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
 const INQUIRY_STAGGER_MS     = 75;           // Jeda tetap antar-user; tidak memakai akhir_lead.txt.
-const MINI_PROBE2_LEAD_MS    = 1500;         // Warm-up T-1.5s sebelum burst (warm TLS pool).
+const MINI_PROBE2_LEAD_MS    = 2500;         // Beri provider lambat waktu cukup untuk mengisi TLS pool.
 const MINI_PROBE2_PARALLEL   = 4;            // 4 koneksi paralel untuk warm-up TLS.
 const MAX_USERS              = 10;           // Max user per VPS.
 const INQUIRY_CONNECT_TO_MS  = 2200;
@@ -957,10 +957,24 @@ function runStaggeredInquiry(
     // Panen response setelah seluruh handle selesai, tanpa mengirim ulang.
     foreach ($preparedInquiries as $meta) {
         $ch = $meta['ch'];
+        $multiResult = 0;
+        while ($multiInfo = curl_multi_info_read($meta['mh'])) {
+            if (($multiInfo['handle'] ?? null) === $ch) {
+                $multiResult = (int)($multiInfo['result'] ?? 0);
+            }
+        }
         $resp = curl_multi_getcontent($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr = curl_error($ch);
         $curlErrno = curl_errno($ch);
+        // Error transfer per-handle berada di queue curl_multi_info_read().
+        // Tanpa ini timeout multi pernah tercatat menyesatkan sebagai errno=0.
+        if ($curlErrno === 0 && $multiResult !== 0) {
+            $curlErrno = $multiResult;
+            if ($curlErr === '' && function_exists('curl_strerror')) {
+                $curlErr = curl_strerror($multiResult);
+            }
+        }
         $net = collectCurlNetworkTiming($ch);
 
         $userKey = $meta['order']['userId'] . '|' . $meta['order']['serverId'];
@@ -1094,7 +1108,8 @@ function runStaggeredInquiry(
             empty($knownConnects) ? '?' : "{$reusedCount}/" . count($knownConnects)
         );
 
-        // Hitung first-success server-arrival (kalibrasi sweet spot)
+        // Estimasi fire + RTT/2 disimpan hanya sebagai diagnostik.
+        // TTFB mengandung antrean/backend, jadi ini bukan arrival origin.
         $firstSuccess = null;
         $firstStop    = null;
         foreach ($inquiryStats as $s) {
@@ -1105,14 +1120,14 @@ function runStaggeredInquiry(
                 $firstStop = $s;
             }
         }
-        echo "\n? [VPS-EVAL] Window kalibrasi:\n";
+        echo "\n? [VPS-EVAL] srvEst (diagnostik, bukan dasar tuning lead):\n";
         if ($firstSuccess) {
-            echo sprintf("   - First SUCCESS server-arrival: %+dms (sweet spot lower bound)\n", (int) $firstSuccess['srv_arrival']);
+            echo sprintf("   - First SUCCESS srvEst: %+dms\n", (int) $firstSuccess['srv_arrival']);
         } else {
             echo "   - First SUCCESS: tidak ada (zonk run)\n";
         }
         if ($firstStop) {
-            echo sprintf("   - First OUT-OF-STOCK server-arrival: %+dms (window upper bound)\n", (int) $firstStop['srv_arrival']);
+            echo sprintf("   - First OUT-OF-STOCK srvEst: %+dms\n", (int) $firstStop['srv_arrival']);
         }
 
         // Vps verdict
@@ -1123,17 +1138,15 @@ function runStaggeredInquiry(
         elseif ($successCount === 1) $tier = '? OK (1 voucher)';
 
         echo "\n? [VPS-EVAL] Verdict: $tier";
-        if ($phaseElapsed > 1000) echo " | ⚠️  PHASE > 1s (kemungkinan kena window war yang ketat)";
+        if ($phaseElapsed > 1000) echo " | ⚠️  PHASE > 1s (TTFB/antrean backend tinggi)";
         echo "\n";
 
-        // RTT inquiry bertahap vs mini-probe (kalau ada)
+        // RTT war didominasi TTFB origin. Kualitas VPS dinilai dari clock,
+        // connection reuse, TCP dan TLS; bukan angka RTT ini saja.
         if (!empty($inquiryStats)) {
             $salvo1MedianRtt = percentile(array_column($inquiryStats, 'rtt'), 0.5);
-            $rttTier = '✅ excellent';
-            if ($salvo1MedianRtt > 500)      $rttTier = '? critical (replace VPS)';
-            elseif ($salvo1MedianRtt > 350)  $rttTier = '? slow (consider replace)';
-            elseif ($salvo1MedianRtt > 250)  $rttTier = '? acceptable';
-            echo "? [VPS-EVAL] Inquiry bertahap median RTT: {$salvo1MedianRtt}ms → $rttTier\n";
+            echo "? [VPS-EVAL] Inquiry median RTT/TTFB: {$salvo1MedianRtt}ms"
+               . " (observasi backend; bukan alasan tunggal mengganti VPS)\n";
         }
     }
     echo "\n";
@@ -1184,6 +1197,7 @@ function runParallelPayment(array $inquirySuccess): int {
             'order'    => $entry['order'],
             'orderId'  => $orderId,
             'headers'  => $payHeaders,
+            'body'     => $paymentBody,
             'ref'      => $ref,
         ];
         curl_multi_add_handle($paymentMulti, $ch);
@@ -1194,9 +1208,11 @@ function runParallelPayment(array $inquirySuccess): int {
     $success = 0;
     $bufferedWrites = [];
     foreach ($paymentChannels as $item) {
-        $resp = curl_multi_getcontent($item['ch']);
-        $code = curl_getinfo($item['ch'], CURLINFO_HTTP_CODE);
-        curl_multi_remove_handle($paymentMulti, $item['ch']);
+        $paymentHandle = $item['ch'];
+        $paymentHeaders = $item['headers'];
+        $resp = curl_multi_getcontent($paymentHandle);
+        $code = curl_getinfo($paymentHandle, CURLINFO_HTTP_CODE);
+        curl_multi_remove_handle($paymentMulti, $paymentHandle);
 
         $uid = $item['order']['userId'];
         $sid = $item['order']['serverId'];
@@ -1204,13 +1220,33 @@ function runParallelPayment(array $inquirySuccess): int {
 
         echo "[$uid | $sid] Payment → ";
 
+        // Inquiry/order sudah berhasil. Untuk kegagalan transport tanpa HTTP
+        // response atau origin 5xx, retry sekali memakai idempotency key sama.
+        if ($code === 0 || $code >= 500) {
+            echo "HTTP $code; retry idempotent 1x → ";
+            curl_close($paymentHandle);
+
+            $paymentHeaders['x-timestamp'] = (string) round(microtime(true) * 1000);
+            $paymentHandle = createCurlSession();
+            configureCurlHandle(
+                $paymentHandle,
+                'https://gopay.co.id/games/v1/order/payment',
+                'POST',
+                $paymentHeaders,
+                $item['body'],
+                ['connect_timeout_ms' => PAYMENT_CONNECT_TO_MS, 'timeout_ms' => PAYMENT_TIMEOUT_MS]
+            );
+            $resp = curl_exec($paymentHandle);
+            $code = curl_getinfo($paymentHandle, CURLINFO_HTTP_CODE);
+        }
+
         if ($code !== 200 && $code !== 201) {
             $errorPayload = decodeResponseBody((string) $resp);
             $errorText = extractApiErrorMessage($errorPayload);
             echo "HTTP $code";
             if ($errorText !== '') echo " - $errorText";
             echo "\n";
-            curl_close($item['ch']);
+            curl_close($paymentHandle);
             continue;
         }
 
@@ -1218,13 +1254,13 @@ function runParallelPayment(array $inquirySuccess): int {
         $txnId = $payRes['data'] ?? null;
         if (!$txnId) {
             echo "tidak ada txnId\n";
-            curl_close($item['ch']);
+            curl_close($paymentHandle);
             continue;
         }
 
         echo "TxnID: $txnId → ";
-        $txnData = getTransactionUntilReady($txnId, $item['headers'], $item['ch']);
-        curl_close($item['ch']);
+        $txnData = getTransactionUntilReady($txnId, $paymentHeaders, $paymentHandle);
+        curl_close($paymentHandle);
         if ($txnData) {
             $payUrl = $txnData['actionPayment']['paymentDirect'] ?? $txnData['actionPayment']['deeplinkRedirect'] ?? '(tidak tersedia)';
             $txnUrl = "https://gopay.co.id/games/payment/$txnId";
