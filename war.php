@@ -6,16 +6,20 @@
 //  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
 //    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
-//  - Inquiry ditembak bertahap dari lead dengan jeda tetap 75ms.
+//  - Tepat 10 user unik ditembak bertahap dari lead dengan jeda tetap 28ms.
 //    Slot terakhir diturunkan otomatis dari lead dan jumlah user.
-//  - Warm-up tunggal T-2.5s (4 paralel) untuk warm TLS pool sebelum burst.
+//  - Warm-up tunggal T-2.5s (10 paralel) untuk warm TLS pool sebelum burst.
 //  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
 //  - Target server-arrival adalah 0ms (T=0).
-//  - Captcha dipakai sekali untuk semua user, di-cache 23 jam.
+//  - Captcha dipakai sekali untuk semua user dan dicoba ulang bila fetch gagal.
 // ======================================================================
 if (php_sapi_name() !== 'cli') {
     die("Script ini hanya boleh dijalankan via CLI\n");
 }
+$CLI_ARGS = $_SERVER['argv'] ?? [];
+$TIMING_SELF_TEST_MODE =
+    in_array('--timing-self-test', $CLI_ARGS, true)
+    || in_array('--self-test-timing', $CLI_ARGS, true);
 date_default_timezone_set('Asia/Jakarta');
 set_time_limit(0);
 ignore_user_abort(true);
@@ -27,7 +31,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 // File loghasil.txt akan di-truncate setiap script start (fresh log per run).
 // ----------------------------------------------------------------------
 $LOG_FILE = __DIR__ . '/loghasil.txt';
-$LOG_FH   = fopen($LOG_FILE, 'w');
+$LOG_FH   = $TIMING_SELF_TEST_MODE ? null : fopen($LOG_FILE, 'w');
 if ($LOG_FH === false) {
     fwrite(STDERR, "[WARN] Tidak bisa buka loghasil.txt untuk tulis. Lanjut tanpa logging file.\n");
     $LOG_FH = null;
@@ -65,10 +69,15 @@ register_shutdown_function(function () use (&$LOG_FH) {
 //           POSITIF = fire SETELAH war start (telat).
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
-const INQUIRY_STAGGER_MS     = 75;           // Jeda tetap antar-user; tidak memakai akhir_lead.txt.
+const INQUIRY_STAGGER_MS     = 28;           // 10 slot mencakup 252ms; tidak memakai akhir_lead.txt.
+const SCHEDULER_ARM_LEAD_MS  = 100;          // Scheduler mengambil alih 100ms sebelum slot pertama.
+const MIN_DISPATCH_GAP_MS    = 8;            // Hindari request menumpuk bila host sempat stall.
 const MINI_PROBE2_LEAD_MS    = 2500;         // Beri provider lambat waktu cukup untuk mengisi TLS pool.
-const MINI_PROBE2_PARALLEL   = 4;            // 4 koneksi paralel untuk warm-up TLS.
-const MAX_USERS              = 10;           // Max user per VPS.
+const MINI_PROBE2_PARALLEL   = 10;           // Satu koneksi hangat untuk setiap slot inquiry.
+const REQUIRED_USERS         = 10;           // War dibatalkan bila user unik kurang dari jumlah ini.
+const MAX_USERS              = 10;           // Batas keras user per VPS/proses.
+const CAPTCHA_MAX_ATTEMPTS   = 3;
+const CAPTCHA_RETRY_BASE_MS  = 600;
 const INQUIRY_CONNECT_TO_MS  = 2200;
 const INQUIRY_TIMEOUT_MS    = 5200;
 const PAYMENT_CONNECT_TO_MS = 2200;
@@ -224,8 +233,15 @@ function waitForExactBurstTime(
         $remaining = $targetMono - hrtime(true);
         if ($remaining <= 0) {
             if (!$preBurstTriggered && $prepareBurst !== null) {
+                $prepareStart = hrtime(true);
                 $prepareBurst();
+                echo "[SCHED] Prepare terlambat selesai dalam "
+                   . sprintf('%.3fms', (hrtime(true) - $prepareStart) / 1_000_000)
+                   . "\n";
             }
+            echo "[SCHED] MISSED_ARM: kontrol kembali "
+               . sprintf('%.3fms', abs($remaining) / 1_000_000)
+               . " setelah target slot pertama.\n";
             return true;
         }
         $remainingUs = intdiv($remaining, 1000);
@@ -237,16 +253,30 @@ function waitForExactBurstTime(
             // (Bukti war 30 Mei: warm-up 2000ms → burst telat 500ms → zonk total.)
             $budgetMs = intdiv($remainingUs, 1000) - 200;
             if ($beforeBurst !== null && $budgetMs >= 150) {
+                $warmStart = hrtime(true);
                 $beforeBurst($budgetMs);
+                echo "[SCHED] Warm-up duration="
+                   . sprintf('%.3fms', (hrtime(true) - $warmStart) / 1_000_000)
+                   . "\n";
             } elseif ($beforeBurst !== null) {
                 echo "[WARM-UP] Skip — sisa waktu ke burst < 350ms (jaga burst tetap on-time)\n";
             }
             // Siapkan seluruh handle setelah warm-up agar slot pertama hanya perlu
             // add + curl_multi_exec, tanpa biaya membangun header/body/cURL.
             if ($prepareBurst !== null) {
+                $prepareStart = hrtime(true);
                 $prepareBurst();
+                echo "[SCHED] Prepare " . REQUIRED_USERS . " handle duration="
+                   . sprintf('%.3fms', (hrtime(true) - $prepareStart) / 1_000_000)
+                   . "\n";
             }
             continue;
+        }
+        if ($remainingUs <= SCHEDULER_ARM_LEAD_MS * 1000) {
+            echo "[SCHED] Armed dengan sisa="
+               . sprintf('%.3fms', $remainingUs / 1000)
+               . "; final wait memakai monotonic clock.\n";
+            return true;
         }
         if ($remainingUs > 50000) usleep(12000);
         elseif ($remainingUs > 25000) usleep(4000);
@@ -548,9 +578,9 @@ function warmUpBurstSession(array $baseHeaders): void {
 }
 
 /**
- * Warm-up T-MINI_PROBE2_LEAD_MS sebelum burst (default 1.5s): GET endpoint
- * inquiry tanpa body/order/voucher, memakai MINI_PROBE2_PARALLEL koneksi
- * paralel supaya TCP/TLS pool benar-benar warm saat salvo war fire.
+ * Warm-up T-MINI_PROBE2_LEAD_MS sebelum burst (default 2.5s): HEAD ke root
+ * host yang sama, memakai MINI_PROBE2_PARALLEL koneksi paralel supaya
+ * TCP/TLS pool hangat tanpa menyentuh endpoint/order quota.
  * RTT yang dilaporkan hanya untuk informasi di log, tidak dipakai untuk
  * re-tune lead.
  *
@@ -580,12 +610,13 @@ function miniProbe2ReWarm(int $maxMs = 1200): array {
         $ch = createCurlSession();
         configureCurlHandle(
             $ch,
-            'https://gopay.co.id/games/v1/order/inquiry',
-            'GET',
+            'https://gopay.co.id/',
+            'HEAD',
             $headers,
             null,
             ['connect_timeout_ms' => $connectTo, 'timeout_ms' => $maxMs]
         );
+        curl_setopt($ch, CURLOPT_NOBODY, true);
         curl_multi_add_handle($mh, $ch);
         $handles[] = $ch;
     }
@@ -601,13 +632,27 @@ function miniProbe2ReWarm(int $maxMs = 1200): array {
         }
     } while ($running > 0 && $st === CURLM_OK && microtime(true) < $deadline);
 
+    $multiResults = [];
+    while ($multiInfo = curl_multi_info_read($mh)) {
+        if (isset($multiInfo['handle'])) {
+            $multiResults[curlHandleKey($multiInfo['handle'])] =
+                (int) ($multiInfo['result'] ?? -1);
+        }
+    }
     $rttMs = [];
     foreach ($handles as $ch) {
         $errno = curl_errno($ch);
         $info  = curl_getinfo($ch);
+        $multiResult = $multiResults[curlHandleKey($ch)] ?? null;
         curl_multi_remove_handle($mh, $ch);
         curl_close($ch);
-        if ($errno) continue;
+        if (
+            $errno !== 0
+            || $multiResult !== CURLE_OK
+            || (int) ($info['http_code'] ?? 0) <= 0
+        ) {
+            continue;
+        }
         $totalSec = (float) ($info['total_time'] ?? 0);
         if ($totalSec > 0) $rttMs[] = $totalSec * 1000;
     }
@@ -630,7 +675,8 @@ function percentile(array $values, float $p): float {
 // CAPTCHA: ambil dari Google
 // ----------------------------------------------------------------------
 function getFreshCaptchaToken(): string {
-    echo "[CAPTCHA] Mengambil token captcha baru dari Google...\n";
+    echo "[CAPTCHA] Mengambil token captcha baru dari Google"
+       . " (maks " . CAPTCHA_MAX_ATTEMPTS . " percobaan)...\n";
     $url = "https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o";
     $headers = [
         'sec-ch-ua-platform' => '"Android"',
@@ -650,33 +696,62 @@ function getFreshCaptchaToken(): string {
     if ($reloadBody === false) {
         throw new RuntimeException("Gagal membaca reload.txt");
     }
-    $ch = createCurlSession();
-    configureCurlHandle(
-        $ch,
-        $url,
-        'POST',
-        $headers,
-        $reloadBody,
-        ['connect_timeout_ms' => 4000, 'timeout_ms' => 10000]
+
+    $lastError = 'unknown error';
+    for ($attempt = 1; $attempt <= CAPTCHA_MAX_ATTEMPTS; $attempt++) {
+        $ch = null;
+        try {
+            echo "[CAPTCHA] Percobaan {$attempt}/" . CAPTCHA_MAX_ATTEMPTS . "...\n";
+            $ch = createCurlSession();
+            configureCurlHandle(
+                $ch,
+                $url,
+                'POST',
+                $headers,
+                $reloadBody,
+                ['connect_timeout_ms' => 4000, 'timeout_ms' => 10000]
+            );
+            $response = curl_exec($ch);
+            $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $errno = curl_errno($ch);
+            $errorMsg = curl_error($ch);
+
+            if ($errno !== 0) {
+                throw new RuntimeException("cURL [$errno] $errorMsg", $errno);
+            }
+            if ($httpCode !== 200 || !is_string($response) || $response === '') {
+                throw new RuntimeException("HTTP {$httpCode} atau response kosong");
+            }
+            if (!preg_match('/"rresp","([^"]+)"/', $response, $matches)) {
+                throw new RuntimeException("response Google tidak memuat rresp");
+            }
+
+            $token = $matches[1];
+            saveCaptchaToken($token);
+            echo "[CAPTCHA] Token berhasil diambil (panjang: "
+               . strlen($token) . " karakter)\n\n";
+            return $token;
+        } catch (Throwable $e) {
+            $lastError = $e->getMessage();
+            echo "[CAPTCHA] Percobaan {$attempt} gagal: {$lastError}\n";
+        } finally {
+            if ($ch !== null) {
+                @curl_close($ch);
+            }
+        }
+
+        if ($attempt < CAPTCHA_MAX_ATTEMPTS) {
+            $jitterMs = random_int(0, 250);
+            $delayMs = (CAPTCHA_RETRY_BASE_MS * $attempt) + $jitterMs;
+            echo "[CAPTCHA] Ulang dalam {$delayMs}ms...\n";
+            usleep($delayMs * 1000);
+        }
+    }
+
+    throw new RuntimeException(
+        "Gagal mengambil CAPTCHA setelah " . CAPTCHA_MAX_ATTEMPTS
+        . " percobaan: {$lastError}"
     );
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $errno = curl_errno($ch);
-    $errorMsg = curl_error($ch);
-    curl_close($ch);
-    if ($errno) {
-        throw new RuntimeException("Gagal mengambil captcha token: cURL [$errno] $errorMsg", $errno);
-    }
-    if ($httpCode !== 200 || empty($response)) {
-        throw new RuntimeException("Gagal mengambil captcha token. HTTP Code: $httpCode");
-    }
-    if (preg_match('/"rresp","([^"]+)"/', $response, $matches)) {
-        $token = $matches[1];
-        saveCaptchaToken($token);
-        echo "[CAPTCHA] Token berhasil diambil (panjang: " . strlen($token) . " karakter)\n\n";
-        return $token;
-    }
-    throw new RuntimeException("Gagal parse captcha token dari response Google");
 }
 
 function saveCaptchaToken(string $token): void {
@@ -838,13 +913,10 @@ function prepareInquiry(array $order, string $captchaToken): array {
         $body,
         ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => INQUIRY_TIMEOUT_MS]
     );
-    // Satu multi handle per user memungkinkan easy handle dipasang sebelum
-    // jadwal. Pada slot tembak, curl_multi_exec tinggal mengaktifkan request.
-    $mh = curl_multi_init();
-    curl_multi_add_handle($mh, $ch);
+    // Easy handle baru dimasukkan ke satu shared multi-handle tepat pada
+    // slotnya. Ini menghindari overhead memompa 10 multi-handle terpisah.
     return [
         'ch'       => $ch,
-        'mh'       => $mh,
         'order'    => $order,
         'headers'  => $headers,
         'started'  => null,
@@ -854,6 +926,122 @@ function prepareInquiry(array $order, string $captchaToken): array {
 // ----------------------------------------------------------------------
 // SINGLE INQUIRY BERTAHAP
 // ----------------------------------------------------------------------
+function pumpCurlMultiNonBlocking($multi, int &$running): int {
+    do {
+        $status = curl_multi_exec($multi, $running);
+    } while ($status === CURLM_CALL_MULTI_PERFORM);
+    return $status;
+}
+
+function schedulerSpinGuardUs(): int {
+    // PHP/Windows pada host lama dapat membulatkan usleep pendek menjadi
+    // 15-30ms. Linux VPS punya sleep resolusi tinggi; guard 2ms memberi hasil
+    // terbaik pada A/B VPS 1-core sekaligus hemat CPU/steal time.
+    return PHP_OS_FAMILY === 'Windows' ? 25000 : 2000;
+}
+
+/**
+ * Tunggu slot monotonic dengan sleep bertahap lalu spin pada guard terakhir.
+ * Pump hanya boleh berjalan di luar guard; durasinya tetap dicatat agar log
+ * dapat membedakan jitter host dari curl_multi yang melintasi target.
+ */
+function waitForMonotonicSlot(
+    int $targetMonoNs,
+    ?callable $pump = null,
+    ?array &$telemetry = null
+): int {
+    $spinGuardUs = schedulerSpinGuardUs();
+    $telemetry = [
+        'spin_guard_us'       => $spinGuardUs,
+        'pump_calls'          => 0,
+        'pump_max_ms'         => 0.0,
+        'pump_crossed_target' => false,
+    ];
+
+    while (true) {
+        $nowMonoNs = hrtime(true);
+        $remainingNs = $targetMonoNs - $nowMonoNs;
+        if ($remainingNs <= 0) {
+            return $nowMonoNs;
+        }
+
+        $remainingUs = intdiv($remainingNs, 1000);
+        if ($remainingUs <= $spinGuardUs) {
+            do {
+                $releasedMonoNs = hrtime(true);
+            } while ($releasedMonoNs < $targetMonoNs);
+            return $releasedMonoNs;
+        }
+
+        if ($pump !== null) {
+            $pumpStartMonoNs = hrtime(true);
+            $pump();
+            $pumpEndMonoNs = hrtime(true);
+            $pumpDurationMs = ($pumpEndMonoNs - $pumpStartMonoNs) / 1_000_000;
+            $telemetry['pump_calls']++;
+            $telemetry['pump_max_ms'] = max(
+                $telemetry['pump_max_ms'],
+                $pumpDurationMs
+            );
+            if (
+                $pumpStartMonoNs < $targetMonoNs
+                && $pumpEndMonoNs >= $targetMonoNs
+            ) {
+                $telemetry['pump_crossed_target'] = true;
+            }
+
+            // Pump dapat menghabiskan sebagian/seluruh budget. Hitung ulang
+            // sebelum sleep agar tidak tidur melewati target.
+            $nowMonoNs = hrtime(true);
+            $remainingNs = $targetMonoNs - $nowMonoNs;
+            if ($remainingNs <= 0) {
+                return $nowMonoNs;
+            }
+            $remainingUs = intdiv($remainingNs, 1000);
+            if ($remainingUs <= $spinGuardUs) {
+                do {
+                    $releasedMonoNs = hrtime(true);
+                } while ($releasedMonoNs < $targetMonoNs);
+                return $releasedMonoNs;
+            }
+        }
+
+        $sleepBudgetUs = $remainingUs - $spinGuardUs;
+        $sleepFloorUs = PHP_OS_FAMILY === 'Windows' ? 16000 : 500;
+        if ($sleepBudgetUs <= $sleepFloorUs) {
+            do {
+                $releasedMonoNs = hrtime(true);
+            } while ($releasedMonoNs < $targetMonoNs);
+            return $releasedMonoNs;
+        }
+        $sleepUs = min(
+            $sleepBudgetUs,
+            12000,
+            max($sleepFloorUs, intdiv($sleepBudgetUs, 2))
+        );
+        usleep($sleepUs);
+    }
+}
+
+function curlHandleKey($handle): string {
+    return is_object($handle)
+        ? 'o' . spl_object_id($handle)
+        : 'r' . (int) $handle;
+}
+
+function guardedDispatchTargetMonoNs(
+    int $nominalTargetMonoNs,
+    ?int $lastDispatchMonoNs
+): int {
+    if ($lastDispatchMonoNs === null) {
+        return $nominalTargetMonoNs;
+    }
+    return max(
+        $nominalTargetMonoNs,
+        $lastDispatchMonoNs + (MIN_DISPATCH_GAP_MS * 1_000_000)
+    );
+}
+
 function runStaggeredInquiry(
     array $preparedInquiries,
     int $leadOffsetMs
@@ -863,8 +1051,8 @@ function runStaggeredInquiry(
     $totalUsers = count($preparedInquiries);
     if ($totalUsers === 0) return [];
 
-    // Slot pertama tepat di lead. Slot berikutnya selalu maju 75ms.
-    // Contoh lead -460ms: -460, -385, -310, -235.
+    // Slot pertama tepat di lead. Sembilan slot berikutnya maju 28ms.
+    // Contoh lead -426ms: -426, -398, ... hingga -174ms.
     $intervalMs = (float) INQUIRY_STAGGER_MS;
     $distanceMs = $totalUsers > 1
         ? INQUIRY_STAGGER_MS * ($totalUsers - 1)
@@ -875,55 +1063,97 @@ function runStaggeredInquiry(
 
     // Petakan T=0 wall-clock ke monotonic clock satu kali. Semua slot dihitung
     // dari anchor yang sama agar tidak terkena drift akibat usleep/RTT.
+    $clockSampleMonoBeforeNs = hrtime(true);
     $clockSampleWallUs = microtime(true) * 1_000_000;
-    $clockSampleMonoNs = hrtime(true);
+    $clockSampleMonoAfterNs = hrtime(true);
+    $clockSampleMonoNs = intdiv(
+        $clockSampleMonoBeforeNs + $clockSampleMonoAfterNs,
+        2
+    );
+    $clockSampleWindowUs = (
+        $clockSampleMonoAfterNs - $clockSampleMonoBeforeNs
+    ) / 1000;
     $warStartMonoNs = $clockSampleMonoNs
         + (int) round(($WAR_START_WALL_US - $clockSampleWallUs) * 1000);
     $phaseStart = microtime(true);
     $inquiryStats = []; // [{user, rtt, srvArrival, http, verdict}]
-    $launched = [];
+    $sharedMulti = curl_multi_init();
+    if ($sharedMulti === false) {
+        throw new RuntimeException('Gagal membuat shared curl_multi untuk inquiry');
+    }
+    $running = 0;
+    $multiStatus = CURLM_OK;
+    $lastDispatchMonoNs = null;
+    echo "[SCHED] platform=" . PHP_OS_FAMILY
+       . " spinGuard=" . sprintf('%.3fms', schedulerSpinGuardUs() / 1000)
+       . " arm=" . SCHEDULER_ARM_LEAD_MS . "ms"
+       . " minGap=" . MIN_DISPATCH_GAP_MS . "ms"
+       . " clockMapWindow=" . sprintf('%.3fus', $clockSampleWindowUs) . "\n";
 
     foreach ($preparedInquiries as $index => $meta) {
         $plannedOffsetMs = $leadOffsetMs + ($intervalMs * $index);
-        $targetMonoNs = $warStartMonoNs + (int) round($plannedOffsetMs * 1_000_000);
+        $nominalTargetMonoNs = $warStartMonoNs
+            + (int) round($plannedOffsetMs * 1_000_000);
+        $guardedTargetMonoNs = guardedDispatchTargetMonoNs(
+            $nominalTargetMonoNs,
+            $lastDispatchMonoNs
+        );
+        $guardDelayMs = max(
+            0.0,
+            ($guardedTargetMonoNs - $nominalTargetMonoNs) / 1_000_000
+        );
+        $waitTelemetry = null;
 
-        // Sambil menunggu slot berikutnya, request yang sudah ditembak tetap
-        // dipompa oleh curl_multi. Dua puluh lima milidetik terakhir memakai
-        // busy-wait agar resolusi sleep OS tidak membuat slot meleset.
-        while (true) {
-            foreach ($launched as $launchedIndex) {
-                do {
-                    $status = curl_multi_exec(
-                        $preparedInquiries[$launchedIndex]['mh'],
-                        $running
-                    );
-                } while ($status === CURLM_CALL_MULTI_PERFORM);
-                $preparedInquiries[$launchedIndex]['running'] = $running;
-            }
-
-            $remainingNs = $targetMonoNs - hrtime(true);
-            if ($remainingNs <= 0) break;
-
-            $remainingUs = intdiv($remainingNs, 1000);
-            if ($remainingUs > 50000) {
-                usleep(12000);
-            } elseif ($remainingUs > 25000) {
-                usleep(4000);
-            } else {
-                continue;
-            }
-        }
+        waitForMonotonicSlot(
+            $guardedTargetMonoNs,
+            static function () use ($sharedMulti, &$running, &$multiStatus): void {
+                $multiStatus = pumpCurlMultiNonBlocking($sharedMulti, $running);
+            },
+            $waitTelemetry
+        );
 
         $preparedInquiries[$index]['planned_offset_ms'] = $plannedOffsetMs;
+        $preparedInquiries[$index]['guarded_offset_ms'] = (
+            $guardedTargetMonoNs - $warStartMonoNs
+        ) / 1_000_000;
+        $preparedInquiries[$index]['guard_delay_ms'] = $guardDelayMs;
+        $preparedInquiries[$index]['wait_pump_max_ms'] =
+            $waitTelemetry['pump_max_ms'] ?? 0.0;
+        $preparedInquiries[$index]['wait_pump_crossed_target'] =
+            (bool) ($waitTelemetry['pump_crossed_target'] ?? false);
+        $addStartMonoNs = hrtime(true);
+        $addStatus = curl_multi_add_handle(
+            $sharedMulti,
+            $preparedInquiries[$index]['ch']
+        );
+        $preparedInquiries[$index]['add_duration_ms'] = (
+            hrtime(true) - $addStartMonoNs
+        ) / 1_000_000;
+        if ($addStatus !== CURLM_OK) {
+            throw new RuntimeException(
+                "Gagal memasang inquiry slot " . ($index + 1)
+                . " ke shared multi: CURLM {$addStatus}"
+            );
+        }
+
+        // add_handle belum mengirim request. Timestamp fire diambil tepat
+        // sebelum curl_multi_exec yang mengaktifkan transfer.
         $preparedInquiries[$index]['started'] = microtime(true);
+        $dispatchStartMonoNs = hrtime(true);
+        $lastDispatchMonoNs = $dispatchStartMonoNs;
         $preparedInquiries[$index]['fired_offset_ms'] = (
-            $preparedInquiries[$index]['started'] * 1_000_000 - $WAR_START_WALL_US
-        ) / 1000;
-        do {
-            $status = curl_multi_exec($preparedInquiries[$index]['mh'], $running);
-        } while ($status === CURLM_CALL_MULTI_PERFORM);
-        $preparedInquiries[$index]['running'] = $running;
-        $launched[] = $index;
+            $dispatchStartMonoNs - $warStartMonoNs
+        ) / 1_000_000;
+        $multiStatus = pumpCurlMultiNonBlocking($sharedMulti, $running);
+        $preparedInquiries[$index]['dispatch_duration_ms'] = (
+            hrtime(true) - $dispatchStartMonoNs
+        ) / 1_000_000;
+        if ($multiStatus !== CURLM_OK) {
+            throw new RuntimeException(
+                "Scheduler inquiry gagal pada slot " . ($index + 1)
+                . ": CURLM {$multiStatus}"
+            );
+        }
     }
 
     $scheduleSummary = sprintf(
@@ -935,34 +1165,33 @@ function runStaggeredInquiry(
         $intervalMs
     );
 
-    // Semua request sudah ditembak. Lanjutkan pump tanpa blocking select agar
-    // response selesai secepat mungkin.
+    // Semua request sudah ditembak. Lanjutkan satu event loop bersama sampai
+    // seluruh response selesai.
     do {
-        $hasRunning = false;
-        foreach ($launched as $launchedIndex) {
-            do {
-                $status = curl_multi_exec(
-                    $preparedInquiries[$launchedIndex]['mh'],
-                    $running
-                );
-            } while ($status === CURLM_CALL_MULTI_PERFORM);
-            $preparedInquiries[$launchedIndex]['running'] = $running;
-            if ($running > 0) {
-                $hasRunning = true;
+        $multiStatus = pumpCurlMultiNonBlocking($sharedMulti, $running);
+        if ($multiStatus !== CURLM_OK) {
+            throw new RuntimeException("Event loop inquiry gagal: CURLM {$multiStatus}");
+        }
+        if ($running > 0) {
+            $selected = curl_multi_select($sharedMulti, 0.01);
+            if ($selected === -1) {
+                usleep(500);
             }
         }
-        if ($hasRunning) usleep(1000);
-    } while ($hasRunning);
+    } while ($running > 0);
+
+    $multiResults = [];
+    while ($multiInfo = curl_multi_info_read($sharedMulti)) {
+        if (isset($multiInfo['handle'])) {
+            $multiResults[curlHandleKey($multiInfo['handle'])] =
+                (int) ($multiInfo['result'] ?? 0);
+        }
+    }
 
     // Panen response setelah seluruh handle selesai, tanpa mengirim ulang.
     foreach ($preparedInquiries as $meta) {
         $ch = $meta['ch'];
-        $multiResult = 0;
-        while ($multiInfo = curl_multi_info_read($meta['mh'])) {
-            if (($multiInfo['handle'] ?? null) === $ch) {
-                $multiResult = (int)($multiInfo['result'] ?? 0);
-            }
-        }
+        $multiResult = $multiResults[curlHandleKey($ch)] ?? 0;
         $resp = curl_multi_getcontent($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $curlErr = curl_error($ch);
@@ -1016,7 +1245,13 @@ function runStaggeredInquiry(
             'http'         => (int) $code,
             'verdict'      => $verdict['status'],
             'planned_fire' => $meta['planned_offset_ms'],
+            'guarded_fire' => $meta['guarded_offset_ms'],
+            'guard_delay'  => $meta['guard_delay_ms'],
             'actual_fire'  => $meta['fired_offset_ms'],
+            'add_ms'       => $meta['add_duration_ms'] ?? null,
+            'exec_ms'      => $meta['dispatch_duration_ms'] ?? null,
+            'pump_max_ms'  => $meta['wait_pump_max_ms'] ?? null,
+            'pump_crossed' => $meta['wait_pump_crossed_target'] ?? false,
             'dns_ms'       => $net['dns_ms'],
             'tcp_ms'       => $net['tcp_ms'],
             'tls_ms'       => $net['tls_ms'],
@@ -1027,7 +1262,8 @@ function runStaggeredInquiry(
         $tag = "[$responseWallTime][+" . sprintf('%6.1f', $tRel) . "ms][$userKey]"
              . "[plan" . sprintf('%+.1f', $meta['planned_offset_ms']) . "ms]"
              . "[fire" . sprintf('%+.1f', $meta['fired_offset_ms']) . "ms]"
-             . "[single][rtt {$elapsed}ms][$sArr][HTTP $code]";
+             . "[single guard" . sprintf('%+.1f', $meta['guard_delay_ms']) . "ms]"
+             . "[rtt {$elapsed}ms][$sArr][HTTP $code]";
 
         if ($verdict['status'] === 'success') {
             echo "$tag ✅ OrderID: {$verdict['orderId']}\n";
@@ -1049,10 +1285,10 @@ function runStaggeredInquiry(
             $curlErrno
         ) . "\n";
 
-        curl_multi_remove_handle($meta['mh'], $ch);
-        curl_multi_close($meta['mh']);
+        curl_multi_remove_handle($sharedMulti, $ch);
         @curl_close($ch);
     }
+    curl_multi_close($sharedMulti);
 
     $phaseElapsed = (microtime(true) - $phaseStart) * 1000;
 
@@ -1068,6 +1304,28 @@ function runStaggeredInquiry(
             fn($s) => $s['actual_fire'] - $s['planned_fire'],
             $inquiryStats
         );
+        $addValues = array_values(array_filter(
+            array_column($inquiryStats, 'add_ms'),
+            static fn($value) => $value !== null
+        ));
+        $execValues = array_values(array_filter(
+            array_column($inquiryStats, 'exec_ms'),
+            static fn($value) => $value !== null
+        ));
+        $dispatchWindowValues = [];
+        foreach ($inquiryStats as $stat) {
+            if ($stat['add_ms'] !== null && $stat['exec_ms'] !== null) {
+                $dispatchWindowValues[] = $stat['add_ms'] + $stat['exec_ms'];
+            }
+        }
+        $guardValues = array_column($inquiryStats, 'guard_delay');
+        $guardCount = count(array_filter(
+            $guardValues,
+            static fn($value) => $value > 0.001
+        ));
+        $pumpCrossedCount = count(array_filter(
+            array_column($inquiryStats, 'pump_crossed')
+        ));
         $rtts        = array_column($inquiryStats, 'rtt');
         $srvArr      = array_filter(array_column($inquiryStats, 'srv_arrival'), fn($v) => $v !== null);
         $verdicts    = array_count_values(array_column($inquiryStats, 'verdict'));
@@ -1084,6 +1342,25 @@ function runStaggeredInquiry(
             percentile($fireDrifts, 0.5),
             max($fireDrifts)
         );
+        echo sprintf(
+            "   - anti-tumpuk: minGap=%dms guard=%d/%d maxShift=%.3fms"
+            . " pumpCrossed=%d\n",
+            MIN_DISPATCH_GAP_MS,
+            $guardCount,
+            count($inquiryStats),
+            empty($guardValues) ? 0.0 : max($guardValues),
+            $pumpCrossedCount
+        );
+        if (!empty($dispatchWindowValues)) {
+            echo sprintf(
+                "   - dispatch window: add med=%.3fms | exec med=%.3fms"
+                . " | total p95=%.3fms max=%.3fms\n",
+                percentile($addValues, 0.5),
+                percentile($execValues, 0.5),
+                percentile($dispatchWindowValues, 0.95),
+                max($dispatchWindowValues)
+            );
+        }
         $dnsValues = array_column($inquiryStats, 'dns_ms');
         $tcpValues = array_column($inquiryStats, 'tcp_ms');
         $tlsValues = array_column($inquiryStats, 'tls_ms');
@@ -1282,6 +1559,444 @@ function runParallelPayment(array $inquirySuccess): int {
 }
 
 // ----------------------------------------------------------------------
+// OFFLINE TIMING SELF-TEST
+// ----------------------------------------------------------------------
+function timingSelfTestIterations(array $args, int $default = 20): int {
+    foreach ($args as $arg) {
+        if (preg_match('/^--iterations=(\d+)$/', (string) $arg, $match)) {
+            return max(1, min(200, (int) $match[1]));
+        }
+    }
+    return $default;
+}
+
+function runTimingSelfTest(int $iterations = 20): int {
+    $shots = REQUIRED_USERS;
+    $intervalMs = (float) INQUIRY_STAGGER_MS;
+    $intervalNs = (int) round($intervalMs * 1_000_000);
+    $expectedSpanMs = $intervalMs * max(0, $shots - 1);
+
+    $latenessMs = [];
+    $intervalErrorAbsMs = [];
+    $spanErrorAbsMs = [];
+    $perShotWorstMs = array_fill(0, $shots, 0.0);
+    $lateOver1 = 0;
+    $lateOver5 = 0;
+    $lateOver10 = 0;
+    $lateAtLeastInterval = 0;
+    $dispatchOver1 = 0;
+    $dispatchOver5 = 0;
+    $dispatchOver10 = 0;
+    $dispatchAtLeastInterval = 0;
+    $badRounds = 0;
+    $missedIntervalRounds = 0;
+    $guardApplications = 0;
+    $pumpCrossedTarget = 0;
+    $pumpMaxMs = 0.0;
+    $addDurationMs = [];
+    $dispatchDurationMs = [];
+    $dispatchEndLatenessMs = [];
+    $dispatchEndOver1 = 0;
+    $dispatchEndOver5 = 0;
+    $dispatchEndOver10 = 0;
+    $dispatchEndAtLeastInterval = 0;
+    $fileTransfersValidated = 0;
+    $worstRound = 0;
+    $worstShot = 0;
+    $worstLateMs = -INF;
+
+    echo "[TIMING-TEST] OFFLINE: tidak menghubungi Google/GoPay"
+       . " dan tidak menyentuh loghasil.txt\n";
+    echo "[TIMING-TEST] iterations={$iterations} shots={$shots}"
+       . " interval=" . sprintf('%.3fms', $intervalMs)
+       . " span=" . sprintf('%.3fms', $expectedSpanMs) . "\n";
+    echo "[TIMING-TEST] platform=" . PHP_OS_FAMILY
+       . " spin_guard=" . sprintf('%.3fms', schedulerSpinGuardUs() / 1000)
+       . " arm=" . SCHEDULER_ARM_LEAD_MS . "ms"
+       . " min_dispatch_gap=" . MIN_DISPATCH_GAP_MS . "ms\n";
+
+    // Boundary unit-check anti-tumpuk.
+    $unitPreviousNominalNs = 1_000_000_000;
+    $unitNextNominalNs = $unitPreviousNominalNs + $intervalNs;
+    $antiStackCases = [
+        ['name' => 'first', 'late_ms' => null, 'shift_ms' => 0.0],
+        ['name' => 'on_time', 'late_ms' => 0.0, 'shift_ms' => 0.0],
+        ['name' => 'late20', 'late_ms' => 20.0, 'shift_ms' => 0.0],
+        ['name' => 'late21', 'late_ms' => 21.0, 'shift_ms' => 1.0],
+        ['name' => 'late27', 'late_ms' => 27.0, 'shift_ms' => 7.0],
+        ['name' => 'late56', 'late_ms' => 56.0, 'shift_ms' => 36.0],
+    ];
+    foreach ($antiStackCases as $case) {
+        $lastDispatchNs = $case['late_ms'] === null
+            ? null
+            : $unitPreviousNominalNs
+                + (int) round($case['late_ms'] * 1_000_000);
+        $unitGuardedNs = guardedDispatchTargetMonoNs(
+            $unitNextNominalNs,
+            $lastDispatchNs
+        );
+        $unitGuardShiftMs = (
+            $unitGuardedNs - $unitNextNominalNs
+        ) / 1_000_000;
+        $gapValid = $lastDispatchNs === null
+            || $unitGuardedNs - $lastDispatchNs
+                >= MIN_DISPATCH_GAP_MS * 1_000_000;
+        if (
+            abs($unitGuardShiftMs - $case['shift_ms']) > 0.000001
+            || $unitGuardedNs < $unitNextNominalNs
+            || !$gapValid
+        ) {
+            throw new RuntimeException(
+                "Unit-check anti-tumpuk {$case['name']} gagal:"
+                . " shift={$unitGuardShiftMs}ms"
+            );
+        }
+    }
+    echo "[TIMING-TEST] anti_stack_unit=PASS cases="
+       . count($antiStackCases) . " shifts=0,0,0,1,7,36ms\n";
+
+    $selfTestPath = str_replace('\\', '/', __FILE__);
+    $selfTestFileUrl = (PHP_OS_FAMILY === 'Windows' ? 'file:///' : 'file://')
+        . str_replace(' ', '%20', $selfTestPath);
+
+    for ($round = 0; $round < $iterations; $round++) {
+        // Easy handle disiapkan sebelum arm, sama seperti inquiry produksi.
+        $testHandles = [];
+        for ($shot = 0; $shot < $shots; $shot++) {
+            $testHandle = curl_init($selfTestFileUrl);
+            if ($testHandle === false) {
+                throw new RuntimeException('Gagal membuat local cURL self-test');
+            }
+            curl_setopt_array($testHandle, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_NOBODY => true,
+                CURLOPT_NOSIGNAL => true,
+            ]);
+            $testHandles[] = $testHandle;
+        }
+
+        // Anchor ditentukan sebelum setup multi agar budget arm 100ms ikut diuji.
+        $anchorMonoNs = hrtime(true)
+            + (SCHEDULER_ARM_LEAD_MS * 1_000_000);
+        // Shared multi memakai file:// lokal: add_handle + exec ikut diuji tanpa
+        // mengirim trafik jaringan.
+        $testMulti = curl_multi_init();
+        if ($testMulti === false) {
+            throw new RuntimeException('Gagal membuat curl_multi untuk timing self-test');
+        }
+        $running = 0;
+        $multiStatus = CURLM_OK;
+        $released = [];
+        $lastReleaseMonoNs = null;
+        $roundWorstDispatchEndLateMs = 0.0;
+
+        for ($shot = 0; $shot < $shots; $shot++) {
+            $nominalTargetMonoNs = $anchorMonoNs + ($shot * $intervalNs);
+            $guardedTargetMonoNs = guardedDispatchTargetMonoNs(
+                $nominalTargetMonoNs,
+                $lastReleaseMonoNs
+            );
+            if ($guardedTargetMonoNs > $nominalTargetMonoNs) {
+                $guardApplications++;
+            }
+
+            $waitTelemetry = null;
+            waitForMonotonicSlot(
+                $guardedTargetMonoNs,
+                static function () use ($testMulti, &$running, &$multiStatus): void {
+                    $multiStatus = pumpCurlMultiNonBlocking($testMulti, $running);
+                },
+                $waitTelemetry
+            );
+            if ($multiStatus !== CURLM_OK) {
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "curl_multi self-test gagal: CURLM {$multiStatus}"
+                );
+            }
+
+            $addStartMonoNs = hrtime(true);
+            $addStatus = curl_multi_add_handle(
+                $testMulti,
+                $testHandles[$shot]
+            );
+            $addMs = (hrtime(true) - $addStartMonoNs) / 1_000_000;
+            $addDurationMs[] = $addMs;
+            if ($addStatus !== CURLM_OK) {
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "add_handle self-test gagal: CURLM {$addStatus}"
+                );
+            }
+            // Ini titik fire yang sama dengan produksi: tepat sebelum exec.
+            $actualMonoNs = hrtime(true);
+            $multiStatus = pumpCurlMultiNonBlocking($testMulti, $running);
+            $dispatchMs = (
+                hrtime(true) - $actualMonoNs
+            ) / 1_000_000;
+            $dispatchDurationMs[] = $dispatchMs;
+            if ($dispatchMs > 1.0) $dispatchOver1++;
+            if ($dispatchMs > 5.0) $dispatchOver5++;
+            if ($dispatchMs > 10.0) $dispatchOver10++;
+            if ($dispatchMs >= $intervalMs) $dispatchAtLeastInterval++;
+            if ($multiStatus !== CURLM_OK) {
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "dispatch self-test gagal: CURLM {$multiStatus}"
+                );
+            }
+
+            $lastReleaseMonoNs = $actualMonoNs;
+            $pumpMaxMs = max(
+                $pumpMaxMs,
+                (float) ($waitTelemetry['pump_max_ms'] ?? 0.0)
+            );
+            if (!empty($waitTelemetry['pump_crossed_target'])) {
+                $pumpCrossedTarget++;
+            }
+
+            $released[] = $actualMonoNs;
+            // Tetap ukur terhadap target nominal. Shift anti-tumpuk tidak
+            // di-clamp agar host stall tetap terlihat apa adanya.
+            $late = ($actualMonoNs - $nominalTargetMonoNs) / 1_000_000;
+            $latenessMs[] = $late;
+            $perShotWorstMs[$shot] = max($perShotWorstMs[$shot], $late);
+            if ($late > 1.0) $lateOver1++;
+            if ($late > 5.0) $lateOver5++;
+            if ($late > 10.0) $lateOver10++;
+            if ($late >= $intervalMs) $lateAtLeastInterval++;
+            $dispatchEndLateMs = $late + $dispatchMs;
+            $dispatchEndLatenessMs[] = $dispatchEndLateMs;
+            $roundWorstDispatchEndLateMs = max(
+                $roundWorstDispatchEndLateMs,
+                $dispatchEndLateMs
+            );
+            if ($dispatchEndLateMs > 1.0) $dispatchEndOver1++;
+            if ($dispatchEndLateMs > 5.0) $dispatchEndOver5++;
+            if ($dispatchEndLateMs > 10.0) $dispatchEndOver10++;
+            if ($dispatchEndLateMs >= $intervalMs) {
+                $dispatchEndAtLeastInterval++;
+            }
+            if ($late > $worstLateMs) {
+                $worstLateMs = $late;
+                $worstRound = $round + 1;
+                $worstShot = $shot + 1;
+            }
+
+            if ($shot > 0) {
+                $actualIntervalMs = (
+                    $actualMonoNs - $released[$shot - 1]
+                ) / 1_000_000;
+                $intervalErrorAbsMs[] = abs($actualIntervalMs - $intervalMs);
+            }
+        }
+
+        $actualSpanMs = (
+            $released[$shots - 1] - $released[0]
+        ) / 1_000_000;
+        $spanErrorAbsMs[] = abs($actualSpanMs - $expectedSpanMs);
+        if ($roundWorstDispatchEndLateMs > 5.0) {
+            $badRounds++;
+        }
+        if ($roundWorstDispatchEndLateMs >= $intervalMs) {
+            $missedIntervalRounds++;
+        }
+
+        do {
+            $multiStatus = pumpCurlMultiNonBlocking($testMulti, $running);
+        } while ($multiStatus === CURLM_OK && $running > 0);
+        if ($multiStatus !== CURLM_OK) {
+            curl_multi_close($testMulti);
+            throw new RuntimeException(
+                "finalize self-test gagal: CURLM {$multiStatus}"
+            );
+        }
+        $testResults = [];
+        while ($multiInfo = curl_multi_info_read($testMulti)) {
+            if (isset($multiInfo['handle'])) {
+                $testResults[curlHandleKey($multiInfo['handle'])] =
+                    (int) ($multiInfo['result'] ?? -1);
+            }
+        }
+        foreach ($testHandles as $testHandle) {
+            $testResult = $testResults[curlHandleKey($testHandle)] ?? null;
+            if ($testResult !== CURLE_OK || curl_errno($testHandle) !== 0) {
+                curl_multi_remove_handle($testMulti, $testHandle);
+                curl_close($testHandle);
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "Transfer file:// self-test gagal; result="
+                    . var_export($testResult, true)
+                );
+            }
+            $fileTransfersValidated++;
+            curl_multi_remove_handle($testMulti, $testHandle);
+            curl_close($testHandle);
+        }
+        curl_multi_close($testMulti);
+    }
+
+    $medianLate = percentile($latenessMs, 0.5);
+    $p95Late = percentile($latenessMs, 0.95);
+    $p99Late = percentile($latenessMs, 0.99);
+    $maxLate = max($latenessMs);
+    $p95Interval = percentile($intervalErrorAbsMs, 0.95);
+    $maxInterval = max($intervalErrorAbsMs);
+    $p95Span = percentile($spanErrorAbsMs, 0.95);
+    $maxSpan = max($spanErrorAbsMs);
+    $localDispatchWindowMs = [];
+    foreach ($addDurationMs as $index => $addMs) {
+        $localDispatchWindowMs[] = $addMs + $dispatchDurationMs[$index];
+    }
+    $p95Add = percentile($addDurationMs, 0.95);
+    $p95Exec = percentile($dispatchDurationMs, 0.95);
+    $p95LocalWindow = percentile($localDispatchWindowMs, 0.95);
+    $maxLocalWindow = max($localDispatchWindowMs);
+    $p95DispatchEndLate = percentile($dispatchEndLatenessMs, 0.95);
+    $maxDispatchEndLate = max($dispatchEndLatenessMs);
+
+    echo sprintf(
+        "[TIMING-TEST] lateness  min=%.3fms med=%.3fms"
+        . " p95=%.3fms p99=%.3fms max=%.3fms\n",
+        min($latenessMs),
+        $medianLate,
+        $p95Late,
+        $p99Late,
+        $maxLate
+    );
+    echo sprintf(
+        "[TIMING-TEST] interval |error| p95=%.3fms max=%.3fms\n",
+        $p95Interval,
+        $maxInterval
+    );
+    echo sprintf(
+        "[TIMING-TEST] span %.0fms |error| p95=%.3fms max=%.3fms\n",
+        $expectedSpanMs,
+        $p95Span,
+        $maxSpan
+    );
+    echo "[TIMING-TEST] worst/shot: "
+       . implode(', ', array_map(
+           static fn($index, $value) => sprintf(
+               'T%d=%.3fms',
+               $index + 1,
+               $value
+           ),
+           array_keys($perShotWorstMs),
+           $perShotWorstMs
+       ))
+       . "\n";
+
+    $badRoundRate = ($badRounds / $iterations) * 100;
+    echo sprintf(
+        "[TIMING-TEST] fire outliers >1ms=%d >5ms=%d >10ms=%d >=%.0fms=%d\n",
+        $lateOver1,
+        $lateOver5,
+        $lateOver10,
+        $intervalMs,
+        $lateAtLeastInterval
+    );
+    echo sprintf(
+        "[TIMING-TEST] dispatch-end lateness p95=%.3fms max=%.3fms"
+        . " | >1ms=%d >5ms=%d >10ms=%d >=%.0fms=%d"
+        . " | bad_rounds=%d/%d (%.1f%%)\n",
+        $p95DispatchEndLate,
+        $maxDispatchEndLate,
+        $dispatchEndOver1,
+        $dispatchEndOver5,
+        $dispatchEndOver10,
+        $intervalMs,
+        $dispatchEndAtLeastInterval,
+        $badRounds,
+        $iterations,
+        $badRoundRate
+    );
+    echo sprintf(
+        "[TIMING-TEST] guard_applied=%d pump_crossed_target=%d"
+        . " pump_max=%.3fms | worst=round%d/T%d %.3fms\n",
+        $guardApplications,
+        $pumpCrossedTarget,
+        $pumpMaxMs,
+        $worstRound,
+        $worstShot,
+        $worstLateMs
+    );
+    echo sprintf(
+        "[TIMING-TEST] LOCAL_CURL_DISPATCH_SYNTHETIC"
+        . " add[p95=%.3fms] exec[p95=%.3fms]"
+        . " total[med=%.3fms p95=%.3fms max=%.3fms]"
+        . " validated=%d/%d\n",
+        $p95Add,
+        $p95Exec,
+        percentile($localDispatchWindowMs, 0.5),
+        $p95LocalWindow,
+        $maxLocalWindow,
+        $fileTransfersValidated,
+        $iterations * $shots
+    );
+    echo sprintf(
+        "[TIMING-TEST] synthetic exec outliers >1ms=%d >5ms=%d >10ms=%d"
+        . " >=%.0fms=%d\n",
+        $dispatchOver1,
+        $dispatchOver5,
+        $dispatchOver10,
+        $intervalMs,
+        $dispatchAtLeastInterval
+    );
+
+    $corePass = $medianLate <= 0.10
+             && $p95Late <= 1.0
+             && $p95Interval <= 1.5;
+    $coreWarn = !$corePass
+             && $medianLate <= 0.25
+             && $p95Late <= 2.0
+             && $p95Interval <= 3.0;
+    $coreStatus = $corePass ? 'PASS' : ($coreWarn ? 'WARN' : 'FAIL');
+
+    $localPass = $p95LocalWindow <= 2.0
+              && $fileTransfersValidated === $iterations * $shots;
+    $localWarn = !$localPass
+              && $p95LocalWindow <= 4.0
+              && $fileTransfersValidated === $iterations * $shots;
+    $localStatus = $localPass ? 'PASS' : ($localWarn ? 'WARN' : 'FAIL');
+
+    $hostGood = $badRounds === 0
+             && $missedIntervalRounds === 0
+             && $p95Span <= 3.0;
+    $hostWarn = !$hostGood
+             && $badRoundRate <= 5.0
+             && $missedIntervalRounds === 0
+             && $p95Span <= 6.0;
+    $hostStatus = $hostGood ? 'GOOD' : ($hostWarn ? 'WARN' : 'FAIL');
+
+    if (
+        $coreStatus === 'FAIL'
+        || $localStatus === 'FAIL'
+        || $hostStatus === 'FAIL'
+    ) {
+        $result = 'FAIL';
+        $exitCode = 1;
+    } elseif (
+        $coreStatus === 'PASS'
+        && $localStatus === 'PASS'
+        && $hostStatus === 'GOOD'
+    ) {
+        $result = 'PASS';
+        $exitCode = 0;
+    } else {
+        $result = 'WARN';
+        $exitCode = 2;
+    }
+
+    echo "[TIMING-TEST] SCHEDULER_CORE={$coreStatus}"
+       . " LOCAL_CURL_DISPATCH={$localStatus}"
+       . " HOST_JITTER={$hostStatus}\n";
+    echo "[TIMING-TEST] RESULT={$result}"
+       . " (kualifikasi final: ulang >=50x di VPS Linux idle dan saat CPU load)\n";
+    return $exitCode;
+}
+
+// ----------------------------------------------------------------------
 // MAIN
 // ----------------------------------------------------------------------
 function gpyPay(): void {
@@ -1290,16 +2005,48 @@ function gpyPay(): void {
 
     $lines = file('user_server_wdp.txt', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
     $orders = [];
+    $seenOrders = [];
+    $duplicateOrders = [];
+    $invalidOrderLines = [];
     foreach ($lines as $line) {
         $parts = array_map('trim', explode('|', $line));
-        if (count($parts) >= 2) $orders[] = ['userId' => $parts[0], 'serverId' => $parts[1]];
+        $userId = ltrim((string) ($parts[0] ?? ''), "\xEF\xBB\xBF");
+        $serverId = (string) ($parts[1] ?? '');
+        if (count($parts) < 2 || $userId === '' || $serverId === '') {
+            $invalidOrderLines[] = trim($line);
+            continue;
+        }
+
+        $orderKey = $userId . '|' . $serverId;
+        if (isset($seenOrders[$orderKey])) {
+            $duplicateOrders[$orderKey] = true;
+            continue;
+        }
+        $seenOrders[$orderKey] = true;
+        $orders[] = ['userId' => $userId, 'serverId' => $serverId];
     }
-    $orders = array_slice($orders, 0, MAX_USERS);
-    if (empty($orders)) {
-        die("❌ Tidak ada order valid di user_server_wdp.txt\n");
+    if (!empty($invalidOrderLines)) {
+        throw new RuntimeException(
+            "user_server_wdp.txt memuat " . count($invalidOrderLines)
+            . " baris tidak valid; setiap baris minimal wajib userId|serverId"
+        );
+    }
+    if (!empty($duplicateOrders)) {
+        throw new RuntimeException(
+            "user_server_wdp.txt memuat user duplikat: "
+            . implode(', ', array_keys($duplicateOrders))
+        );
+    }
+    if (count($orders) !== REQUIRED_USERS || count($orders) > MAX_USERS) {
+        throw new RuntimeException(
+            "Diperlukan tepat " . REQUIRED_USERS
+            . " akun unik (userId|serverId) per VPS; ditemukan " . count($orders)
+        );
     }
 
     echo "✅ Loaded " . count($orders) . " order (max " . MAX_USERS . ")\n";
+    echo "[CONFIG] Akun unik tervalidasi: " . count($orders)
+       . "/" . REQUIRED_USERS . "\n";
     echo "? Fixed lead from lead.txt"
        . " | TARGET_SRV=" . sprintf('%.0fms', TARGET_SRV_MS_DEFAULT)
        . " | STAGGERED_INQUIRY\n\n";
@@ -1332,13 +2079,14 @@ function gpyPay(): void {
     // Captcha 1× di-fetch setelah konfigurasi timing dinyatakan valid.
     $captchaToken = getFreshCaptchaToken();
 
-    // Tunggu dan fire — mini-probe2 T-1.5s untuk warm TLS pool sebelum burst.
+    // Tunggu dan fire — mini-probe2 T-2.5s untuk warm TLS pool sebelum burst.
     // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
     $preparedInquiries = [];
     waitForExactBurstTime(
         $burstLeadMs,
         static function (int $budgetMs = 1200): void {
-            echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000) . "s re-warm TLS pool via GET tanpa voucher ("
+            echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000)
+               . "s re-warm TLS pool via HEAD root tanpa endpoint order ("
                . MINI_PROBE2_PARALLEL . " call paralel, budget {$budgetMs}ms)...\n";
             $rtts = miniProbe2ReWarm($budgetMs);
             if (!empty($rtts)) {
@@ -1365,4 +2113,13 @@ function gpyPay(): void {
     echo "\n? FULL FLOW SELESAI! Berhasil: $success / " . count($orders) . "\n";
 }
 
-gpyPay();
+if ($TIMING_SELF_TEST_MODE) {
+    exit(runTimingSelfTest(timingSelfTestIterations($CLI_ARGS)));
+}
+
+try {
+    gpyPay();
+} catch (Throwable $e) {
+    echo "\n[FATAL] " . get_class($e) . ': ' . $e->getMessage() . "\n";
+    exit(1);
+}
