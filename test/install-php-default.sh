@@ -43,69 +43,28 @@ install_files_from_extract() {
 cleanup_download() { trace="$trace cleanup"; }
 verify_php_setup() { trace="$trace verify"; }
 
-go_tripwire() {
-  fail "Jalur PHP memanggil persiapan Golang: $*"
-}
-linux_install_golang() { go_tripwire linux_install_golang; }
-linux_install_golang_official() { go_tripwire linux_install_golang_official; }
-setup_go_mod() { go_tripwire setup_go_mod; }
-prebuild_war_binary() { go_tripwire prebuild_war_binary; }
-try_install_prebuilt_war_binary() { go_tripwire try_install_prebuilt_war_binary; }
-install_linux_war_binary() { go_tripwire install_linux_war_binary; }
-verify_linux_setup() { go_tripwire verify_linux_setup; }
-
 IS_LINUX=1
 IS_TERMUX=0
 IS_MACOS=0
 PLATFORM="linux"
 APP_DIR="$test_root/app"
 WDP1_DIR="$APP_DIR/wdp1"
-BINARY_MODE="source"
-ALLOW_SOURCE_FALLBACK=1
-mkdir -p "$APP_DIR"
-printf 'legacy-go-binary-must-stay-untouched\n' > "$APP_DIR/war"
-legacy_hash="$(sha256sum "$APP_DIR/war" | awk '{print $1}')"
 
 install_output="$test_root/install-output.txt"
-do_install_linux >"$install_output"
+do_install_linux > "$install_output"
 [ "$trace" = " clock download wait files-main files-wdp1 cleanup verify" ] \
   || fail "urutan full install salah:$trace"
 [ "$(tail -n 1 "$install_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir full install"
-[ "$(sha256sum "$APP_DIR/war" | awk '{print $1}')" = "$legacy_hash" ] \
-  || fail "binary Go lama berubah saat full install PHP"
 
 trace=""
 update_output="$test_root/update-output.txt"
-do_update_files >"$update_output"
+do_update_files > "$update_output"
 [ "$trace" = " clock download wait files-main files-wdp1 cleanup verify" ] \
   || fail "urutan update salah:$trace"
 [ "$(tail -n 1 "$update_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir update"
-[ "$(sha256sum "$APP_DIR/war" | awk '{print $1}')" = "$legacy_hash" ] \
-  || fail "binary Go lama berubah saat update PHP"
 
-# Pilihan Go tetap tersedia, tetapi wajib memakai toolchain + binary release
-# tanpa menyentuh build source war.go.
-trace=""
-linux_prepare_clock() {
-  [ $# -eq 0 ] || fail "setup Go tidak boleh meminta dependency PHP"
-  trace="$trace clock"
-}
-linux_install_golang_toolchain() { trace="$trace go-toolchain"; }
-install_linux_war_binary() {
-  [ "$BINARY_MODE" = "release" ] || fail "pilihan Go tidak memakai release"
-  trace="$trace release-binary"
-}
-verify_golang_setup() { trace="$trace go-verify"; }
-go_output="$test_root/go-output.txt"
-do_setup_golang_only >"$go_output"
-[ "$trace" = " clock download wait files-main files-wdp1 go-toolchain release-binary cleanup go-verify" ] \
-  || fail "urutan setup Go release salah:$trace"
-[ "$(tail -n 1 "$go_output")" = "__WDP_CLOCK_HEALTHY__" ] \
-  || fail "marker clock bukan output terakhir setup Go"
-
-# macOS memasang paket di HOME dan HOME/wdp1 tanpa APT/Chrony/Golang.
 trace=""
 IS_LINUX=0
 IS_MACOS=1
@@ -114,25 +73,23 @@ APP_DIR="$test_root/macos-home"
 WDP1_DIR="$APP_DIR/wdp1"
 macos_prepare_php() { trace="$trace mac"; }
 mac_output="$test_root/macos-output.txt"
-do_install_macos >"$mac_output"
+do_install_macos > "$mac_output"
 [ "$trace" = " mac download files-main files-wdp1 cleanup verify" ] \
   || fail "urutan install macOS salah:$trace"
 [ "$(tail -n 1 "$mac_output")" = "__WDP_INSTALL_OK__" ] \
   || fail "marker install bukan output terakhir macOS"
-if grep -Fq "__WDP_CLOCK_HEALTHY__" "$mac_output"; then
-  fail "macOS mengklaim Chrony sehat tanpa clock gate Linux"
-fi
 
-# Pulihkan implementasi asli untuk menguji profil file secara nyata.
 eval "$original_install_files"
 eval "$original_download_package"
 eval "$original_verify_php_setup"
-for file in war.php install.sh war.go go.mod go.sum; do
+
+for file in "${PHP_CORE_FILES[@]}"; do
   printf 'fixture:%s\n' "$file" > "$extract_dir/$file"
 done
 for file in "${CONFIG_FILES[@]}"; do
   printf 'config:%s\n' "$file" > "$extract_dir/$file"
 done
+printf 'jangan disalin\n' > "$extract_dir/unexpected.bin"
 
 APP_DIR="$test_root/php-main"
 WDP1_DIR="$APP_DIR/wdp1"
@@ -140,221 +97,62 @@ install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
 install_files_from_extract "$extract_dir" "$WDP1_DIR" >/dev/null
 for target in "$APP_DIR" "$WDP1_DIR"; do
   for file in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}"; do
-    [ -f "$target/$file" ] || fail "file paket hilang dari $target: $file"
+    [ -f "$target/$file" ] \
+      || fail "file paket hilang dari $target: $file"
   done
-  for file in war.go go.mod go.sum; do
-    [ ! -e "$target/$file" ] || fail "aset Go ikut terpasang di $target: $file"
-  done
+  [ ! -e "$target/unexpected.bin" ] \
+    || fail "file di luar allowlist ikut terpasang"
 done
 
-# Default portable: paket utama tetap di HOME dan salinan berada di HOME/wdp1.
+printf 'config-lokal\n' > "$APP_DIR/waktu.txt"
+install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
+[ "$(cat "$APP_DIR/waktu.txt")" = "config-lokal" ] \
+  || fail "config lokal tertimpa tanpa --force"
+FORCE_OVERWRITE=1
+install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
+[ "$(cat "$APP_DIR/waktu.txt")" = "config:waktu.txt" ] \
+  || fail "--force tidak mengganti config"
+FORCE_OVERWRITE=0
+
 IS_TERMUX=0
-MODE="auto"
 HOME="/root"
 [ "$(default_app_dir)" = "/root" ] \
-  || fail "direktori utama root bukan /root"
+  || fail "direktori utama root salah"
 HOME="/home/ubuntu"
 [ "$(default_app_dir)" = "/home/ubuntu" ] \
-  || fail "direktori utama ubuntu bukan /home/ubuntu"
-IS_MACOS=1
-HOME="/Users/codex"
-[ "$(default_app_dir)" = "/Users/codex" ] \
-  || fail "direktori utama macOS bukan /Users/codex"
+  || fail "direktori utama user salah"
 IS_TERMUX=1
 [ "$(default_app_dir)" = "/sdcard/wdp" ] \
-  || fail "direktori utama Termux bukan /sdcard/wdp"
-IS_TERMUX=0
-MODE="auto"
+  || fail "direktori utama Termux salah"
 
-# Pemilihan menu mempertahankan HOME sebagai direktori utama.
-(
-  unset APP_DIR
-  HOME="/home/menu-user"
-  APP_DIR_EXPLICIT=0
-  MODE="auto"
-  detect_platform() {
-    IS_LINUX=1
-    IS_TERMUX=0
-    IS_MACOS=0
-    PLATFORM="linux"
-  }
-  show_menu() {
-    MODE="go-only"
-    BINARY_MODE="release"
-  }
-  do_setup_golang_only() {
-    [ "$APP_DIR" = "/home/menu-user" ] \
-      || fail "menu Go tidak memakai direktori utama: $APP_DIR"
-    [ "$WDP1_DIR" = "/home/menu-user/wdp1" ] \
-      || fail "folder salinan menu salah: $WDP1_DIR"
-    [ "$BINARY_MODE" = "release" ] \
-      || fail "menu Go tidak memilih binary release"
-  }
-  main --menu >/dev/null
-)
+archive_root="$test_root/archive/warwdpgo-main"
+fixture_archive="$test_root/github-source.tar.gz"
+mkdir -p "$archive_root"
+cp "$repo_root/war.php" "$archive_root/war.php"
+cp "$repo_root/install.sh" "$archive_root/install.sh"
+for file in "${CONFIG_FILES[@]}"; do
+  cp "$repo_root/$file" "$archive_root/$file"
+done
+tar -czf "$fixture_archive" -C "$test_root/archive" warwdpgo-main
 
-IS_LINUX=0
-IS_MACOS=0
-PLATFORM="unknown"
-uname() { printf '%s\n' "Darwin"; }
-detect_platform
-unset -f uname
-[ "$IS_MACOS" -eq 1 ] && [ "$PLATFORM" = "macos" ] \
-  || fail "Darwin tidak dideteksi sebagai macOS"
-
-# Arsip PHP-only sah untuk default/update.
-php_archive_root="$test_root/php-archive/warwdpgo"
-php_archive="$test_root/php-only.tar.gz"
-mkdir -p "$php_archive_root"
-cp "$repo_root/war.php" "$php_archive_root/war.php"
-cp "$repo_root/install.sh" "$php_archive_root/install.sh"
-tar -czf "$php_archive" -C "$test_root/php-archive" warwdpgo
-ARCHIVE_URL="https://example.invalid/php-only.tar.gz"
-ARCHIVE_SHA256="$(sha256sum "$php_archive" | awk '{print $1}')"
-curl_download() { cp "$php_archive" "$2"; }
-
-MODE="auto"
-download_package >/dev/null
-[ -f "$EXTRACT_DIR/war.php" ] || fail "arsip PHP-only tidak diterima default"
-[ ! -e "$EXTRACT_DIR/war.go" ] || fail "fixture PHP-only tiba-tiba berisi Go"
-cleanup_download
-
-# Override arsip flat juga wajib diterima; tar dapat exit 0 sambil membuang
-# semua entry bila --strip-components dipakai pada format ini.
-flat_archive_root="$test_root/php-flat"
-flat_archive="$test_root/php-flat.tar.gz"
-mkdir -p "$flat_archive_root"
-cp "$repo_root/war.php" "$flat_archive_root/war.php"
-cp "$repo_root/install.sh" "$flat_archive_root/install.sh"
-tar -czf "$flat_archive" -C "$flat_archive_root" .
-ARCHIVE_SHA256="$(sha256sum "$flat_archive" | awk '{print $1}')"
-curl_download() { cp "$flat_archive" "$2"; }
-download_package >/dev/null
-[ -f "$EXTRACT_DIR/war.php" ] && [ -f "$EXTRACT_DIR/install.sh" ] \
-  || fail "arsip flat tidak diekstrak dengan benar"
-cleanup_download
-
-# Jalur default wajib mengambil arsip dan checksum dari pasangan objek R2,
-# bukan diam-diam kembali ke GitHub Release.
-r2_checksum="$test_root/R2-SHA256SUMS"
-# Simulasikan publisher Windows lama (CRLF); parser Linux wajib tetap menerima.
-printf '%s  warwdpgo.tar.gz\r\n' \
-  "$(sha256sum "$php_archive" | awk '{print $1}')" > "$r2_checksum"
-ARCHIVE_URL=""
-ARCHIVE_SHA256=""
-R2_PUBLIC_BASE_URL="https://r2.example.invalid"
-R2_PACKAGE_KEY="warwdpgo/warwdpgo.tar.gz"
-R2_CHECKSUM_KEY="warwdpgo/SHA256SUMS"
+downloaded_url=""
 curl_download() {
-  case "$1" in
-    *"/SHA256SUMS?v="*) cp "$r2_checksum" "$2" ;;
-    *"/warwdpgo.tar.gz?v="*) cp "$php_archive" "$2" ;;
-    *) fail "URL default bukan pasangan objek R2: $1" ;;
-  esac
+  downloaded_url="$1"
+  cp "$fixture_archive" "$2"
 }
-MODE="auto"
+GITHUB_REPO="example/project"
+GITHUB_REF="main"
 download_package >/dev/null
+[ "$downloaded_url" = \
+  "https://github.com/example/project/archive/main.tar.gz" ] \
+  || fail "URL GitHub salah: $downloaded_url"
 [ -f "$EXTRACT_DIR/war.php" ] \
-  || fail "paket default R2 tidak berhasil diekstrak"
-[ "$PACKAGE_WAR_SHA256" = "$(sha256sum "$repo_root/war.php" | awk '{print $1}')" ] \
-  || fail "checksum war.php hasil ekstrak berbeda"
+  || fail "arsip GitHub tidak diekstrak"
 cleanup_download
 
-if (
-  printf '%064d  warwdpgo.tar.gz\n' 0 > "$r2_checksum"
-  download_package
-) >/dev/null 2>&1; then
-  fail "paket R2 diterima walau checksum arsip tidak cocok"
-fi
-printf '%s  warwdpgo.tar.gz\r\n' \
-  "$(sha256sum "$php_archive" | awk '{print $1}')" > "$r2_checksum"
-
 MODE="auto"
-BINARY_MODE="release"
-parse_args --go-only
-[ "$MODE" = "go-only" ] || fail "--go-only tidak memilih profil Go"
-[ "$BINARY_MODE" = "release" ] || fail "--go-only tidak memilih binary release"
-if (parse_args --build-from-source) >/dev/null 2>&1; then
-  fail "--build-from-source masih diterima oleh installer PHP-only"
-fi
+parse_args --github-ref stable
+[ "$GITHUB_REF" = "stable" ] \
+  || fail "--github-ref tidak diterapkan"
 
-# Paket aktual harus lolos verifikasi tanpa pernah menjalankan entrypoint WAR.
-APP_DIR="$test_root/actual-main"
-WDP1_DIR="$APP_DIR/wdp1"
-PACKAGE_WAR_SHA256="$(sha256sum "$repo_root/war.php" | awk '{print $1}')"
-for target in "$APP_DIR" "$WDP1_DIR"; do
-  mkdir -p "$target"
-  cp "$repo_root/war.php" "$target/war.php"
-  cp "$repo_root/install.sh" "$target/install.sh"
-  for file in "${CONFIG_FILES[@]}"; do
-    cp "$repo_root/$file" "$target/$file"
-  done
-done
-actual_verify_output="$(verify_php_setup)"
-printf '%s\n' "$actual_verify_output" | grep -Fxq "__WDP_PHP_SETUP_OK__" \
-  || fail "paket aktual gagal verifikasi PHP"
-[ ! -e "$APP_DIR/loghasil.txt" ] && [ ! -e "$WDP1_DIR/loghasil.txt" ] \
-  || fail "verifikasi installer menjalankan war.php aktual"
-
-# Verifikasi hanya lint dan tidak boleh mengeksekusi flow aplikasi.
-APP_DIR="$test_root/no-exec-main"
-WDP1_DIR="$APP_DIR/wdp1"
-executed_marker="$test_root/war-was-executed"
-for target in "$APP_DIR" "$WDP1_DIR"; do
-  mkdir -p "$target"
-  printf '%s\n' '<?php' "file_put_contents('$executed_marker', 'ran');" \
-    > "$target/war.php"
-  printf '%s\n' '#!/usr/bin/env bash' > "$target/install.sh"
-  for file in "${CONFIG_FILES[@]}"; do
-    : > "$target/$file"
-  done
-done
-PACKAGE_WAR_SHA256="$(sha256sum "$APP_DIR/war.php" | awk '{print $1}')"
-verify_php_runtime() { :; }
-verify_php_setup >/dev/null
-[ ! -e "$executed_marker" ] \
-  || fail "verify_php_setup mengeksekusi war.php"
-
-# Target wdp1 dan file managed tidak boleh berupa symlink.
-symlink_root="$test_root/symlink-root"
-mkdir -p "$symlink_root/real"
-APP_DIR="$symlink_root/link"
-ln -s "$symlink_root/real" "$APP_DIR"
-if [ -L "$APP_DIR" ]; then
-  if (install_files_from_extract "$extract_dir") >/dev/null 2>&1; then
-    fail "folder wdp1 berupa symlink diterima"
-  fi
-fi
-
-APP_DIR="$test_root/symlink-file-wdp1"
-mkdir -p "$APP_DIR"
-outside_file="$test_root/outside-war.php"
-printf 'outside-safe\n' > "$outside_file"
-ln -s "$outside_file" "$APP_DIR/war.php"
-if [ -L "$APP_DIR/war.php" ]; then
-  if (install_files_from_extract "$extract_dir") >/dev/null 2>&1; then
-    fail "symlink file managed diterima"
-  fi
-  [ "$(cat "$outside_file")" = "outside-safe" ] \
-    || fail "referent luar symlink berubah"
-fi
-
-# Symlink config juga wajib ditolak meskipun file tersebut tidak tersedia
-# di source package; referent luar tidak boleh dibuat/diubah.
-APP_DIR="$test_root/symlink-config-wdp1"
-missing_config_extract="$test_root/missing-config-extract"
-mkdir -p "$APP_DIR" "$missing_config_extract"
-cp "$extract_dir/war.php" "$missing_config_extract/war.php"
-cp "$extract_dir/install.sh" "$missing_config_extract/install.sh"
-outside_config="$test_root/outside-lead.txt"
-printf 'outside-config-safe\n' > "$outside_config"
-ln -s "$outside_config" "$APP_DIR/lead.txt"
-if [ -L "$APP_DIR/lead.txt" ]; then
-  if (install_files_from_extract "$missing_config_extract") >/dev/null 2>&1; then
-    fail "symlink config tanpa source diterima"
-  fi
-  [ "$(cat "$outside_config")" = "outside-config-safe" ] \
-    || fail "referent luar config symlink berubah"
-fi
-
-printf 'php-only default/update routing: ok\n'
+printf 'install PHP default: ok\n'

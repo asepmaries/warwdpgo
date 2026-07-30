@@ -69,7 +69,7 @@ register_shutdown_function(function () use (&$LOG_FH) {
 //           POSITIF = fire SETELAH war start (telat).
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
-const INQUIRY_STAGGER_MS     = 25;           // 10 slot mencakup 252ms; tidak memakai akhir_lead.txt.
+const INQUIRY_STAGGER_MS     = 20;           // 10 slot mencakup 252ms; tidak memakai akhir_lead.txt.
 const SCHEDULER_ARM_LEAD_MS  = 100;          // Scheduler mengambil alih 100ms sebelum slot pertama.
 const MIN_DISPATCH_GAP_MS    = 8;            // Hindari request menumpuk bila host sempat stall.
 const MINI_PROBE2_LEAD_MS    = 2500;         // Beri provider lambat waktu cukup untuk mengisi TLS pool.
@@ -761,7 +761,7 @@ function saveCaptchaToken(string $token): void {
 
 // ----------------------------------------------------------------------
 // CLASSIFY RESPONSE INQUIRY
-// Status "retry" hanya label klasifikasi agar sama dengan war.go.
+// Status "retry" hanya label klasifikasi respons.
 // runStaggeredInquiry tetap single-shot dan tidak mengirim inquiry ulang.
 // Return: ['status' => 'success'|'stop'|'user_invalid'|'skip_user'|'region_block'|'retry'|'unknown', 'orderId' => ?string]
 // ----------------------------------------------------------------------
@@ -773,8 +773,8 @@ function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload)
         }
     }
 
-    // war.go mencocokkan pola terhadap seluruh response body, bukan hanya
-    // pesan error yang berhasil diekstrak.
+    // Cocokkan pola terhadap seluruh response body, bukan hanya pesan error
+    // yang berhasil diekstrak.
     $payloadText = is_array($payload)
         ? json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
         : '';

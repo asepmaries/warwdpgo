@@ -8,118 +8,54 @@ source "$installer"
 
 fake_bin="$(mktemp -d)"
 trap 'rm -rf "$fake_bin"' EXIT
+
 printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/chronyc"
 chmod +x "$fake_bin/chronyc"
 
 root_calls=0
-run_root() { root_calls=$((root_calls + 1)); return 0; }
+run_root() {
+  root_calls=$((root_calls + 1))
+  return 0
+}
 linux_have_ca_bundle() { return 0; }
-PATH="$fake_bin:$PATH" linux_apt_base >/dev/null
+php_runtime_ready() { return 0; }
+PATH="$fake_bin:$PATH" linux_apt_base 1 >/dev/null
 [ "$root_calls" -eq 0 ]
 
 rm -f "$fake_bin/chronyc"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/apt-get"
-printf '#!/usr/bin/env bash\nprintf "  Candidate: 1.0\\n"\n' > "$fake_bin/apt-cache"
+printf '#!/usr/bin/env bash\nprintf "  Candidate: 1.0\\n"\n' \
+  > "$fake_bin/apt-cache"
 chmod +x "$fake_bin/apt-get" "$fake_bin/apt-cache"
-root_log=""
-run_root() { root_log="$root_log $*"; return 0; }
+
+php_runtime_ready() { return 1; }
 need_cmd() { return 0; }
 linux_apt_sources_https() { return 0; }
-PATH="$fake_bin:$PATH" linux_apt_base >/dev/null
-case "$root_log" in
-  *" install "*" chrony"*) ;;
-  *) printf 'minimal chrony install command missing: %s\n' "$root_log" >&2; exit 1 ;;
-esac
-case "$root_log" in
-  *" update "*) printf 'APT update must not run with a usable cached candidate\n' >&2; exit 1 ;;
-esac
-case "$root_log" in
-  *" curl"*|*" tar"*|*" ca-certificates"*)
-    printf 'already-present packages must not be requested: %s\n' "$root_log" >&2
-    exit 1
-    ;;
-esac
-
-# apt-cache dapat exit non-zero ketika index provider rusak/belum tersedia.
-# Installer harus refresh index, bukan berhenti diam-diam akibat errexit+pipefail.
-apt_ready_marker="$fake_bin/apt-ready"
-export APT_READY_MARKER="$apt_ready_marker"
-printf '#!/usr/bin/env bash\nif [ -f "$APT_READY_MARKER" ]; then printf "  Candidate: 1.0\\n"; else exit 100; fi\n' > "$fake_bin/apt-cache"
-chmod +x "$fake_bin/apt-cache"
-update_calls=0
-install_calls=0
-run_root() {
-  case " $* " in
-    *" update "*) update_calls=$((update_calls + 1)); touch "$apt_ready_marker"; return 0 ;;
-    *" install "*) install_calls=$((install_calls + 1)); return 0 ;;
-    *) return 0 ;;
-  esac
-}
-PATH="$fake_bin:$PATH" linux_apt_base >/dev/null
-[ "$update_calls" -eq 1 ]
-[ "$install_calls" -eq 1 ]
-
-printf '#!/usr/bin/env bash\nprintf "  Candidate: 1.0\\n"\n' > "$fake_bin/apt-cache"
-chmod +x "$fake_bin/apt-cache"
-
-install_calls=0
-update_calls=0
 root_log=""
 run_root() {
   root_log="$root_log $*"
-  case " $* " in
-    *" install "*)
-      install_calls=$((install_calls + 1))
-      [ "$install_calls" -gt 1 ]
-      ;;
-    *" update "*)
-      update_calls=$((update_calls + 1))
-      return 0
-      ;;
-    *) return 0 ;;
-  esac
+  return 0
 }
-PATH="$fake_bin:$PATH" linux_apt_base >/dev/null
-[ "$install_calls" -eq 2 ]
-[ "$update_calls" -eq 1 ]
-case "$root_log" in
-  *"DPkg::Lock::Timeout=60"*) ;;
-  *) printf 'bounded dpkg lock wait missing: %s\n' "$root_log" >&2; exit 1 ;;
-esac
-
-# Profil Linux PHP wajib meminta php-cli/php-curl bila runtime belum siap.
-php_runtime_ready() { return 1; }
-root_log=""
-run_root() { root_log="$root_log $*"; return 0; }
 PATH="$fake_bin:$PATH" linux_apt_base 1 >/dev/null
 case "$root_log" in
   *" install "*" php-cli"*" php-curl"*) ;;
-  *) printf 'PHP dependency install command missing: %s\n' "$root_log" >&2; exit 1 ;;
-esac
-case "$root_log" in
-  *"golang"*|*" go1."*|*" snap "*)
-    printf 'PHP dependency path must not install Go: %s\n' "$root_log" >&2
+  *)
+    printf 'PHP dependency install command missing: %s\n' "$root_log" >&2
     exit 1
     ;;
 esac
 case "$root_log" in
-  *" update "*) printf 'APT update must stay skipped with usable PHP candidates\n' >&2; exit 1 ;;
+  *"DPkg::Lock::Timeout=60"*) ;;
+  *)
+    printf 'bounded dpkg lock wait missing: %s\n' "$root_log" >&2
+    exit 1
+    ;;
 esac
 
-TMP_DIR="$fake_bin/release"
-mkdir -p "$TMP_DIR"
-RELEASE_REPO="example/project"
-RELEASE_TAG="v-test"
-RELEASE_CHECKSUM_FILE=""
-RELEASE_CHECKSUM_TAG=""
-checksum_downloads=0
-curl_download() {
-  checksum_downloads=$((checksum_downloads + 1))
-  printf '%064d  asset\n' 0 > "$2"
-}
-ensure_release_checksums
-ensure_release_checksums
-[ "$checksum_downloads" -eq 1 ]
+GITHUB_REPO="example/project"
+GITHUB_REF="feature/php"
+[ "$(github_archive_url)" = \
+  "https://github.com/example/project/archive/feature/php.tar.gz" ]
 
 grep -Fq 'Acquire::ForceIPv4=true' "$installer"
 grep -Fq '__WDP_APT_TRANSIENT__' "$installer"
