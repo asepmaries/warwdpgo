@@ -26,7 +26,7 @@ GITHUB_REF="${GITHUB_REF:-main}"
 # bersifat versioned; checksum tidak diambil dari jaringan dan wajib cocok.
 RUNTIME_BUNDLE_REPO="${RUNTIME_BUNDLE_REPO:-asepmaries/warwdpgo}"
 RUNTIME_BUNDLE_VERSION="v3"
-RUNTIME_BUNDLE_RELEASE_TAG="runtime-ubuntu24-v3.0.0"
+RUNTIME_BUNDLE_RELEASE_TAG="runtime-ubuntu24-amd64-v3"
 RUNTIME_BUNDLE_ARCHIVE="runtime-ubuntu24-amd64-v3.tar.gz"
 RUNTIME_BUNDLE_SHA256="1bf80c485efe1b929936bff4c3ae359c2bc45119b18788d5b8a3cbe015d714b4"
 RUNTIME_BUNDLE_SIZE_BYTES="36132390"

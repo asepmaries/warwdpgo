@@ -9,7 +9,7 @@ agar update aplikasi tidak memerlukan download ulang runtime 35 MiB.
 
 ## Release production AMD64 v3
 
-- Tag: `runtime-ubuntu24-v3.0.0`
+- Tag: `runtime-ubuntu24-amd64-v3`
 - Asset: `runtime-ubuntu24-amd64-v3.tar.gz`
 - Ukuran: 36,132,390 byte (34.46 MiB)
 - SHA-256: `1bf80c485efe1b929936bff4c3ae359c2bc45119b18788d5b8a3cbe015d714b4`
