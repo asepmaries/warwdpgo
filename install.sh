@@ -6,7 +6,8 @@
 # Linux  : paket utama di $HOME + salinan di $HOME/wdp1
 # macOS  : paket utama di $HOME + salinan di $HOME/wdp1
 #
-# Sumber paket selalu arsip repository GitHub.
+# Aplikasi berasal dari arsip repository GitHub. Ubuntu 24.04 AMD64 memakai
+# runtime bundle GitHub Release yang versioned dan checksum-pinned.
 #
 # Jalankan:
 #   bash install.sh
@@ -21,8 +22,24 @@ set -Eeuo pipefail
 GITHUB_REPO="${GITHUB_REPO:-asepmaries/warwdpgo}"
 GITHUB_REF="${GITHUB_REF:-main}"
 
+# Runtime bundle production untuk fast path Ubuntu 24.04 AMD64. Asset release
+# bersifat versioned; checksum tidak diambil dari jaringan dan wajib cocok.
+RUNTIME_BUNDLE_REPO="${RUNTIME_BUNDLE_REPO:-asepmaries/warwdpgo}"
+RUNTIME_BUNDLE_VERSION="v3"
+RUNTIME_BUNDLE_RELEASE_TAG="runtime-ubuntu24-v3"
+RUNTIME_BUNDLE_ARCHIVE="runtime-ubuntu24-amd64-v3.tar.gz"
+RUNTIME_BUNDLE_SHA256="1bf80c485efe1b929936bff4c3ae359c2bc45119b18788d5b8a3cbe015d714b4"
+RUNTIME_BUNDLE_SIZE_BYTES="36132390"
+RUNTIME_BUNDLE_URL="${RUNTIME_BUNDLE_URL:-https://github.com/$RUNTIME_BUNDLE_REPO/releases/download/$RUNTIME_BUNDLE_RELEASE_TAG/$RUNTIME_BUNDLE_ARCHIVE}"
+RUNTIME_BUNDLE_FILE="${RUNTIME_BUNDLE_FILE:-}"
+RUNTIME_BUNDLE_DOWNLOAD_TIMEOUT_SEC="${RUNTIME_BUNDLE_DOWNLOAD_TIMEOUT_SEC:-60}"
+RUNTIME_BUNDLE_INSTALL_TIMEOUT_SEC="${RUNTIME_BUNDLE_INSTALL_TIMEOUT_SEC:-90}"
+RUNTIME_BUNDLE_CACHE_ROOT="/var/cache/warwdpgo"
+RUNTIME_BUNDLE_READY_FILE="/var/lib/warwdpgo/runtime-ready"
+RUNTIME_BUNDLE_LEGACY_READY_FILE="/var/lib/warwdpgo-experiment/runtime-ready"
+
 # Policy kesehatan clock. Unit correction/error adalah detik; skew adalah ppm.
-CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-120}"
+CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-30}"
 CLOCK_WAIT_INTERVAL_SEC="${CLOCK_WAIT_INTERVAL_SEC:-1}"
 CLOCK_MAX_CORRECTION_SEC="${CLOCK_MAX_CORRECTION_SEC:-0.005}"
 CLOCK_MAX_RMS_SEC="${CLOCK_MAX_RMS_SEC:-0.010}"
@@ -39,6 +56,7 @@ CLOCK_GATE_PASSED=0
 PACKAGE_WAR_SHA256=""
 TMP_DIR=""
 EXTRACT_DIR=""
+RUNTIME_TMP_DIR=""
 
 # ----------------------------------------------------------------------
 # Util
@@ -163,6 +181,11 @@ parse_args() {
         shift
         GITHUB_REF="$1"
         ;;
+      --runtime-bundle-file)
+        [ $# -ge 2 ] || die "--runtime-bundle-file membutuhkan FILE"
+        shift
+        RUNTIME_BUNDLE_FILE="$1"
+        ;;
       --force|-f)
         FORCE_OVERWRITE=1
         ;;
@@ -182,6 +205,8 @@ Usage: bash install.sh [options]
   --clock-only          Linux: install/start chrony lalu tunggu clock sehat
   --verify-clock        Linux: verifikasi clock tanpa mengubah paket
   --github-ref REF      Branch, tag, atau commit GitHub (default: main)
+  --runtime-bundle-file FILE
+                        Ubuntu 24 AMD64: gunakan bundle lokal, tanpa download
   --force, -f           Overwrite config lokal
   --app-dir DIR         Direktori utama (default: HOME; Termux:/sdcard/wdp)
   --help, -h            Bantuan
@@ -191,6 +216,8 @@ sistem. Paket disalin ke APP_DIR dan APP_DIR/wdp1.
 
 Env:
   GITHUB_REPO / GITHUB_REF
+  RUNTIME_BUNDLE_REPO / RUNTIME_BUNDLE_URL / RUNTIME_BUNDLE_FILE
+  RUNTIME_BUNDLE_DOWNLOAD_TIMEOUT_SEC / RUNTIME_BUNDLE_INSTALL_TIMEOUT_SEC
   CLOCK_WAIT_TRIES / CLOCK_WAIT_INTERVAL_SEC
   CLOCK_MAX_CORRECTION_SEC / CLOCK_MAX_RMS_SEC
   CLOCK_MAX_SKEW_PPM / CLOCK_MAX_ERROR_SEC
@@ -253,8 +280,8 @@ curl_download() {
   retry_flags="$(curl_retry_extra_flags)"
   # shellcheck disable=SC2086
   curl --fail --location --silent --show-error \
-    --retry 3 --retry-delay 1 $retry_flags \
-    --connect-timeout 15 --max-time 180 \
+    --retry 2 --retry-delay 1 $retry_flags \
+    --connect-timeout 5 --max-time 30 \
     --proto '=https' --tlsv1.2 \
     "$url" -o "$dest"
 }
@@ -642,6 +669,216 @@ linux_set_timezone() {
   ok "Timezone Asia/Jakarta aktif"
 }
 
+linux_is_ubuntu24() {
+  local identity
+  [ -r /etc/os-release ] || return 1
+  identity="$(
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf '%s:%s' "${ID:-}" "${VERSION_ID:-}"
+  )"
+  [ "$identity" = "ubuntu:24.04" ]
+}
+
+linux_dpkg_architecture() {
+  if command -v dpkg >/dev/null 2>&1; then
+    dpkg --print-architecture
+  else
+    case "$(uname -m 2>/dev/null || true)" in
+      x86_64) printf '%s\n' amd64 ;;
+      aarch64|arm64) printf '%s\n' arm64 ;;
+      *) printf '%s\n' unknown ;;
+    esac
+  fi
+}
+
+runtime_bundle_expected_marker() {
+  printf 'runtime-ubuntu24-amd64-%s\n' "$RUNTIME_BUNDLE_VERSION"
+}
+
+runtime_bundle_health_ready() {
+  php_runtime_ready \
+    && command -v curl >/dev/null 2>&1 \
+    && command -v tar >/dev/null 2>&1 \
+    && command -v sha256sum >/dev/null 2>&1 \
+    && command -v chronyc >/dev/null 2>&1
+}
+
+runtime_bundle_marker_ready() {
+  [ -r "$RUNTIME_BUNDLE_READY_FILE" ] \
+    && [ "$(cat "$RUNTIME_BUNDLE_READY_FILE" 2>/dev/null || true)" = \
+      "$(runtime_bundle_expected_marker)" ] \
+    && runtime_bundle_health_ready
+}
+
+write_runtime_bundle_marker() {
+  local marker_tmp
+  marker_tmp="$(mktemp)"
+  printf '%s\n' "$(runtime_bundle_expected_marker)" > "$marker_tmp"
+  if ! run_root install -D -m 0644 "$marker_tmp" \
+      "$RUNTIME_BUNDLE_READY_FILE"; then
+    rm -f -- "$marker_tmp"
+    die "Gagal menulis marker runtime production"
+  fi
+  rm -f -- "$marker_tmp"
+}
+
+cleanup_runtime_download() {
+  trap - EXIT
+  if [ -n "${RUNTIME_TMP_DIR:-}" ] && [ -d "${RUNTIME_TMP_DIR:-}" ]; then
+    rm -rf -- "$RUNTIME_TMP_DIR"
+  fi
+  RUNTIME_TMP_DIR=""
+}
+
+runtime_archive_entry_is_unsafe() {
+  local entry="$1"
+  case "$entry" in
+    /*|../*|*/../*|*/..)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+download_runtime_bundle() {
+  local dest="$1" timeout_sec="$RUNTIME_BUNDLE_DOWNLOAD_TIMEOUT_SEC"
+  require_positive_integer "RUNTIME_BUNDLE_DOWNLOAD_TIMEOUT_SEC" "$timeout_sec"
+
+  if [ -n "$RUNTIME_BUNDLE_FILE" ]; then
+    [ -f "$RUNTIME_BUNDLE_FILE" ] \
+      || die "Bundle lokal tidak ditemukan: $RUNTIME_BUNDLE_FILE"
+    cp "$RUNTIME_BUNDLE_FILE" "$dest" \
+      || die "Gagal menyalin bundle lokal"
+    ok "Bundle runtime dibaca dari file lokal"
+    return 0
+  fi
+
+  case "$RUNTIME_BUNDLE_URL" in
+    https://*) ;;
+    *) die "URL runtime bundle wajib HTTPS" ;;
+  esac
+
+  log "Download runtime bundle $RUNTIME_BUNDLE_VERSION"
+  printf '    URL: %s\n' "$RUNTIME_BUNDLE_URL"
+  need_cmd timeout
+  if command -v curl >/dev/null 2>&1; then
+    timeout "$timeout_sec" curl \
+      --fail --location --silent --show-error \
+      --retry 2 --retry-delay 1 --connect-timeout 5 \
+      --max-time "$timeout_sec" --proto '=https' --tlsv1.2 \
+      "$RUNTIME_BUNDLE_URL" -o "$dest" \
+      || die "Gagal download runtime bundle dengan curl"
+  elif command -v wget >/dev/null 2>&1; then
+    timeout "$timeout_sec" wget --quiet --https-only \
+      --timeout=15 --tries=2 -O "$dest" "$RUNTIME_BUNDLE_URL" \
+      || die "Gagal download runtime bundle dengan wget"
+  elif command -v python3 >/dev/null 2>&1; then
+    if ! timeout "$timeout_sec" \
+        python3 - "$RUNTIME_BUNDLE_URL" "$dest" <<'PY'
+import shutil
+import ssl
+import sys
+import urllib.request
+
+request = urllib.request.Request(
+    sys.argv[1], headers={"User-Agent": "warwdpgo-installer/1"}
+)
+with urllib.request.urlopen(
+    request, timeout=15, context=ssl.create_default_context()
+) as response, open(sys.argv[2], "wb") as output:
+    shutil.copyfileobj(response, output)
+PY
+    then
+      die "Gagal download runtime bundle dengan python3"
+    fi
+  else
+    die "Butuh curl, wget, atau python3 untuk download runtime bundle"
+  fi
+}
+
+linux_install_runtime_bundle() {
+  local archive actual_sha actual_size archive_listing top_dir entry
+  local expected_top install_root install_timeout
+
+  if runtime_bundle_marker_ready; then
+    log "Linux: runtime bundle $RUNTIME_BUNDLE_VERSION sudah sehat"
+    ok "Fast path runtime aktif (skip download dan APT)"
+    return 0
+  fi
+
+  if [ -r "$RUNTIME_BUNDLE_LEGACY_READY_FILE" ] \
+    && [ "$(cat "$RUNTIME_BUNDLE_LEGACY_READY_FILE" 2>/dev/null || true)" = \
+      "$RUNTIME_BUNDLE_VERSION" ] \
+    && runtime_bundle_health_ready; then
+    log "Adopsi runtime bundle $RUNTIME_BUNDLE_VERSION yang sudah terpasang"
+    write_runtime_bundle_marker
+    ok "Marker runtime production siap"
+    return 0
+  fi
+
+  [ "$(linux_dpkg_architecture)" = "amd64" ] \
+    || die "Runtime bundle Ubuntu 24 belum tersedia untuk arsitektur $(linux_dpkg_architecture)"
+  need_cmd mktemp
+  need_cmd tar
+  need_cmd sha256sum
+  need_cmd wc
+  install_timeout="$RUNTIME_BUNDLE_INSTALL_TIMEOUT_SEC"
+  require_positive_integer "RUNTIME_BUNDLE_INSTALL_TIMEOUT_SEC" "$install_timeout"
+
+  RUNTIME_TMP_DIR="$(mktemp -d)"
+  trap cleanup_runtime_download EXIT
+  archive="$RUNTIME_TMP_DIR/$RUNTIME_BUNDLE_ARCHIVE"
+  download_runtime_bundle "$archive"
+
+  actual_size="$(wc -c < "$archive" | tr -d '[:space:]')"
+  [ "$actual_size" = "$RUNTIME_BUNDLE_SIZE_BYTES" ] \
+    || die "Ukuran runtime bundle berbeda: $actual_size byte"
+  actual_sha="$(sha256sum "$archive" | awk '{print $1}')"
+  [ "$actual_sha" = "$RUNTIME_BUNDLE_SHA256" ] \
+    || die "Checksum runtime bundle berbeda"
+  ok "Ukuran dan SHA-256 runtime bundle valid"
+
+  archive_listing="$(tar -tzf "$archive")" \
+    || die "Runtime bundle bukan tar.gz yang valid"
+  [ -n "$archive_listing" ] || die "Runtime bundle kosong"
+  top_dir="${archive_listing%%/*}"
+  expected_top="runtime-ubuntu24-amd64-$RUNTIME_BUNDLE_VERSION"
+  [ "$top_dir" = "$expected_top" ] \
+    || die "Root directory runtime bundle tidak valid: $top_dir"
+  while IFS= read -r entry; do
+    runtime_archive_entry_is_unsafe "$entry" \
+      && die "Path tidak aman di runtime bundle: $entry"
+    case "$entry" in
+      "$top_dir"|"$top_dir/"|"$top_dir/"*) ;;
+      *) die "Runtime bundle memiliki lebih dari satu root directory" ;;
+    esac
+  done <<< "$archive_listing"
+
+  install_root="$RUNTIME_BUNDLE_CACHE_ROOT/$top_dir"
+  run_root install -d -m 0755 "$RUNTIME_BUNDLE_CACHE_ROOT"
+  run_root rm -rf -- "$install_root"
+  run_root tar -xzf "$archive" -C "$RUNTIME_BUNDLE_CACHE_ROOT"
+  run_root test -x "$install_root/install-runtime-bundle.sh" \
+    || die "Installer internal runtime tidak tersedia"
+
+  log "Install runtime dari repository lokal bundle"
+  run_root env \
+    CLOCK_BURST_ROUNDS=3 \
+    CLOCK_ROUND_TRIES=15 \
+    CLOCK_WAIT_INTERVAL_SEC=1 \
+    timeout "$install_timeout" \
+    "$install_root/install-runtime-bundle.sh" \
+    || die "Instalasi runtime bundle gagal/timeout"
+
+  runtime_bundle_health_ready \
+    || die "Runtime hasil bundle tidak memenuhi kebutuhan aplikasi"
+  write_runtime_bundle_marker
+  cleanup_runtime_download
+  ok "Runtime production siap: $expected_top"
+  printf '%s\n' "__WDP_RUNTIME_BUNDLE_READY__"
+}
+
 linux_apt_sources_https() {
   local source_file changed=0
   [ -d /etc/apt ] || return 0
@@ -830,8 +1067,8 @@ clock_tracking_is_healthy() {
       if (toupper($1) == "7F7F0101") fail("chrony memakai synthetic local reference")
       if (!numeric($3) || $3 < 1 || $3 > 15) fail("stratum invalid")
       if ($14 != "Normal") fail("leap status=" $14)
-      if (!numeric($5) || !numeric($7) || !numeric($10)
-        || !numeric($11) || !numeric($12)) {
+      if (!numeric($5) || !numeric($7) ||
+          !numeric($10) || !numeric($11) || !numeric($12)) {
         fail("field numerik invalid")
       }
       if (abs($5) > max_correction) fail("system correction melebihi batas")
@@ -896,7 +1133,11 @@ print_install_success() {
 }
 
 linux_prepare_clock() {
-  linux_apt_base "${1:-0}"
+  if linux_is_ubuntu24; then
+    linux_install_runtime_bundle
+  else
+    linux_apt_base "${1:-0}"
+  fi
   linux_set_timezone
   linux_start_chrony
 }
@@ -920,6 +1161,7 @@ LINUX/VPS siap
 
 Yang sudah dikonfigurasi:
   - PHP CLI + ekstensi cURL/JSON
+  - Ubuntu 24 AMD64: runtime bundle lokal $RUNTIME_BUNDLE_VERSION
   - timezone Asia/Jakarta + chrony fail-closed
   - paket tersedia di direktori utama dan wdp1
 

@@ -1,0 +1,7 @@
+ca-certificates
+curl
+tar
+coreutils
+php-cli
+php-curl
+chrony

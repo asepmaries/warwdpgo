@@ -60,7 +60,12 @@ GITHUB_REF="feature/php"
 grep -Fq 'Acquire::ForceIPv4=true' "$installer"
 grep -Fq '__WDP_APT_TRANSIENT__' "$installer"
 grep -Fq 'trap cleanup_download EXIT' "$installer"
-grep -Fq 'CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-120}"' "$installer"
+grep -Fq 'CLOCK_WAIT_TRIES="${CLOCK_WAIT_TRIES:-30}"' "$installer"
 grep -Fq 'CLOCK_WAIT_INTERVAL_SEC="${CLOCK_WAIT_INTERVAL_SEC:-1}"' "$installer"
+grep -Fq 'RUNTIME_BUNDLE_RELEASE_TAG="runtime-ubuntu24-v3"' "$installer"
+grep -Fq 'RUNTIME_BUNDLE_DOWNLOAD_TIMEOUT_SEC:-60' "$installer"
+grep -Fq 'RUNTIME_BUNDLE_INSTALL_TIMEOUT_SEC:-90' "$installer"
+grep -Fq 'linux_install_runtime_bundle' "$installer"
+grep -Fq -- '--connect-timeout 5 --max-time 30' "$installer"
 
 printf 'install performance guards: ok\n'

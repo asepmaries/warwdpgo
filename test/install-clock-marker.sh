@@ -60,4 +60,8 @@ assert_unhealthy_is_final waitsync "chronyc waitsync gagal/timeout"
 assert_unhealthy_is_final tracking "chronyc tracking gagal"
 assert_unhealthy_is_final policy "Metrik chrony di luar policy"
 
+healthy_tracking='05DF32CF,ntp.example,3,0,0.000001,0.000002,0.000003,1.0,0.1,20.0,0.004,0.002,1.0,Normal'
+printf '%s\n' "$healthy_tracking" | clock_tracking_is_healthy \
+  || { printf 'healthy chrony CSV rejected\n' >&2; exit 1; }
+
 printf 'install clock failure marker ordering: ok\n'
