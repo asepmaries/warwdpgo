@@ -13,7 +13,7 @@ fail() {
 }
 
 [ "$RUNTIME_BUNDLE_VERSION" = "v3" ] || fail "versi production bukan v3"
-[ "$RUNTIME_BUNDLE_RELEASE_TAG" = "runtime-ubuntu24-v3" ] \
+[ "$RUNTIME_BUNDLE_RELEASE_TAG" = "runtime-ubuntu24-v3.0.0" ] \
   || fail "tag release salah"
 [ "$RUNTIME_BUNDLE_ARCHIVE" = "runtime-ubuntu24-amd64-v3.tar.gz" ] \
   || fail "nama archive salah"
@@ -23,7 +23,7 @@ fail() {
   "1bf80c485efe1b929936bff4c3ae359c2bc45119b18788d5b8a3cbe015d714b4" ] \
   || fail "SHA-256 pinned salah"
 [ "$RUNTIME_BUNDLE_URL" = \
-  "https://github.com/asepmaries/warwdpgo/releases/download/runtime-ubuntu24-v3/runtime-ubuntu24-amd64-v3.tar.gz" ] \
+  "https://github.com/asepmaries/warwdpgo/releases/download/runtime-ubuntu24-v3.0.0/runtime-ubuntu24-amd64-v3.tar.gz" ] \
   || fail "URL release salah: $RUNTIME_BUNDLE_URL"
 [ "$(runtime_bundle_expected_marker)" = "runtime-ubuntu24-amd64-v3" ] \
   || fail "marker production salah"
