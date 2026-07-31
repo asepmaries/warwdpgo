@@ -65,3 +65,7 @@ path idempotent.
 - Clock gate adaptive membutuhkan maksimal tiga ronde burst pendek.
 - Smoke test entrypoint production dengan bundle lokal lulus dalam 11.881 detik
   pada VPS yang runtime-nya sudah terpasang; fast path berikutnya 1.455 detik.
+- Download dan install melalui release HTTPS publik tanpa token lulus dalam
+  15.317 detik pada VPS yang runtime-nya sudah terpasang.
+- Full install aplikasi dari `main` setelah runtime sehat lulus dalam 2.265
+  detik, termasuk dua salinan aplikasi dan strict clock gate.
