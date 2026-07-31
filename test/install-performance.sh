@@ -67,5 +67,7 @@ grep -Fq 'RUNTIME_BUNDLE_DOWNLOAD_TIMEOUT_SEC:-60' "$installer"
 grep -Fq 'RUNTIME_BUNDLE_INSTALL_TIMEOUT_SEC:-90' "$installer"
 grep -Fq 'linux_install_runtime_bundle' "$installer"
 grep -Fq -- '--connect-timeout 5 --max-time 30' "$installer"
+grep -Fq 'server 169.254.169.254 iburst prefer' "$installer"
+grep -Fq 'linux_configure_provider_ntp' "$installer"
 
 printf 'install performance guards: ok\n'

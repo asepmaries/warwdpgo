@@ -57,6 +57,8 @@ PACKAGE_WAR_SHA256=""
 TMP_DIR=""
 EXTRACT_DIR=""
 RUNTIME_TMP_DIR=""
+CHRONY_RESTART_REQUIRED=0
+CHRONY_PROVIDER_CONFIG_FILE="${CHRONY_PROVIDER_CONFIG_FILE:-/etc/chrony/conf.d/98-wdp-provider.conf}"
 
 # ----------------------------------------------------------------------
 # Util
@@ -692,6 +694,46 @@ linux_dpkg_architecture() {
   fi
 }
 
+linux_is_oci() {
+  local cloud_identity="" chassis_asset=""
+  if command -v cloud-id >/dev/null 2>&1; then
+    cloud_identity="$(cloud-id 2>/dev/null || true)"
+  fi
+  [ "$cloud_identity" = "oracle" ] && return 0
+
+  if [ -r /sys/class/dmi/id/chassis_asset_tag ]; then
+    chassis_asset="$(cat /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true)"
+  fi
+  [ "$chassis_asset" = "OracleCloud.com" ]
+}
+
+linux_configure_provider_ntp() {
+  local expected_config marker_tmp
+  CHRONY_RESTART_REQUIRED=0
+  linux_is_oci || return 0
+
+  expected_config='# OCI local NTP: managed, regional, and reachable inside the VCN.
+server 169.254.169.254 iburst prefer'
+  [ ! -L "$CHRONY_PROVIDER_CONFIG_FILE" ] \
+    || die "Menolak symlink konfigurasi provider NTP"
+  if [ -r "$CHRONY_PROVIDER_CONFIG_FILE" ] \
+    && [ "$(cat "$CHRONY_PROVIDER_CONFIG_FILE")" = "$expected_config" ]; then
+    ok "OCI local NTP sudah dikonfigurasi"
+    return 0
+  fi
+
+  marker_tmp="$(mktemp)"
+  printf '%s\n' "$expected_config" > "$marker_tmp"
+  if ! run_root install -D -m 0644 "$marker_tmp" \
+      "$CHRONY_PROVIDER_CONFIG_FILE"; then
+    rm -f -- "$marker_tmp"
+    die "Gagal menulis konfigurasi OCI local NTP"
+  fi
+  rm -f -- "$marker_tmp"
+  CHRONY_RESTART_REQUIRED=1
+  ok "OCI local NTP aktif: 169.254.169.254"
+}
+
 runtime_bundle_expected_marker() {
   printf 'runtime-ubuntu24-amd64-%s\n' "$RUNTIME_BUNDLE_VERSION"
 }
@@ -1010,7 +1052,7 @@ linux_apt_base() {
 }
 
 linux_start_chrony() {
-  local unit started=0
+  local unit started=0 started_unit=""
   log "Linux: enable dan start chrony"
 
   if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
@@ -1024,19 +1066,32 @@ linux_start_chrony() {
         run_root systemctl enable --now "$unit" \
           || die "Gagal enable/start $unit"
         started=1
+        started_unit="$unit"
         break
       fi
     done
   elif command -v service >/dev/null 2>&1; then
     if run_root service chrony start >/dev/null 2>&1; then
       started=1
+      started_unit="chrony"
     elif run_root service chronyd start >/dev/null 2>&1; then
       started=1
+      started_unit="chronyd"
     fi
   fi
 
   [ "$started" -eq 1 ] \
     || die "Service chrony/chronyd tidak dapat dimulai"
+
+  if [ "$CHRONY_RESTART_REQUIRED" -eq 1 ]; then
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+      run_root systemctl restart "$started_unit" \
+        || die "Gagal restart $started_unit setelah config provider"
+    else
+      run_root service "$started_unit" restart \
+        || die "Gagal restart $started_unit setelah config provider"
+    fi
+  fi
   ok "Daemon chrony aktif"
 
   run_root chronyc -a online >/dev/null 2>&1 \
@@ -1139,6 +1194,7 @@ linux_prepare_clock() {
     linux_apt_base "${1:-0}"
   fi
   linux_set_timezone
+  linux_configure_provider_ntp
   linux_start_chrony
 }
 

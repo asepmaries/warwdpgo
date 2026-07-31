@@ -62,6 +62,10 @@ path idempotent.
 - PHP 8.3.6, cURL, JSON, OpenSSL, chrony, dan clock gate terverifikasi.
 - Log instalasi tidak memuat URL HTTP/HTTPS; APT target hanya membaca `file:`.
 - `acquisitionport 123` memungkinkan NTP pada firewall stateless.
+- OCI memakai layanan NTP lokal `169.254.169.254` secara otomatis agar strict
+  error bound tidak bergantung pada delay/dispersion sumber NTP publik.
+- Pada uji OCI, error bound turun dari 59.238 ms (NTP publik) menjadi 0.705 ms;
+  mode `--clock-only` lulus strict gate dalam 9.049 detik.
 - Clock gate adaptive membutuhkan maksimal tiga ronde burst pendek.
 - Smoke test entrypoint production dengan bundle lokal lulus dalam 11.881 detik
   pada VPS yang runtime-nya sudah terpasang; fast path berikutnya 1.455 detik.
