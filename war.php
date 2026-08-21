@@ -889,7 +889,7 @@ function buildInquiryHeaders(string $captchaToken): array {
 function buildInquiryBody(array $order): array {
     return [
         'productId' => 19,
-        'productItemId' => 2434,
+        'productItemId' => 366,
         'data' => ['userId' => $order['userId'], 'zoneId' => $order['serverId']],
         'paymentChannelId' => 73,
         'phoneNumber' => '628783219212',
