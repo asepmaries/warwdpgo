@@ -11,6 +11,15 @@ fail() {
   exit 1
 }
 
+case " ${PHP_CORE_FILES[*]} " in
+  *" dm.php "*) ;;
+  *) fail "dm.php belum terdaftar sebagai file inti" ;;
+esac
+case " ${CONFIG_FILES[*]} " in
+  *" user_server_dm.txt "*) ;;
+  *) fail "user_server_dm.txt belum terdaftar sebagai config" ;;
+esac
+
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 extract_dir="$test_root/extract"
@@ -128,8 +137,9 @@ IS_TERMUX=1
 archive_root="$test_root/archive/warwdpgo-main"
 fixture_archive="$test_root/github-source.tar.gz"
 mkdir -p "$archive_root"
-cp "$repo_root/war.php" "$archive_root/war.php"
-cp "$repo_root/install.sh" "$archive_root/install.sh"
+for file in "${PHP_CORE_FILES[@]}"; do
+  cp "$repo_root/$file" "$archive_root/$file"
+done
 for file in "${CONFIG_FILES[@]}"; do
   cp "$repo_root/$file" "$archive_root/$file"
 done
@@ -148,6 +158,10 @@ download_package >/dev/null
   || fail "URL GitHub salah: $downloaded_url"
 [ -f "$EXTRACT_DIR/war.php" ] \
   || fail "arsip GitHub tidak diekstrak"
+[ -f "$EXTRACT_DIR/dm.php" ] \
+  || fail "dm.php tidak diekstrak dari arsip GitHub"
+[ -f "$EXTRACT_DIR/user_server_dm.txt" ] \
+  || fail "user_server_dm.txt tidak diekstrak dari arsip GitHub"
 cleanup_download
 
 MODE="auto"

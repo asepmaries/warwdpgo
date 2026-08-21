@@ -21,11 +21,13 @@ const PROJECT_ROOT = __DIR__;
 const REQUIRED_PROJECT_FILES = [
     '.gitattributes',
     '.gitignore',
+    'dm.php',
     'install.sh',
     'lead.txt',
     'publish.php',
     'reload.txt',
     'target_srv.txt',
+    'user_server_dm.txt',
     'user_server_wdp.txt',
     'waktu.txt',
     'war.php',
@@ -177,6 +179,7 @@ function validateProject(): void
     }
 
     runCommand([PHP_BINARY, '-l', 'war.php']);
+    runCommand([PHP_BINARY, '-l', 'dm.php']);
     runCommand([PHP_BINARY, '-l', 'publish.php']);
     runCommand(['bash', '-n', 'install.sh']);
     foreach (TEST_FILES as $testFile) {

@@ -46,8 +46,8 @@ CLOCK_MAX_RMS_SEC="${CLOCK_MAX_RMS_SEC:-0.010}"
 CLOCK_MAX_SKEW_PPM="${CLOCK_MAX_SKEW_PPM:-100}"
 CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.050}"
 
-PHP_CORE_FILES=(war.php install.sh)
-CONFIG_FILES=(waktu.txt user_server_wdp.txt lead.txt reload.txt target_srv.txt)
+PHP_CORE_FILES=(war.php dm.php install.sh)
+CONFIG_FILES=(waktu.txt user_server_wdp.txt user_server_dm.txt lead.txt reload.txt target_srv.txt)
 
 FORCE_OVERWRITE=0
 APP_DIR_EXPLICIT=0
@@ -203,7 +203,7 @@ Usage: bash install.sh [options]
 
   (default)             Install PHP
   --menu, -m            Tampilkan menu pilihan
-  --update, -u          Sync war.php dan config dari GitHub
+  --update, -u          Sync script PHP dan config dari GitHub
   --clock-only          Linux: install/start chrony lalu tunggu clock sehat
   --verify-clock        Linux: verifikasi clock tanpa mengubah paket
   --github-ref REF      Branch, tag, atau commit GitHub (default: main)
@@ -322,7 +322,7 @@ archive_entry_is_unsafe() {
 download_package() {
   local tmp_dir archive_file extract_dir archive_url entry required
   local archive_listing
-  local -a required_files=(war.php install.sh)
+  local -a required_files=("${PHP_CORE_FILES[@]}")
 
   need_cmd curl
   need_cmd tar
@@ -497,7 +497,7 @@ verify_php_runtime() {
 }
 
 verify_php_install_dir() {
-  local verify_dir="$1" required installed_war_sha
+  local verify_dir="$1" required php_file installed_war_sha
   [ -d "$verify_dir" ] && [ -w "$verify_dir" ] \
     || die "Folder aplikasi tidak writable: $verify_dir"
   for required in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}"; do
@@ -506,10 +506,12 @@ verify_php_install_dir() {
     [ -f "$verify_dir/$required" ] \
       || die "Verify paket PHP gagal: $verify_dir/$required tidak ada"
   done
-  [ -s "$verify_dir/war.php" ] \
-    || die "Verify PHP gagal: $verify_dir/war.php kosong"
-  php -l "$verify_dir/war.php" >/dev/null \
-    || die "Syntax war.php tidak valid: $verify_dir/war.php"
+  for php_file in war.php dm.php; do
+    [ -s "$verify_dir/$php_file" ] \
+      || die "Verify PHP gagal: $verify_dir/$php_file kosong"
+    php -l "$verify_dir/$php_file" >/dev/null \
+      || die "Syntax $php_file tidak valid: $verify_dir/$php_file"
+  done
   is_sha256 "${PACKAGE_WAR_SHA256:-}" \
     || die "Checksum war.php paket tidak tersedia saat verifikasi"
   installed_war_sha="$(file_sha256 "$verify_dir/war.php")" \
@@ -1296,7 +1298,7 @@ show_menu() {
   GitHub   : $GITHUB_REPO@$GITHUB_REF
 ============================================================
   1) Full install PHP
-  2) Update war.php + config dari GitHub
+  2) Update script PHP + config dari GitHub
   3) Force overwrite config + full install PHP
   4) Setup + verifikasi chrony (Linux/VPS)
   0) Keluar
