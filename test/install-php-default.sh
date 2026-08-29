@@ -15,9 +15,17 @@ case " ${PHP_CORE_FILES[*]} " in
   *" dm.php "*) ;;
   *) fail "dm.php belum terdaftar sebagai file inti" ;;
 esac
+case " ${PHP_CORE_FILES[*]} " in
+  *" ff.php "*) ;;
+  *) fail "ff.php belum terdaftar sebagai file inti" ;;
+esac
 case " ${CONFIG_FILES[*]} " in
   *" user_server_dm.txt "*) ;;
   *) fail "user_server_dm.txt belum terdaftar sebagai config" ;;
+esac
+case " ${CONFIG_FILES[*]} " in
+  *" user_server_ff.txt "*) ;;
+  *) fail "user_server_ff.txt belum terdaftar sebagai config" ;;
 esac
 
 test_root="$(mktemp -d)"
@@ -160,8 +168,12 @@ download_package >/dev/null
   || fail "arsip GitHub tidak diekstrak"
 [ -f "$EXTRACT_DIR/dm.php" ] \
   || fail "dm.php tidak diekstrak dari arsip GitHub"
+[ -f "$EXTRACT_DIR/ff.php" ] \
+  || fail "ff.php tidak diekstrak dari arsip GitHub"
 [ -f "$EXTRACT_DIR/user_server_dm.txt" ] \
   || fail "user_server_dm.txt tidak diekstrak dari arsip GitHub"
+[ -f "$EXTRACT_DIR/user_server_ff.txt" ] \
+  || fail "user_server_ff.txt tidak diekstrak dari arsip GitHub"
 cleanup_download
 
 MODE="auto"

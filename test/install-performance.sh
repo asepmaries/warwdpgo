@@ -10,7 +10,8 @@ fake_bin="$(mktemp -d)"
 trap 'rm -rf "$fake_bin"' EXIT
 
 printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/chronyc"
-chmod +x "$fake_bin/chronyc"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fake_bin/timeout"
+chmod +x "$fake_bin/chronyc" "$fake_bin/timeout"
 
 root_calls=0
 run_root() {

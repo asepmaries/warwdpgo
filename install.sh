@@ -46,8 +46,8 @@ CLOCK_MAX_RMS_SEC="${CLOCK_MAX_RMS_SEC:-0.010}"
 CLOCK_MAX_SKEW_PPM="${CLOCK_MAX_SKEW_PPM:-100}"
 CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.050}"
 
-PHP_CORE_FILES=(war.php dm.php install.sh)
-CONFIG_FILES=(waktu.txt user_server_wdp.txt user_server_dm.txt lead.txt reload.txt target_srv.txt)
+PHP_CORE_FILES=(war.php dm.php ff.php install.sh)
+CONFIG_FILES=(waktu.txt user_server_wdp.txt user_server_dm.txt user_server_ff.txt lead.txt reload.txt target_srv.txt)
 
 FORCE_OVERWRITE=0
 APP_DIR_EXPLICIT=0
@@ -506,7 +506,7 @@ verify_php_install_dir() {
     [ -f "$verify_dir/$required" ] \
       || die "Verify paket PHP gagal: $verify_dir/$required tidak ada"
   done
-  for php_file in war.php dm.php; do
+  for php_file in war.php dm.php ff.php; do
     [ -s "$verify_dir/$php_file" ] \
       || die "Verify PHP gagal: $verify_dir/$php_file kosong"
     php -l "$verify_dir/$php_file" >/dev/null \
