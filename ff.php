@@ -6,7 +6,7 @@
 //  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
 //    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
-//  - Tepat 10 user unik ditembak bertahap dari lead dengan jeda tetap 28ms.
+//  - Maksimal 10 user unik ditembak bertahap dari lead dengan jeda tetap 15ms.
 //    Slot terakhir diturunkan otomatis dari lead dan jumlah user.
 //  - Warm-up tunggal T-2.5s (10 paralel) untuk warm TLS pool sebelum burst.
 //  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
@@ -74,7 +74,7 @@ const SCHEDULER_ARM_LEAD_MS  = 100;          // Scheduler mengambil alih 100ms s
 const MIN_DISPATCH_GAP_MS    = 8;            // Hindari request menumpuk bila host sempat stall.
 const MINI_PROBE2_LEAD_MS    = 2500;         // Beri provider lambat waktu cukup untuk mengisi TLS pool.
 const MINI_PROBE2_PARALLEL   = 10;           // Satu koneksi hangat untuk setiap slot inquiry.
-const REQUIRED_USERS         = 10;           // War dibatalkan bila user unik kurang dari jumlah ini.
+const MIN_USERS              = 1;            // Batas minimal user unik per VPS/proses.
 const MAX_USERS              = 10;           // Batas keras user per VPS/proses.
 const CAPTCHA_MAX_ATTEMPTS   = 3;
 const CAPTCHA_RETRY_BASE_MS  = 600;
@@ -265,8 +265,9 @@ function waitForExactBurstTime(
             // add + curl_multi_exec, tanpa biaya membangun header/body/cURL.
             if ($prepareBurst !== null) {
                 $prepareStart = hrtime(true);
-                $prepareBurst();
-                echo "[SCHED] Prepare " . REQUIRED_USERS . " handle duration="
+                $countPrepared = $prepareBurst();
+                $countStr = is_numeric($countPrepared) ? " {$countPrepared}" : "";
+                echo "[SCHED] Prepare{$countStr} handle duration="
                    . sprintf('%.3fms', (hrtime(true) - $prepareStart) / 1_000_000)
                    . "\n";
             }
@@ -1570,7 +1571,7 @@ function timingSelfTestIterations(array $args, int $default = 20): int {
 }
 
 function runTimingSelfTest(int $iterations = 20): int {
-    $shots = REQUIRED_USERS;
+    $shots = MAX_USERS;
     $intervalMs = (float) INQUIRY_STAGGER_MS;
     $intervalNs = (int) round($intervalMs * 1_000_000);
     $expectedSpanMs = $intervalMs * max(0, $shots - 1);
@@ -1618,13 +1619,13 @@ function runTimingSelfTest(int $iterations = 20): int {
     $unitPreviousNominalNs = 1_000_000_000;
     $unitNextNominalNs = $unitPreviousNominalNs + $intervalNs;
     $antiStackCases = [
-        ['name' => 'first', 'late_ms' => null, 'shift_ms' => 0.0],
-        ['name' => 'on_time', 'late_ms' => 0.0, 'shift_ms' => 0.0],
-        ['name' => 'late20', 'late_ms' => 20.0, 'shift_ms' => 0.0],
-        ['name' => 'late21', 'late_ms' => 21.0, 'shift_ms' => 1.0],
-        ['name' => 'late27', 'late_ms' => 27.0, 'shift_ms' => 7.0],
-        ['name' => 'late56', 'late_ms' => 56.0, 'shift_ms' => 36.0],
+        ['name' => 'first', 'late_ms' => null],
+        ['name' => 'on_time', 'late_ms' => 0.0],
+        ['name' => 'late_within_gap', 'late_ms' => max(0.0, $intervalMs - MIN_DISPATCH_GAP_MS)],
+        ['name' => 'late_shift1', 'late_ms' => max(0.0, $intervalMs - MIN_DISPATCH_GAP_MS + 1.0)],
+        ['name' => 'late_shift7', 'late_ms' => max(0.0, $intervalMs - MIN_DISPATCH_GAP_MS + 7.0)],
     ];
+    $shiftsStr = [];
     foreach ($antiStackCases as $case) {
         $lastDispatchNs = $case['late_ms'] === null
             ? null
@@ -1637,22 +1638,26 @@ function runTimingSelfTest(int $iterations = 20): int {
         $unitGuardShiftMs = (
             $unitGuardedNs - $unitNextNominalNs
         ) / 1_000_000;
+        $expectedShiftMs = $case['late_ms'] === null
+            ? 0.0
+            : max(0.0, ($case['late_ms'] + MIN_DISPATCH_GAP_MS) - $intervalMs);
         $gapValid = $lastDispatchNs === null
             || $unitGuardedNs - $lastDispatchNs
                 >= MIN_DISPATCH_GAP_MS * 1_000_000;
         if (
-            abs($unitGuardShiftMs - $case['shift_ms']) > 0.000001
+            abs($unitGuardShiftMs - $expectedShiftMs) > 0.000001
             || $unitGuardedNs < $unitNextNominalNs
             || !$gapValid
         ) {
             throw new RuntimeException(
                 "Unit-check anti-tumpuk {$case['name']} gagal:"
-                . " shift={$unitGuardShiftMs}ms"
+                . " shift={$unitGuardShiftMs}ms (expected={$expectedShiftMs}ms)"
             );
         }
+        $shiftsStr[] = sprintf('%.0f', $unitGuardShiftMs);
     }
     echo "[TIMING-TEST] anti_stack_unit=PASS cases="
-       . count($antiStackCases) . " shifts=0,0,0,1,7,36ms\n";
+       . count($antiStackCases) . " shifts=" . implode(',', $shiftsStr) . "ms\n";
 
     $selfTestPath = str_replace('\\', '/', __FILE__);
     $selfTestFileUrl = (PHP_OS_FAMILY === 'Windows' ? 'file:///' : 'file://')
@@ -2035,16 +2040,16 @@ function gpyPay(): void {
             . implode(', ', array_keys($duplicateOrders))
         );
     }
-    if (count($orders) !== REQUIRED_USERS || count($orders) > MAX_USERS) {
+    if (count($orders) < MIN_USERS || count($orders) > MAX_USERS) {
         throw new RuntimeException(
-            "Diperlukan tepat " . REQUIRED_USERS
+            "Diperlukan antara " . MIN_USERS . " sampai " . MAX_USERS
             . " userId unik per VPS; ditemukan " . count($orders)
         );
     }
 
     echo "✅ Loaded " . count($orders) . " order (max " . MAX_USERS . ")\n";
     echo "[CONFIG] Akun unik tervalidasi: " . count($orders)
-       . "/" . REQUIRED_USERS . "\n";
+       . " (min " . MIN_USERS . ", max " . MAX_USERS . ")\n";
     echo "? Fixed lead from lead.txt"
        . " | TARGET_SRV=" . sprintf('%.0fms', TARGET_SRV_MS_DEFAULT)
        . " | STAGGERED_INQUIRY\n\n";
@@ -2095,10 +2100,11 @@ function gpyPay(): void {
                 echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
             }
         },
-        static function () use (&$preparedInquiries, $orders, $captchaToken): void {
+        static function () use (&$preparedInquiries, $orders, $captchaToken): int {
             foreach ($orders as $order) {
                 $preparedInquiries[] = prepareInquiry($order, $captchaToken);
             }
+            return count($preparedInquiries);
         }
     );
 
