@@ -348,13 +348,18 @@ function gpyPay(string $voucherCode): void {
     $orders = array_slice($orders, 0, 10);
 
     echo "✅ Loaded " . count($orders) . " order(s)\n";
-    $captchaTokens = getCaptchaTokens(count($orders));
+    if (empty($orders)) {
+        echo "Tidak ada order untuk diproses.\n";
+        return;
+    }
+    // Satu token dipakai bersama untuk seluruh order dalam batch ini.
+    $captchaToken = getCaptchaTokens(1)[0];
 
     $prepared = [];
     $totalOrders = count($orders);
     foreach ($orders as $index => $ord) {
         $no = $index + 1;
-        echo "[ORDER $no/$totalOrders] Menyiapkan request untuk {$ord['userId']} | {$ord['serverId']} dengan captcha ke-$no...\n";
+        echo "[ORDER $no/$totalOrders] Menyiapkan request untuk {$ord['userId']} | {$ord['serverId']} dengan captcha bersama...\n";
         $ua = getRandomUserAgent();
         $sentry = generateSentryTrace();
 
@@ -366,7 +371,7 @@ function gpyPay(string $voucherCode): void {
             'baggage' => $sentry['baggage'],
             'sentry-trace' => $sentry['sentry-trace'],
             'user-agent' => $ua['user-agent'],
-            'x-captcha-token' => $captchaTokens[$index],
+            'x-captcha-token' => $captchaToken,
             'content-type' => 'application/json',
             'x-client' => 'mobile',
             'accept' => '*/*',
@@ -394,7 +399,7 @@ function gpyPay(string $voucherCode): void {
         $prepared[] = ['headers' => $headers, 'body' => $body, 'order' => $ord];
     }
 
-    echo "\n✅ Semua request siap menggunakan captcha yang tersedia.\n";
+    echo "\n✅ Semua request siap menggunakan satu token captcha bersama.\n";
     echo "🚀 Langsung mengeksekusi inquiry tanpa menunggu waktu terjadwal.\n\n";
 
     // ===================== PARALLEL INQUIRY =====================
