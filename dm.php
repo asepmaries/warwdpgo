@@ -10,8 +10,6 @@ date_default_timezone_set('Asia/Jakarta');
 set_time_limit(0);
 ignore_user_abort(true);
 
-const CAPTCHA_FILE = 'captchadm.txt';
-const CAPTCHA_FETCH_DELAY_MS = 450;
 const DEFAULT_VOUCHER_CODE = 'WARWDPGG';
 
 // ----------------------------------------------------------------------
@@ -188,61 +186,6 @@ function resolveVoucherCode(array $argv): string {
     return $voucher;
 }
 
-function loadSavedCaptchaTokens(): array {
-    if (!file_exists(CAPTCHA_FILE)) {
-        return [];
-    }
-
-    $lines = file(CAPTCHA_FILE, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    if ($lines === false) {
-        return [];
-    }
-
-    return array_values(array_filter(array_map('trim', $lines), static fn(string $token): bool => $token !== ''));
-}
-
-function saveCaptchaTokens(array $tokens): void {
-    if (empty($tokens)) {
-        return;
-    }
-
-    file_put_contents(CAPTCHA_FILE, implode(PHP_EOL, $tokens) . PHP_EOL);
-    echo "[CAPTCHA] " . count($tokens) . " token disimpan ke " . CAPTCHA_FILE . "\n";
-}
-
-function getCaptchaTokens(int $needed): array {
-    if ($needed <= 0) {
-        return [];
-    }
-
-    $tokens = loadSavedCaptchaTokens();
-    $available = count($tokens);
-
-    if ($available > 0) {
-        echo "[CAPTCHA] Ditemukan {$available} token di " . CAPTCHA_FILE . "\n";
-    }
-
-    if ($available >= $needed) {
-        echo "[CAPTCHA] Menggunakan {$needed} token yang sudah tersedia.\n";
-        return array_slice($tokens, 0, $needed);
-    }
-
-    $missing = $needed - $available;
-    echo "[CAPTCHA] Token tersedia kurang {$missing}, mengambil captcha baru...\n";
-
-    for ($i = 0; $i < $missing; $i++) {
-        $token = getFreshCaptchaToken();
-        $tokens[] = $token;
-
-        if ($i < $missing - 1) {
-            usleep(CAPTCHA_FETCH_DELAY_MS * 1000);
-        }
-    }
-
-    saveCaptchaTokens($tokens);
-    return array_slice($tokens, 0, $needed);
-}
-
 function getFreshCaptchaToken(): string {
     echo "[CAPTCHA] Mengambil token captcha baru dari Google...\n";
     $url = "https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o";
@@ -352,8 +295,8 @@ function gpyPay(string $voucherCode): void {
         echo "Tidak ada order untuk diproses.\n";
         return;
     }
-    // Satu token dipakai bersama untuk seluruh order dalam batch ini.
-    $captchaToken = getCaptchaTokens(1)[0];
+    // Ambil satu token baru setiap eksekusi untuk seluruh order dalam batch ini.
+    $captchaToken = getFreshCaptchaToken();
 
     $prepared = [];
     $totalOrders = count($orders);
