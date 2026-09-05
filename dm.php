@@ -299,10 +299,7 @@ function gpyPay(string $voucherCode): void {
     $captchaToken = getFreshCaptchaToken();
 
     $prepared = [];
-    $totalOrders = count($orders);
-    foreach ($orders as $index => $ord) {
-        $no = $index + 1;
-        echo "[ORDER $no/$totalOrders] Menyiapkan request untuk {$ord['userId']} | {$ord['serverId']} dengan captcha bersama...\n";
+    foreach ($orders as $ord) {
         $ua = getRandomUserAgent();
         $sentry = generateSentryTrace();
 
@@ -342,7 +339,6 @@ function gpyPay(string $voucherCode): void {
         $prepared[] = ['headers' => $headers, 'body' => $body, 'order' => $ord];
     }
 
-    echo "\n✅ Semua request siap menggunakan satu token captcha bersama.\n";
     echo "🚀 Langsung mengeksekusi inquiry tanpa menunggu waktu terjadwal.\n\n";
 
     // ===================== PARALLEL INQUIRY =====================
