@@ -209,7 +209,7 @@ Usage: bash install.sh [options]
   --github-ref REF      Branch, tag, atau commit GitHub (default: main)
   --runtime-bundle-file FILE
                         Ubuntu 24 AMD64: gunakan bundle lokal, tanpa download
-  --force, -f           Overwrite config lokal
+  --force, -f           Overwrite config lokal (reload.txt selalu diperbarui)
   --app-dir DIR         Direktori utama (default: HOME; Termux:/sdcard/wdp)
   --help, -h            Bantuan
 
@@ -424,7 +424,11 @@ install_files_from_extract() {
     copy_file_smart "$extract_dir/$file" "$target_dir/$file" 0
   done
   for file in "${CONFIG_FILES[@]}"; do
-    copy_file_smart "$extract_dir/$file" "$target_dir/$file" 1
+    if [ "$file" = "reload.txt" ]; then
+      copy_file_smart "$extract_dir/$file" "$target_dir/$file" 0
+    else
+      copy_file_smart "$extract_dir/$file" "$target_dir/$file" 1
+    fi
   done
 
   for file in "${CONFIG_FILES[@]}"; do
@@ -1263,7 +1267,7 @@ Update PHP selesai
   Paket utama : $APP_DIR
   Salinan wdp1: $WDP1_DIR
   Sumber       : GitHub $GITHUB_REPO@$GITHUB_REF
-  Config lokal dipertahankan; pakai --force untuk menggantinya.
+  reload.txt selalu diperbarui; config lain tetap kecuali memakai --force.
 ============================================================
 EOF
   print_install_success

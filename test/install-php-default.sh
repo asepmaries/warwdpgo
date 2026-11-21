@@ -122,9 +122,19 @@ for target in "$APP_DIR" "$WDP1_DIR"; do
 done
 
 printf 'config-lokal\n' > "$APP_DIR/waktu.txt"
+printf 'reload-lama\n' > "$APP_DIR/reload.txt"
+printf 'reload-lama-wdp1\n' > "$WDP1_DIR/reload.txt"
+printf 'war-lama\n' > "$APP_DIR/war.php"
 install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
+install_files_from_extract "$extract_dir" "$WDP1_DIR" >/dev/null
 [ "$(cat "$APP_DIR/waktu.txt")" = "config-lokal" ] \
   || fail "config lokal tertimpa tanpa --force"
+[ "$(cat "$APP_DIR/reload.txt")" = "config:reload.txt" ] \
+  || fail "reload.txt utama tidak diperbarui"
+[ "$(cat "$WDP1_DIR/reload.txt")" = "config:reload.txt" ] \
+  || fail "reload.txt wdp1 tidak diperbarui"
+[ "$(cat "$APP_DIR/war.php")" = "fixture:war.php" ] \
+  || fail "war.php utama tidak diperbarui"
 FORCE_OVERWRITE=1
 install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
 [ "$(cat "$APP_DIR/waktu.txt")" = "config:waktu.txt" ] \
