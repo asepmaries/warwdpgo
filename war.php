@@ -69,7 +69,7 @@ register_shutdown_function(function () use (&$LOG_FH) {
 //           POSITIF = fire SETELAH war start (telat).
 // Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
 const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
-const INQUIRY_STAGGER_MS     = 10;           // 10 slot mencakup 252ms; tidak memakai akhir_lead.txt.
+const INQUIRY_STAGGER_MS     = 20;           // 10 slot mencakup 252ms; tidak memakai akhir_lead.txt.
 const SCHEDULER_ARM_LEAD_MS  = 100;          // Scheduler mengambil alih 100ms sebelum slot pertama.
 const MIN_DISPATCH_GAP_MS    = 8;            // Hindari request menumpuk bila host sempat stall.
 const MINI_PROBE2_LEAD_MS    = 2500;         // Beri provider lambat waktu cukup untuk mengisi TLS pool.
@@ -681,17 +681,19 @@ function getFreshCaptchaToken(): string {
     $url = "https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o";
     $headers = [
         'sec-ch-ua-platform' => '"Android"',
-        'sec-ch-ua' => '"Android WebView";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
+        'user-agent' => 'Mozilla/5.0 (Linux; Android 13; SM-X700 Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.8103.50 Mobile Safari/537.36',
+        'sec-ch-ua' => '"Not-A.Brand";v="99", "Android WebView";v="157", "Chromium";v="157"',
         'content-type' => 'application/x-protobuffer',
         'sec-ch-ua-mobile' => '?1',
+        'accept' => '*/*',
         'origin' => 'https://www.google.com',
         'x-requested-with' => 'mark.via.gp',
         'sec-fetch-site' => 'same-origin',
         'sec-fetch-mode' => 'cors',
         'sec-fetch-dest' => 'empty',
-        'referer' => 'https://www.google.com/recaptcha/api2/anchor?ar=1&k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o&co=aHR0cHM6Ly9nb3BheS5jby5pZDo0NDM.&hl=en&v=79clEdOi5xQbrrpL2L8kGmK3&size=invisible&anchor-ms=20000&execute-ms=30000&cb=34spuflel6ax',
+        'referer' => 'https://www.google.com/recaptcha/api2/anchor?ar=1&k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o&co=aHR0cHM6Ly9nb3BheS5jby5pZDo0NDM.&hl=en&v=4i3aN5wAweL7i3ADI7BSX4B-&size=invisible&anchor-ms=20000&execute-ms=30000&ovv=CADq00gF&cb=4wgtvvffxogz',
         'accept-language' => 'en-US,en;q=0.9',
-        'cookie' => '_GRECAPTCHA=09AKhCRwjgcOklpqEngV5VzHCVLFDBttzjYVsQF9rHqCiF81J4gUV-koT2yYoYYMWQ65cGpZGNeDlgcD6AuDUHaXE; NID=530=KWlL-7aGLYQ7iV22k_iTZNjtlWxq7MMTpQq0u8sZfG2g5pM0duotIFiU3TGhRRcOdHcP6LZ4bYME6IegrhsnD0G9nKHB9cRSCGIRBj5W2Wyq8mVkj45oS7mt74yREaGoZGi_-AbUXLh2FE7NPNDvqLHmWFvEWrW_ZlapE-IZB7z36y_F6DCS_WYW5CRp6I_clI3zXw3f_XJAIVGOZJnq_UP7pDDvpsghYNmZCcgp96SxIonQxjlRKmrqaYFQ4FIwfCOHm36EKbA',
+        'cookie' => '_GRECAPTCHA=09AKhCRwig412Sinsks-swNMr3esXkLlnNjxA421fPn7UuqRB9ligadmBfSqi3AcgGO1bFgLp-oRgNIOIbGU1z9Dw; NID=Cp8CCAES0QEBM9Agl5f5KPhyJJl_9q1q-kmQnU8DE5w-ar-n5pEnpZ4eSUoTRY480PWuwlNzNJeDRXQ8A66236sPxxkXN_B_KHxqKMTRHX-506Y3fRb6w7NF99N6u_xk6WQ394XUr9jD6-0tmtexUxSVPLST0wDmxWoLvLakpL_os09LlukbfnKqiaFkRJF-j9iIHCbOlw5lknTrLEhbyn-jQ7r4i271foXMmzPCFbZUWzU07LlU10IQ7yI05O_jYnhtEQchXeRDlOyMQNSI02aZoDWDpoOQ6igBMkUBcEpCz0GeXDlrG9r96kWzKSq5O56WtEc70yBcA6Z5MVk7IEq-gs1nxjavSyZ0FbCw6bGuNClUmTLhSywSfjreC4_KOQ0',
     ];
     $reloadBody = file_get_contents('reload.txt');
     if ($reloadBody === false) {
@@ -753,6 +755,64 @@ function getFreshCaptchaToken(): string {
         "Gagal mengambil CAPTCHA setelah " . CAPTCHA_MAX_ATTEMPTS
         . " percobaan: {$lastError}"
     );
+}
+
+/**
+ * Satu replay reload.txt hanya mewakili satu sesi CAPTCHA. Untuk beberapa
+ * order, gunakan token dari sesi browser yang terpisah, sesuai urutan order.
+ */
+function getFreshCaptchaTokensForOrders(int $orderCount): array {
+    if ($orderCount < 1) {
+        return [];
+    }
+
+    if ($orderCount === 1) {
+        return [getFreshCaptchaToken()];
+    }
+
+    $tokensFile = __DIR__ . '/captcha_tokens.txt';
+    if (!is_file($tokensFile)) {
+        $handle = @fopen($tokensFile, 'x');
+        if ($handle === false) {
+            throw new RuntimeException('Gagal membuat captcha_tokens.txt');
+        }
+        fclose($handle);
+        chmod($tokensFile, 0600);
+        echo "[CAPTCHA] captcha_tokens.txt dibuat otomatis.\n";
+    }
+
+    $lines = file($tokensFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines === false) {
+        throw new RuntimeException('Gagal membaca captcha_tokens.txt');
+    }
+    if (count($lines) !== $orderCount) {
+        throw new RuntimeException(
+            "Butuh {$orderCount} token CAPTCHA dari sesi berbeda; "
+            . "captcha_tokens.txt berisi " . count($lines) . ". "
+            . "Satu HAR/reload.txt tidak menyediakan sesi tambahan."
+        );
+    }
+
+    $tokens = [];
+    $seen = [];
+    foreach ($lines as $orderIndex => $line) {
+        $token = trim($line);
+        if ($token === '' || preg_match('/\s/', $token)) {
+            throw new RuntimeException(
+                "Token CAPTCHA untuk order " . ($orderIndex + 1) . " kosong/tidak valid"
+            );
+        }
+        if (isset($seen[$token])) {
+            throw new RuntimeException(
+                "Token CAPTCHA duplikat pada order " . ($orderIndex + 1)
+            );
+        }
+        $seen[$token] = true;
+        $tokens[] = $token;
+    }
+
+    echo "[CAPTCHA] {$orderCount} token berbeda dimuat sesuai urutan order.\n";
+    return $tokens;
 }
 
 function saveCaptchaToken(string $token): void {
@@ -2081,8 +2141,15 @@ function gpyPay(): void {
     echo "⚡ Jeda tembak : " . sprintf('%.3fms', $intervalMs)
        . " untuk " . count($orders) . " user\n\n";
 
-    // Captcha 1× di-fetch setelah konfigurasi timing dinyatakan valid.
-    $captchaToken = getFreshCaptchaToken();
+    // Satu order memakai satu reload; banyak order membutuhkan token dari
+    // sesi CAPTCHA terpisah sesuai urutan user_server_wdp.txt.
+    $captchaTokens = getFreshCaptchaTokensForOrders(count($orders));
+    if (count($captchaTokens) !== count($orders)) {
+        throw new RuntimeException(
+            "Jumlah token CAPTCHA (" . count($captchaTokens)
+            . ") tidak sama dengan jumlah order (" . count($orders) . ")"
+        );
+    }
 
     // Tunggu dan fire — mini-probe2 T-2.5s untuk warm TLS pool sebelum burst.
     // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
@@ -2102,8 +2169,14 @@ function gpyPay(): void {
                 echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
             }
         },
-        static function () use (&$preparedInquiries, $orders, $captchaToken): int {
-            foreach ($orders as $order) {
+        static function () use (&$preparedInquiries, $orders, $captchaTokens): int {
+            foreach ($orders as $orderIndex => $order) {
+                $captchaToken = $captchaTokens[$orderIndex] ?? null;
+                if (!is_string($captchaToken) || $captchaToken === '') {
+                    throw new RuntimeException(
+                        "Token CAPTCHA untuk order index {$orderIndex} tidak tersedia"
+                    );
+                }
                 $preparedInquiries[] = prepareInquiry($order, $captchaToken);
             }
             return count($preparedInquiries);
