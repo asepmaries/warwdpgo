@@ -53,7 +53,6 @@ linux_wait_clock_health() {
 install_files_from_extract() {
   case "${2:-$APP_DIR}" in
     "$APP_DIR") trace="$trace files-main" ;;
-    "$WDP1_DIR") trace="$trace files-wdp1" ;;
     *) fail "Target copy tidak dikenal: ${2:-}" ;;
   esac
 }
@@ -66,11 +65,10 @@ IS_TERMUX=0
 IS_MACOS=0
 PLATFORM="linux"
 APP_DIR="$test_root/app"
-WDP1_DIR="$APP_DIR/wdp1"
 
 install_output="$test_root/install-output.txt"
 do_install_linux > "$install_output"
-[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify claim" ] \
+[ "$trace" = " clock download wait files-main cleanup verify claim" ] \
   || fail "urutan full install salah:$trace"
 [ "$(tail -n 1 "$install_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir full install"
@@ -78,7 +76,7 @@ do_install_linux > "$install_output"
 trace=""
 update_output="$test_root/update-output.txt"
 do_update_files > "$update_output"
-[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify claim" ] \
+[ "$trace" = " clock download wait files-main cleanup verify claim" ] \
   || fail "urutan update salah:$trace"
 [ "$(tail -n 1 "$update_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir update"
@@ -88,11 +86,10 @@ IS_LINUX=0
 IS_MACOS=1
 PLATFORM="macos"
 APP_DIR="$test_root/macos-home"
-WDP1_DIR="$APP_DIR/wdp1"
 macos_prepare_php() { trace="$trace mac"; }
 mac_output="$test_root/macos-output.txt"
 do_install_macos > "$mac_output"
-[ "$trace" = " mac download files-main files-wdp1 cleanup verify" ] \
+[ "$trace" = " mac download files-main cleanup verify" ] \
   || fail "urutan install macOS salah:$trace"
 [ "$(tail -n 1 "$mac_output")" = "__WDP_INSTALL_OK__" ] \
   || fail "marker install bukan output terakhir macOS"
@@ -110,10 +107,8 @@ done
 printf 'jangan disalin\n' > "$extract_dir/unexpected.bin"
 
 APP_DIR="$test_root/php-main"
-WDP1_DIR="$APP_DIR/wdp1"
 install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
-install_files_from_extract "$extract_dir" "$WDP1_DIR" >/dev/null
-for target in "$APP_DIR" "$WDP1_DIR"; do
+for target in "$APP_DIR"; do
   for file in "${PHP_CORE_FILES[@]}" "${CONFIG_FILES[@]}"; do
     [ -f "$target/$file" ] \
       || fail "file paket hilang dari $target: $file"
@@ -124,16 +119,12 @@ done
 
 printf 'config-lokal\n' > "$APP_DIR/waktu.txt"
 printf 'reload-lama\n' > "$APP_DIR/reload.txt"
-printf 'reload-lama-wdp1\n' > "$WDP1_DIR/reload.txt"
 printf 'war-lama\n' > "$APP_DIR/war.php"
 install_files_from_extract "$extract_dir" "$APP_DIR" >/dev/null
-install_files_from_extract "$extract_dir" "$WDP1_DIR" >/dev/null
 [ "$(cat "$APP_DIR/waktu.txt")" = "config-lokal" ] \
   || fail "config lokal tertimpa tanpa --force"
 [ "$(cat "$APP_DIR/reload.txt")" = "config:reload.txt" ] \
   || fail "reload.txt utama tidak diperbarui"
-[ "$(cat "$WDP1_DIR/reload.txt")" = "config:reload.txt" ] \
-  || fail "reload.txt wdp1 tidak diperbarui"
 [ "$(cat "$APP_DIR/war.php")" = "fixture:war.php" ] \
   || fail "war.php utama tidak diperbarui"
 FORCE_OVERWRITE=1

@@ -2,9 +2,9 @@
 # ======================================================================
 # WARWDPGO installer - PHP-only
 #
-# Termux : paket utama di /sdcard/wdp + salinan di /sdcard/wdp/wdp1
-# Linux  : paket utama di $HOME + salinan di $HOME/wdp1
-# macOS  : paket utama di $HOME + salinan di $HOME/wdp1
+# Termux : paket utama di /sdcard/wdp
+# Linux  : paket utama di $HOME
+# macOS  : paket utama di $HOME
 #
 # Aplikasi berasal dari arsip repository GitHub. Ubuntu 24.04 AMD64 memakai
 # runtime bundle GitHub Release yang versioned dan checksum-pinned.
@@ -223,7 +223,7 @@ Usage: bash install.sh [options]
   --help, -h            Bantuan
 
 Jalankan sebagai user login biasa. Hak root hanya dipakai untuk dependency
-sistem. Paket disalin ke APP_DIR dan APP_DIR/wdp1.
+sistem. Paket disalin ke APP_DIR.
 
 Env:
   GITHUB_REPO / GITHUB_REF
@@ -536,11 +536,10 @@ verify_php_install_dir() {
 
 verify_php_setup() {
   verify_php_runtime
-  log "Verifikasi dua salinan paket"
+  log "Verifikasi paket"
   verify_php_install_dir "$APP_DIR"
-  verify_php_install_dir "$WDP1_DIR"
   printf '%s\n' "__WDP_PHP_SETUP_OK__"
-  ok "Direktori utama dan folder wdp1 siap"
+  ok "Direktori utama siap"
 }
 
 # ----------------------------------------------------------------------
@@ -580,7 +579,6 @@ do_install_termux() {
   install_termux_php
   download_package
   install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
-  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
 
@@ -589,11 +587,10 @@ do_install_termux() {
 ============================================================
 TERMUX/Android siap
   Paket utama : $APP_DIR
-  Salinan wdp1: $WDP1_DIR
   Sumber       : GitHub $GITHUB_REPO@$GITHUB_REF
 
 Jalankan:
-  cd $WDP1_DIR
+  cd $APP_DIR
   php war.php
 
 Update:
@@ -641,7 +638,6 @@ do_install_macos() {
   macos_prepare_php
   download_package
   install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
-  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
 
@@ -650,11 +646,10 @@ do_install_macos() {
 ============================================================
 macOS siap
   Paket utama : $APP_DIR
-  Salinan wdp1: $WDP1_DIR
   Sumber       : GitHub $GITHUB_REPO@$GITHUB_REF
 
 Jalankan:
-  cd $WDP1_DIR
+  cd $APP_DIR
   php war.php
 
 Update:
@@ -1217,8 +1212,8 @@ linux_prepare_clock() {
 # Klaim stok body pool Cloudflare (sekali per VPS, tanpa API key)
 # ----------------------------------------------------------------------
 # Pool tidak memakai API key (proyek pribadi). Klaim dilakukan sekali:
-# claim_bodies.php menyimpan bodies.json (0600) di APP_DIR dan
-# install.sh menyalinnya ke WDP1_DIR (war.php jalan dari wdp1).
+# claim_bodies.php menyimpan bodies.json (0600) di APP_DIR, dan war.php
+# jalan dari APP_DIR itu juga.
 # Kalau bodies.json sudah ada dan valid, claim_bodies.php tidak klaim
 # lagi (idempotent), jadi --update tidak pernah menghabiskan stok pool.
 # Klaim gagal = install gagal (die, tanpa WDP_INSTALL_OK) supaya
@@ -1240,11 +1235,6 @@ claim_pool_bodies() {
   if ! php "$claim_script" --count "$POOL_CLAIM_COUNT" --out "$bodies_file"; then
     die "Klaim body pool gagal — install dibatalkan (tidak ada WDP_INSTALL_OK). Coba lagi nanti, atau jalankan dengan --no-pool lalu klaim manual: php $claim_script --count 10"
   fi
-  if [ -d "$WDP1_DIR" ]; then
-    cp -f "$bodies_file" "$WDP1_DIR/bodies.json"
-    chmod 0600 "$WDP1_DIR/bodies.json" 2>/dev/null || true
-    ok "Stok body disalin ke $WDP1_DIR/bodies.json"
-  fi
   printf '%s\n' "__WDP_POOL_OK__"
 }
 
@@ -1253,7 +1243,6 @@ do_install_linux() {
   download_package
   linux_wait_clock_health
   install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
-  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
   claim_pool_bodies
@@ -1263,17 +1252,16 @@ do_install_linux() {
 ============================================================
 LINUX/VPS siap
   Paket utama : $APP_DIR
-  Salinan wdp1: $WDP1_DIR
   Sumber       : GitHub $GITHUB_REPO@$GITHUB_REF
 
 Yang sudah dikonfigurasi:
   - PHP CLI + ekstensi cURL/JSON
   - Ubuntu 24 AMD64: runtime bundle lokal $RUNTIME_BUNDLE_VERSION
   - timezone Asia/Jakarta + chrony fail-closed
-  - paket tersedia di direktori utama dan wdp1
+  - paket tersedia di direktori utama
 
 Jalankan:
-  cd $WDP1_DIR
+  cd $APP_DIR
   php war.php
 
 Update dari GitHub:
@@ -1287,7 +1275,7 @@ EOF
 # Update dan clock
 # ----------------------------------------------------------------------
 do_update_files() {
-  log "Mode update PHP dari GitHub ke $APP_DIR dan $WDP1_DIR"
+  log "Mode update PHP dari GitHub ke $APP_DIR"
   if [ "$IS_LINUX" -eq 1 ]; then
     linux_prepare_clock 1
   elif [ "$IS_MACOS" -eq 1 ]; then
@@ -1301,7 +1289,6 @@ do_update_files() {
     linux_wait_clock_health
   fi
   install_files_from_extract "$EXTRACT_DIR" "$APP_DIR"
-  install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
   claim_pool_bodies
@@ -1311,7 +1298,6 @@ do_update_files() {
 ============================================================
 Update PHP selesai
   Paket utama : $APP_DIR
-  Salinan wdp1: $WDP1_DIR
   Sumber       : GitHub $GITHUB_REPO@$GITHUB_REF
   reload.txt selalu diperbarui; config lain tetap kecuali memakai --force.
 ============================================================
@@ -1344,7 +1330,6 @@ show_menu() {
   WARWDPGO installer PHP
   Platform : $PLATFORM
   Utama    : $APP_DIR
-  Salinan  : $WDP1_DIR
   GitHub   : $GITHUB_REPO@$GITHUB_REF
 ============================================================
   1) Full install PHP
@@ -1390,16 +1375,14 @@ main() {
   APP_DIR="${APP_DIR%/}"
   [ -n "$APP_DIR" ] && [ "$APP_DIR" != "/" ] \
     || die "APP_DIR tidak boleh kosong atau root filesystem"
-  WDP1_DIR="$APP_DIR/wdp1"
 
-  log "Platform=$PLATFORM | utama=$APP_DIR | salinan=$WDP1_DIR | mode=$MODE"
+  log "Platform=$PLATFORM | utama=$APP_DIR | mode=$MODE"
 
   if [ "$MODE" = "menu" ]; then
     show_menu
     if [ "$APP_DIR_EXPLICIT" -eq 0 ]; then
       APP_DIR="$(default_app_dir)"
       APP_DIR="${APP_DIR%/}"
-      WDP1_DIR="$APP_DIR/wdp1"
     fi
   fi
 
