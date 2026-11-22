@@ -59,6 +59,7 @@ install_files_from_extract() {
 }
 cleanup_download() { trace="$trace cleanup"; }
 verify_php_setup() { trace="$trace verify"; }
+claim_pool_bodies() { trace="$trace claim"; }
 
 IS_LINUX=1
 IS_TERMUX=0
@@ -69,7 +70,7 @@ WDP1_DIR="$APP_DIR/wdp1"
 
 install_output="$test_root/install-output.txt"
 do_install_linux > "$install_output"
-[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify" ] \
+[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify claim" ] \
   || fail "urutan full install salah:$trace"
 [ "$(tail -n 1 "$install_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir full install"
@@ -77,7 +78,7 @@ do_install_linux > "$install_output"
 trace=""
 update_output="$test_root/update-output.txt"
 do_update_files > "$update_output"
-[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify" ] \
+[ "$trace" = " clock download wait files-main files-wdp1 cleanup verify claim" ] \
   || fail "urutan update salah:$trace"
 [ "$(tail -n 1 "$update_output")" = "__WDP_CLOCK_HEALTHY__" ] \
   || fail "marker clock bukan output terakhir update"

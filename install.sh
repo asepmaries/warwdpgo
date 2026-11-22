@@ -15,6 +15,7 @@
 #   bash install.sh --update
 #   bash install.sh --clock-only
 #   bash install.sh --verify-clock
+#   bash install.sh --no-pool
 #   APP_DIR=/path bash install.sh
 # ======================================================================
 set -Eeuo pipefail
@@ -46,12 +47,16 @@ CLOCK_MAX_RMS_SEC="${CLOCK_MAX_RMS_SEC:-0.010}"
 CLOCK_MAX_SKEW_PPM="${CLOCK_MAX_SKEW_PPM:-100}"
 CLOCK_MAX_ERROR_SEC="${CLOCK_MAX_ERROR_SEC:-0.050}"
 
-PHP_CORE_FILES=(war.php dm.php ff.php install.sh)
-CONFIG_FILES=(waktu.txt user_server_wdp.txt user_server_dm.txt user_server_ff.txt lead.txt reload.txt target_srv.txt)
+PHP_CORE_FILES=(war.php dm.php ff.php install.sh claim_bodies.php)
+CONFIG_FILES=(waktu.txt user_server_wdp.txt user_server_dm.txt user_server_ff.txt lead.txt reload.txt)
 
 FORCE_OVERWRITE=0
 APP_DIR_EXPLICIT=0
 MODE="auto"
+# Klaim stok body pool Cloudflare (sekali per VPS). Tanpa API key.
+# 1 = klaim kalau bodies.json belum ada/tidak valid; 0 = lewati (--no-pool).
+POOL_CLAIM_ENABLED=1
+POOL_CLAIM_COUNT="${POOL_CLAIM_COUNT:-10}"
 CLOCK_GATE_PASSED=0
 PACKAGE_WAR_SHA256=""
 TMP_DIR=""
@@ -191,6 +196,9 @@ parse_args() {
       --force|-f)
         FORCE_OVERWRITE=1
         ;;
+      --no-pool)
+        POOL_CLAIM_ENABLED=0
+        ;;
       --app-dir)
         [ $# -ge 2 ] || die "--app-dir membutuhkan DIR"
         shift
@@ -210,6 +218,7 @@ Usage: bash install.sh [options]
   --runtime-bundle-file FILE
                         Ubuntu 24 AMD64: gunakan bundle lokal, tanpa download
   --force, -f           Overwrite config lokal (reload.txt selalu diperbarui)
+  --no-pool             Lewati klaim stok body dari pool Cloudflare
   --app-dir DIR         Direktori utama (default: HOME; Termux:/sdcard/wdp)
   --help, -h            Bantuan
 
@@ -1204,6 +1213,41 @@ linux_prepare_clock() {
   linux_start_chrony
 }
 
+# ----------------------------------------------------------------------
+# Klaim stok body pool Cloudflare (sekali per VPS, tanpa API key)
+# ----------------------------------------------------------------------
+# Pool tidak memakai API key (proyek pribadi). Klaim dilakukan sekali:
+# claim_bodies.php menyimpan bodies.json (0600) di APP_DIR dan
+# install.sh menyalinnya ke WDP1_DIR (war.php jalan dari wdp1).
+# Kalau bodies.json sudah ada dan valid, claim_bodies.php tidak klaim
+# lagi (idempotent), jadi --update tidak pernah menghabiskan stok pool.
+# Klaim gagal = install gagal (die, tanpa WDP_INSTALL_OK) supaya
+# controller menandai VPS itu gagal; lewati pakai --no-pool.
+claim_pool_bodies() {
+  if [ "$POOL_CLAIM_ENABLED" -eq 0 ]; then
+    ok "Klaim pool dilewati (--no-pool)"
+    return 0
+  fi
+  if [ "$IS_LINUX" -ne 1 ]; then
+    ok "Klaim pool hanya untuk Linux/VPS, dilewati"
+    return 0
+  fi
+  local claim_script="$APP_DIR/claim_bodies.php"
+  local bodies_file="$APP_DIR/bodies.json"
+  [ -f "$claim_script" ] \
+    || die "claim_bodies.php tidak ditemukan di $APP_DIR (paket tidak lengkap)"
+  log "Klaim stok body dari pool Cloudflare (maks $POOL_CLAIM_COUNT body)"
+  if ! php "$claim_script" --count "$POOL_CLAIM_COUNT" --out "$bodies_file"; then
+    die "Klaim body pool gagal — install dibatalkan (tidak ada WDP_INSTALL_OK). Coba lagi nanti, atau jalankan dengan --no-pool lalu klaim manual: php $claim_script --count 10"
+  fi
+  if [ -d "$WDP1_DIR" ]; then
+    cp -f "$bodies_file" "$WDP1_DIR/bodies.json"
+    chmod 0600 "$WDP1_DIR/bodies.json" 2>/dev/null || true
+    ok "Stok body disalin ke $WDP1_DIR/bodies.json"
+  fi
+  printf '%s\n' "__WDP_POOL_OK__"
+}
+
 do_install_linux() {
   linux_prepare_clock 1
   download_package
@@ -1212,6 +1256,7 @@ do_install_linux() {
   install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
+  claim_pool_bodies
 
   cat <<EOF
 
@@ -1259,6 +1304,7 @@ do_update_files() {
   install_files_from_extract "$EXTRACT_DIR" "$WDP1_DIR"
   cleanup_download
   verify_php_setup
+  claim_pool_bodies
 
   cat <<EOF
 

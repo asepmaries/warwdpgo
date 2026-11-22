@@ -21,13 +21,13 @@ const PROJECT_ROOT = __DIR__;
 const REQUIRED_PROJECT_FILES = [
     '.gitattributes',
     '.gitignore',
+    'claim_bodies.php',
     'dm.php',
     'ff.php',
     'install.sh',
     'lead.txt',
     'publish.php',
     'reload.txt',
-    'target_srv.txt',
     'user_server_dm.txt',
     'user_server_ff.txt',
     'user_server_wdp.txt',
@@ -38,6 +38,7 @@ const REQUIRED_PROJECT_FILES = [
 const TEST_FILES = [
     'test/install-entrypoint.sh',
     'test/install-php-default.sh',
+    'test/install-pool-claim.sh',
     'test/install-performance.sh',
     'test/install-clock-marker.sh',
 ];

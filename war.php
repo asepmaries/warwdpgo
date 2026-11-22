@@ -1,17 +1,23 @@
 <?php
 // ======================================================================
-// GOPAY MLBB WDP - WAR EDITION (Fixed Lead + Staggered Inquiry)
+// GOPAY MLBB WDP - WAR EDITION (Pool Bodies + Staggered Inquiry)
 //
 // Strategi:
+//  - Stok body CAPTCHA diklaim SEKALI dari pool Cloudflare (claim_bodies.php)
+//    dan disimpan di bodies.json (maks 10 body). Satu order memakai SATU body.
+//  - Token captcha TIDAK dibuat di awal (token hanya berlaku ~120 detik).
+//    Token dibuat per order, masing-masing dari body-nya sendiri, secara
+//    paralel saat sisa waktu war <= 60 detik. Token hanya di memori, tidak
+//    pernah ditulis ke file.
 //  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
 //    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
-//  - Maksimal 10 user unik ditembak bertahap dari lead dengan jeda tetap 15ms.
-//    Slot terakhir diturunkan otomatis dari lead dan jumlah user.
+//  - Maksimal 10 user unik ditembak bertahap dari lead dengan jeda tetap 20ms.
 //  - Warm-up tunggal T-2.5s (10 paralel) untuk warm TLS pool sebelum burst.
 //  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
 //  - Target server-arrival adalah 0ms (T=0).
-//  - Captcha dipakai sekali untuk semua user dan dicoba ulang bila fetch gagal.
+//  - Pool TIDAK dihubungi saat war (tidak butuh kunci API di VPS). Renew
+//    lease + pantau kesehatan body adalah tugas controller.
 // ======================================================================
 if (php_sapi_name() !== 'cli') {
     die("Script ini hanya boleh dijalankan via CLI\n");
@@ -78,6 +84,9 @@ const MIN_USERS              = 1;            // Batas minimal user unik per VPS/
 const MAX_USERS              = 10;           // Batas keras user per VPS/proses.
 const CAPTCHA_MAX_ATTEMPTS   = 3;
 const CAPTCHA_RETRY_BASE_MS  = 600;
+const CAPTCHA_FETCH_LEAD_MS  = 60000;        // Token dibuat saat sisa waktu war <= 60 detik (token hanya berlaku ~120 detik).
+const POOL_BODIES_FILE       = 'bodies.json'; // Stok body pool (klaim sekali via claim_bodies.php).
+const RECAPTCHA_RELOAD_URL   = 'https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o';
 const INQUIRY_CONNECT_TO_MS  = 2200;
 const INQUIRY_TIMEOUT_MS    = 5200;
 const PAYMENT_CONNECT_TO_MS = 2200;
@@ -190,7 +199,8 @@ function logClockSyncStatus(): void {
 function waitForExactBurstTime(
     int $leadMs,
     ?callable $beforeBurst = null,
-    ?callable $prepareBurst = null
+    ?callable $prepareBurst = null,
+    ?callable $fetchTokens = null
 ): bool {
     global $WAR_START_WALL_US;
     $file = 'waktu.txt';
@@ -229,9 +239,16 @@ function waitForExactBurstTime(
     $remainingNs = max(0, (int) round(($targetWallMicro - (microtime(true) * 1_000_000)) * 1000));
     $targetMono = hrtime(true) + $remainingNs;
     $preBurstTriggered = false;
+    $tokensFetched = false;
     while (true) {
         $remaining = $targetMono - hrtime(true);
         if ($remaining <= 0) {
+            // Start sangat mepet: ambil token dulu (walaupun burst sudah telat,
+            // fire dengan token valid lebih baik daripada mati tanpa token).
+            if (!$tokensFetched && $fetchTokens !== null) {
+                $tokensFetched = true;
+                $fetchTokens();
+            }
             if (!$preBurstTriggered && $prepareBurst !== null) {
                 $prepareStart = hrtime(true);
                 $prepareBurst();
@@ -245,6 +262,17 @@ function waitForExactBurstTime(
             return true;
         }
         $remainingUs = intdiv($remaining, 1000);
+        // Token dibuat di sini (sisa waktu <= 60 detik), BUKAN di awal script:
+        // token hanya berlaku ~120 detik, jadi fetch di T-60s membuat umur
+        // token saat fire ~60 detik. Dijalankan sebelum warm-up/prepare.
+        if (!$tokensFetched && $fetchTokens !== null && $remainingUs <= CAPTCHA_FETCH_LEAD_MS * 1000) {
+            $tokensFetched = true;
+            $fetchStart = hrtime(true);
+            $fetchTokens();
+            echo "[CAPTCHA] Token fetch selesai dalam "
+               . sprintf('%.3fms', (hrtime(true) - $fetchStart) / 1_000_000)
+               . "\n";
+        }
         if (!$preBurstTriggered && $remainingUs <= MINI_PROBE2_LEAD_MS * 1000) {
             $preBurstTriggered = true;
             // CRITICAL: warm-up tidak boleh menunda burst. Hitung budget = sisa waktu ke
@@ -673,13 +701,18 @@ function percentile(array $values, float $p): float {
 }
 
 // ----------------------------------------------------------------------
-// CAPTCHA: ambil dari Google
+// CAPTCHA: body dari stok pool, token per order di T-60 detik
 // ----------------------------------------------------------------------
-function getFreshCaptchaToken(): string {
-    echo "[CAPTCHA] Mengambil token captcha baru dari Google"
-       . " (maks " . CAPTCHA_MAX_ATTEMPTS . " percobaan)...\n";
-    $url = "https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o";
-    $headers = [
+// Stok body diklaim SEKALI via claim_bodies.php -> bodies.json (maks 10).
+// Satu order memakai SATU body (body index ke-i untuk order ke-i).
+// Token TIDAK dibuat di awal: token hanya berlaku ~120 detik, jadi token
+// dibuat paralel saat sisa waktu war <= 60 detik (callback di
+// waitForExactBurstTime) dan hanya disimpan di memori — tidak pernah
+// ditulis ke file (tidak ada lagi reload.txt / captcha_token.txt).
+// Pool TIDAK dihubungi saat war; renew lease adalah tugas controller.
+
+function captchaReloadHeaders(): array {
+    return [
         'sec-ch-ua-platform' => '"Android"',
         'user-agent' => 'Mozilla/5.0 (Linux; Android 13; SM-X700 Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.8103.50 Mobile Safari/537.36',
         'sec-ch-ua' => '"Not-A.Brand";v="99", "Android WebView";v="157", "Chromium";v="157"',
@@ -695,129 +728,115 @@ function getFreshCaptchaToken(): string {
         'accept-language' => 'en-US,en;q=0.9',
         'cookie' => '_GRECAPTCHA=09AKhCRwig412Sinsks-swNMr3esXkLlnNjxA421fPn7UuqRB9ligadmBfSqi3AcgGO1bFgLp-oRgNIOIbGU1z9Dw; NID=Cp8CCAES0QEBM9Agl5f5KPhyJJl_9q1q-kmQnU8DE5w-ar-n5pEnpZ4eSUoTRY480PWuwlNzNJeDRXQ8A66236sPxxkXN_B_KHxqKMTRHX-506Y3fRb6w7NF99N6u_xk6WQ394XUr9jD6-0tmtexUxSVPLST0wDmxWoLvLakpL_os09LlukbfnKqiaFkRJF-j9iIHCbOlw5lknTrLEhbyn-jQ7r4i271foXMmzPCFbZUWzU07LlU10IQ7yI05O_jYnhtEQchXeRDlOyMQNSI02aZoDWDpoOQ6igBMkUBcEpCz0GeXDlrG9r96kWzKSq5O56WtEc70yBcA6Z5MVk7IEq-gs1nxjavSyZ0FbCw6bGuNClUmTLhSywSfjreC4_KOQ0',
     ];
-    $reloadBody = file_get_contents('reload.txt');
-    if ($reloadBody === false) {
-        throw new RuntimeException("Gagal membaca reload.txt");
-    }
+}
 
-    $lastError = 'unknown error';
-    for ($attempt = 1; $attempt <= CAPTCHA_MAX_ATTEMPTS; $attempt++) {
-        $ch = null;
-        try {
-            echo "[CAPTCHA] Percobaan {$attempt}/" . CAPTCHA_MAX_ATTEMPTS . "...\n";
-            $ch = createCurlSession();
-            configureCurlHandle(
-                $ch,
-                $url,
-                'POST',
-                $headers,
-                $reloadBody,
-                ['connect_timeout_ms' => 4000, 'timeout_ms' => 10000]
+function loadPoolBodies(string $path, int $orderCount): array {
+    if (!is_file($path)) {
+        throw new RuntimeException(
+            "bodies.json tidak ditemukan di {$path}. Klaim stok body dulu "
+            . "(claim_bodies.php) — satu VPS klaim 10 body sekali dari pool."
+        );
+    }
+    $data = json_decode((string) file_get_contents($path), true);
+    if (!is_array($data) || empty($data['items']) || !is_array($data['items'])) {
+        throw new RuntimeException("bodies.json tidak valid (bukan JSON / tidak ada items).");
+    }
+    $bodies = [];
+    $seen = [];
+    foreach ($data['items'] as $item) {
+        $id = (int) ($item['id'] ?? 0);
+        $bin = base64_decode((string) ($item['body_b64'] ?? ''), true);
+        if ($id <= 0 || $bin === false || strlen($bin) < 1000) {
+            throw new RuntimeException(
+                "bodies.json berisi body tidak valid (id={$id}). Klaim ulang stok body."
             );
-            $response = curl_exec($ch);
-            $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            $errno = curl_errno($ch);
-            $errorMsg = curl_error($ch);
-
-            if ($errno !== 0) {
-                throw new RuntimeException("cURL [$errno] $errorMsg", $errno);
-            }
-            if ($httpCode !== 200 || !is_string($response) || $response === '') {
-                throw new RuntimeException("HTTP {$httpCode} atau response kosong");
-            }
-            if (!preg_match('/"rresp","([^"]+)"/', $response, $matches)) {
-                throw new RuntimeException("response Google tidak memuat rresp");
-            }
-
-            $token = $matches[1];
-            saveCaptchaToken($token);
-            echo "[CAPTCHA] Token berhasil diambil (panjang: "
-               . strlen($token) . " karakter)\n\n";
-            return $token;
-        } catch (Throwable $e) {
-            $lastError = $e->getMessage();
-            echo "[CAPTCHA] Percobaan {$attempt} gagal: {$lastError}\n";
-        } finally {
-            if ($ch !== null) {
-                @curl_close($ch);
-            }
         }
-
-        if ($attempt < CAPTCHA_MAX_ATTEMPTS) {
-            $jitterMs = random_int(0, 250);
-            $delayMs = (CAPTCHA_RETRY_BASE_MS * $attempt) + $jitterMs;
-            echo "[CAPTCHA] Ulang dalam {$delayMs}ms...\n";
-            usleep($delayMs * 1000);
+        if (isset($seen[$id])) {
+            throw new RuntimeException(
+                "bodies.json berisi body duplikat (id={$id}). Klaim ulang stok body."
+            );
         }
+        $seen[$id] = true;
+        $bodies[] = ['id' => $id, 'body' => $bin];
     }
-
-    throw new RuntimeException(
-        "Gagal mengambil CAPTCHA setelah " . CAPTCHA_MAX_ATTEMPTS
-        . " percobaan: {$lastError}"
-    );
+    if (count($bodies) < $orderCount) {
+        throw new RuntimeException(
+            "Stok body (" . count($bodies) . ") kurang dari jumlah order ({$orderCount}). "
+            . "Klaim tambahan dari pool."
+        );
+    }
+    return $bodies;
 }
 
 /**
- * Satu replay reload.txt hanya mewakili satu sesi CAPTCHA. Untuk beberapa
- * order, gunakan token dari sesi browser yang terpisah, sesuai urutan order.
+ * Satu body -> satu token, diambil paralel via curl_multi. Order yang
+ * gagal di-retry (maks CAPTCHA_MAX_ATTEMPTS). Return token per order
+ * (index sama dengan urutan order). Token hanya di memori.
  */
-function getFreshCaptchaTokensForOrders(int $orderCount): array {
-    if ($orderCount < 1) {
-        return [];
-    }
+function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount): array {
+    $tokens = array_fill(0, $orderCount, null);
+    $pending = range(0, $orderCount - 1);
+    $headers = captchaReloadHeaders();
 
-    if ($orderCount === 1) {
-        return [getFreshCaptchaToken()];
-    }
-
-    $tokensFile = __DIR__ . '/captcha_tokens.txt';
-    if (!is_file($tokensFile)) {
-        $handle = @fopen($tokensFile, 'x');
-        if ($handle === false) {
-            throw new RuntimeException('Gagal membuat captcha_tokens.txt');
+    for ($attempt = 1; $attempt <= CAPTCHA_MAX_ATTEMPTS && !empty($pending); $attempt++) {
+        if ($attempt > 1) {
+            $delayMs = (CAPTCHA_RETRY_BASE_MS * ($attempt - 1)) + random_int(0, 250);
+            echo "[CAPTCHA] Retry " . count($pending) . " order dalam {$delayMs}ms...\n";
+            usleep($delayMs * 1000);
         }
-        fclose($handle);
-        chmod($tokensFile, 0600);
-        echo "[CAPTCHA] captcha_tokens.txt dibuat otomatis.\n";
+        echo "[CAPTCHA] Ambil " . count($pending) . " token paralel"
+           . " (percobaan {$attempt}/" . CAPTCHA_MAX_ATTEMPTS . ")...\n";
+        $mh = curl_multi_init();
+        $handles = [];
+        foreach ($pending as $idx) {
+            $ch = createCurlSession();
+            configureCurlHandle(
+                $ch,
+                RECAPTCHA_RELOAD_URL,
+                'POST',
+                $headers,
+                $poolBodies[$idx]['body'],
+                ['connect_timeout_ms' => 4000, 'timeout_ms' => 10000]
+            );
+            curl_multi_add_handle($mh, $ch);
+            $handles[$idx] = $ch;
+        }
+        runMultiHandles($mh);
+
+        $nextPending = [];
+        foreach ($handles as $idx => $ch) {
+            $resp = curl_multi_getcontent($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $errno = curl_errno($ch);
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+            $token = null;
+            if ($errno === 0 && $code === 200 && is_string($resp)
+                && preg_match('/"rresp","([^"]+)"/', $resp, $m)) {
+                $token = $m[1];
+            }
+            if ($token !== null) {
+                $tokens[$idx] = $token;
+                echo "[CAPTCHA] Order " . ($idx + 1) . " token OK"
+                   . " (body #{$poolBodies[$idx]['id']}, " . strlen($token) . " karakter)\n";
+            } else {
+                $nextPending[] = $idx;
+                echo "[CAPTCHA] Order " . ($idx + 1) . " gagal"
+                   . " (HTTP {$code}, errno {$errno})\n";
+            }
+        }
+        curl_multi_close($mh);
+        $pending = $nextPending;
     }
 
-    $lines = file($tokensFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    if ($lines === false) {
-        throw new RuntimeException('Gagal membaca captcha_tokens.txt');
-    }
-    if (count($lines) !== $orderCount) {
+    if (!empty($pending)) {
         throw new RuntimeException(
-            "Butuh {$orderCount} token CAPTCHA dari sesi berbeda; "
-            . "captcha_tokens.txt berisi " . count($lines) . ". "
-            . "Satu HAR/reload.txt tidak menyediakan sesi tambahan."
+            "Gagal mengambil token CAPTCHA untuk order: "
+            . implode(',', array_map(static fn($i) => $i + 1, $pending))
+            . " setelah " . CAPTCHA_MAX_ATTEMPTS . " percobaan"
         );
     }
-
-    $tokens = [];
-    $seen = [];
-    foreach ($lines as $orderIndex => $line) {
-        $token = trim($line);
-        if ($token === '' || preg_match('/\s/', $token)) {
-            throw new RuntimeException(
-                "Token CAPTCHA untuk order " . ($orderIndex + 1) . " kosong/tidak valid"
-            );
-        }
-        if (isset($seen[$token])) {
-            throw new RuntimeException(
-                "Token CAPTCHA duplikat pada order " . ($orderIndex + 1)
-            );
-        }
-        $seen[$token] = true;
-        $tokens[] = $token;
-    }
-
-    echo "[CAPTCHA] {$orderCount} token berbeda dimuat sesuai urutan order.\n";
     return $tokens;
-}
-
-function saveCaptchaToken(string $token): void {
-    file_put_contents('captcha_token.txt', $token);
-    echo "[CAPTCHA] Token baru disimpan ke captcha_token.txt\n";
 }
 
 // ----------------------------------------------------------------------
@@ -962,7 +981,7 @@ function buildInquiryBody(array $order): array {
 // ----------------------------------------------------------------------
 // PREPARE INQUIRY (satu handle per user, belum dikirim)
 // ----------------------------------------------------------------------
-function prepareInquiry(array $order, string $captchaToken): array {
+function prepareInquiry(array $order, string $captchaToken, int $bodyId = 0): array {
     $headers = buildInquiryHeaders($captchaToken);
     $body    = buildInquiryBody($order);
     $ch = createCurlSession();
@@ -981,6 +1000,7 @@ function prepareInquiry(array $order, string $captchaToken): array {
         'order'    => $order,
         'headers'  => $headers,
         'started'  => null,
+        'body_id'  => $bodyId,
     ];
 }
 
@@ -1321,6 +1341,7 @@ function runStaggeredInquiry(
         ];
 
         $tag = "[$responseWallTime][+" . sprintf('%6.1f', $tRel) . "ms][$userKey]"
+             . "[body#" . ($meta['body_id'] ?? 0) . "]"
              . "[plan" . sprintf('%+.1f', $meta['planned_offset_ms']) . "ms]"
              . "[fire" . sprintf('%+.1f', $meta['fired_offset_ms']) . "ms]"
              . "[single guard" . sprintf('%+.1f', $meta['guard_delay_ms']) . "ms]"
@@ -2141,15 +2162,14 @@ function gpyPay(): void {
     echo "⚡ Jeda tembak : " . sprintf('%.3fms', $intervalMs)
        . " untuk " . count($orders) . " user\n\n";
 
-    // Satu order memakai satu reload; banyak order membutuhkan token dari
-    // sesi CAPTCHA terpisah sesuai urutan user_server_wdp.txt.
-    $captchaTokens = getFreshCaptchaTokensForOrders(count($orders));
-    if (count($captchaTokens) !== count($orders)) {
-        throw new RuntimeException(
-            "Jumlah token CAPTCHA (" . count($captchaTokens)
-            . ") tidak sama dengan jumlah order (" . count($orders) . ")"
-        );
-    }
+    // Stok body pool: diklaim sekali via claim_bodies.php -> bodies.json.
+    // Token TIDAK dibuat di awal (token hanya berlaku ~120 detik). Token
+    // dibuat per order, masing-masing dari body-nya sendiri, saat sisa
+    // waktu war <= 60 detik (callback ke-4 di waitForExactBurstTime).
+    $poolBodies = loadPoolBodies(__DIR__ . '/' . POOL_BODIES_FILE, count($orders));
+    echo "✅ Stok body pool: " . count($poolBodies) . " body"
+       . " (pool id: " . implode(',', array_column($poolBodies, 'id')) . ")\n";
+    $captchaTokens = []; // diisi callback fetchTokens di bawah
 
     // Tunggu dan fire — mini-probe2 T-2.5s untuk warm TLS pool sebelum burst.
     // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
@@ -2169,7 +2189,7 @@ function gpyPay(): void {
                 echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
             }
         },
-        static function () use (&$preparedInquiries, $orders, $captchaTokens): int {
+        static function () use (&$preparedInquiries, $orders, &$captchaTokens, $poolBodies): int {
             foreach ($orders as $orderIndex => $order) {
                 $captchaToken = $captchaTokens[$orderIndex] ?? null;
                 if (!is_string($captchaToken) || $captchaToken === '') {
@@ -2177,9 +2197,18 @@ function gpyPay(): void {
                         "Token CAPTCHA untuk order index {$orderIndex} tidak tersedia"
                     );
                 }
-                $preparedInquiries[] = prepareInquiry($order, $captchaToken);
+                $preparedInquiries[] = prepareInquiry(
+                    $order,
+                    $captchaToken,
+                    (int) ($poolBodies[$orderIndex]['id'] ?? 0)
+                );
             }
             return count($preparedInquiries);
+        },
+        static function () use ($poolBodies, $orders, &$captchaTokens): void {
+            $captchaTokens = fetchCaptchaTokensForOrders($poolBodies, count($orders));
+            echo "[CAPTCHA] " . count($captchaTokens)
+               . " token siap (umur token saat fire ~60 detik).\n";
         }
     );
 
