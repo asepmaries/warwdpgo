@@ -14,7 +14,10 @@
 //    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
 //  - Maksimal 10 user unik ditembak bertahap dari lead dengan jeda tetap 20ms.
 //  - Warm-up tunggal T-2.5s (10 paralel) untuk warm TLS pool sebelum burst.
-//  - Hanya satu salvo inquiry per user; response gagal tidak dikirim ulang.
+//  - Salvo burst inquiry pertama bertahap sesuai target waktu.
+//  - Jika response gagal HTTP 406 (error captcha) atau HTTP 429 (transaction suspicous),
+//    lakukan retry dengan jeda ACAK 4s, 5s, atau 6s hingga maks 100x retry.
+//  - Setiap retry merotasi body dari stok pool dan mengambil ulang token captcha.
 //  - Target server-arrival adalah 0ms (T=0).
 //  - Pool TIDAK dihubungi saat war (tidak butuh kunci API di VPS). Renew
 //    lease + pantau kesehatan body adalah tugas controller.
@@ -93,10 +96,13 @@ const PAYMENT_CONNECT_TO_MS = 2200;
 const PAYMENT_TIMEOUT_MS    = 5200;
 const TARGET_SRV_MS_DEFAULT = 0.0;           // Target arrival server tepat T=0.
 
+const INQUIRY_RETRY_MAX_ATTEMPTS = 100;
+const INQUIRY_RETRY_DELAYS_SEC  = [4, 5, 6]; // Jeda retry diacak per percobaan: 4s, 5s, atau 6s.
+
 // Pola pesan error dari endpoint inquiry
 const STOP_PATTERNS = [
     'out of stock', 'sold out', 'kuota habis', 'voucher habis',
-    'stok habis', 'sudah habis', 'Transaction is suspicous',
+    'stok habis', 'sudah habis',
 ];
 const INVALID_USER_PATTERNS = [
     'role_null', 'role null', 'error_role_null',
@@ -115,6 +121,8 @@ const REGION_BLOCK_PATTERNS = [
 const RETRY_PATTERNS = [
     'not available', 'not yet', 'belum dimulai', 'belum tersedia',
     'tidak tersedia', 'try again', 'temporarily', 'service unavailable',
+    'error captcha', 'oops, error captcha', 'transaction is suspicous',
+    'transaction is suspicious', 'suspicous', 'suspicious',
 ];
 
 // ----------------------------------------------------------------------
@@ -839,10 +847,52 @@ function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount): array 
     return $tokens;
 }
 
+/**
+ * Ambil satu token CAPTCHA dari Google reCAPTCHA reload menggunakan satu item body binary.
+ */
+function fetchSingleCaptchaToken(array $bodyItem, int $timeoutMs = 5000): ?string {
+    $headers = captchaReloadHeaders();
+    $ch = createCurlSession();
+    configureCurlHandle(
+        $ch,
+        RECAPTCHA_RELOAD_URL,
+        'POST',
+        $headers,
+        $bodyItem['body'],
+        ['connect_timeout_ms' => 3000, 'timeout_ms' => $timeoutMs]
+    );
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errno = curl_errno($ch);
+    curl_close($ch);
+
+    if ($errno === 0 && $code === 200 && is_string($resp) && preg_match('/"rresp","([^"]+)"/', $resp, $m)) {
+        $token = $m[1];
+        if (strlen($token) >= 50) {
+            return $token;
+        }
+    }
+    return null;
+}
+
+/**
+ * Cek apakah respons inquiry merupakan kandidat retry:
+ * HANYA HTTP 406 (Oops, error captcha) dan HTTP 429 (Transaction is suspicous).
+ * Status lain (stok habis, user invalid, sudah redeem, region block, HTTP lain,
+ * timeout) TIDAK di-retry.
+ */
+function shouldRetryInquiry(int $code, string $errText, string $status): bool {
+    if (in_array($status, ['stop', 'user_invalid', 'skip_user', 'region_block'], true)) {
+        return false;
+    }
+    if ($code === 406 || $code === 429) {
+        return true;
+    }
+    return false;
+}
+
 // ----------------------------------------------------------------------
 // CLASSIFY RESPONSE INQUIRY
-// Status "retry" hanya label klasifikasi respons.
-// runStaggeredInquiry tetap single-shot dan tidak mengirim inquiry ulang.
 // Return: ['status' => 'success'|'stop'|'user_invalid'|'skip_user'|'region_block'|'retry'|'unknown', 'orderId' => ?string]
 // ----------------------------------------------------------------------
 function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload): array {
@@ -981,7 +1031,7 @@ function buildInquiryBody(array $order): array {
 // ----------------------------------------------------------------------
 // PREPARE INQUIRY (satu handle per user, belum dikirim)
 // ----------------------------------------------------------------------
-function prepareInquiry(array $order, string $captchaToken, int $bodyId = 0): array {
+function prepareInquiry(array $order, string $captchaToken, int $bodyId = 0, int $bodyIndex = 0): array {
     $headers = buildInquiryHeaders($captchaToken);
     $body    = buildInquiryBody($order);
     $ch = createCurlSession();
@@ -996,11 +1046,12 @@ function prepareInquiry(array $order, string $captchaToken, int $bodyId = 0): ar
     // Easy handle baru dimasukkan ke satu shared multi-handle tepat pada
     // slotnya. Ini menghindari overhead memompa 10 multi-handle terpisah.
     return [
-        'ch'       => $ch,
-        'order'    => $order,
-        'headers'  => $headers,
-        'started'  => null,
-        'body_id'  => $bodyId,
+        'ch'         => $ch,
+        'order'      => $order,
+        'headers'    => $headers,
+        'started'    => null,
+        'body_id'    => $bodyId,
+        'body_index' => $bodyIndex,
     ];
 }
 
@@ -1130,7 +1181,7 @@ function runStaggeredInquiry(
     global $WAR_START_WALL_US;
 
     $totalUsers = count($preparedInquiries);
-    if ($totalUsers === 0) return [];
+    if ($totalUsers === 0) return [[], [], ''];
 
     // Slot pertama tepat di lead. Sembilan slot berikutnya maju 28ms.
     // Contoh lead -426ms: -426, -398, ... hingga -174ms.
@@ -1141,6 +1192,8 @@ function runStaggeredInquiry(
     $endLeadOffsetMs = $leadOffsetMs + $distanceMs;
 
     $successMap = [];      // userId|serverId -> ['order','orderId','headers']
+    $retryCandidates = []; // userId|serverId -> ['order','body_index','last_code','last_err']
+    $deferredLog = ''; // [NET] + ringkasan + VPS-EVAL burst: ditahan, dicetak setelah retry selesai.
 
     // Petakan T=0 wall-clock ke monotonic clock satu kali. Semua slot dihitung
     // dari anchor yang sama agar tidak terkena drift akibat usleep/RTT.
@@ -1357,9 +1410,18 @@ function runStaggeredInquiry(
         } else {
             $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
             echo "$tag ⚠️  {$verdict['status']}: $shortErr\n";
+            if (shouldRetryInquiry((int) $code, $errText, $verdict['status'])) {
+                $retryCandidates[$userKey] = [
+                    'order'       => $meta['order'],
+                    'body_index'  => $meta['body_index'] ?? 0,
+                    'last_code'   => (int) $code,
+                    'last_err'    => $errText,
+                    'last_status' => $verdict['status'],
+                ];
+            }
         }
 
-        echo formatCurlNetworkLog(
+        $deferredLog .= formatCurlNetworkLog(
             $userKey,
             (float) $meta['planned_offset_ms'],
             (float) $meta['fired_offset_ms'],
@@ -1374,11 +1436,14 @@ function runStaggeredInquiry(
 
     $phaseElapsed = (microtime(true) - $phaseStart) * 1000;
 
-    echo "\n" . $scheduleSummary;
-    echo "? Inquiry summary:\n";
-    echo "   - success           : " . count($successMap) . "/" . $totalUsers . "\n";
-    echo "   - total inquiry call: " . $totalUsers . "\n";
-    echo "   - phase duration    : " . sprintf('%.1f ms', $phaseElapsed) . "\n";
+    $deferredLog .= "\n" . $scheduleSummary;
+    $deferredLog .= "? Inquiry summary:\n";
+    $deferredLog .= "   - success           : " . count($successMap) . "/" . $totalUsers . "\n";
+    if (!empty($retryCandidates)) {
+        $deferredLog .= "   - retry candidates  : " . count($retryCandidates) . "/" . $totalUsers . "\n";
+    }
+    $deferredLog .= "   - total inquiry call: " . $totalUsers . "\n";
+    $deferredLog .= "   - phase duration    : " . sprintf('%.1f ms', $phaseElapsed) . "\n";
 
     // ===== AUTO-SUMMARY untuk evaluasi VPS =====
     if (!empty($inquiryStats)) {
@@ -1415,16 +1480,16 @@ function runStaggeredInquiry(
         $rttStr      = empty($rtts) ? '-' : sprintf('min=%dms med=%dms max=%dms', min($rtts), percentile($rtts, 0.5), max($rtts));
         $srvStr      = empty($srvArr) ? '-' : sprintf('min=%+dms med=%+dms max=%+dms', (int) min($srvArr), (int) percentile($srvArr, 0.5), (int) max($srvArr));
 
-        echo "\n? [VPS-EVAL] Inquiry bertahap:\n";
-        echo sprintf("   - n=%d: rtt[%s] srvArrival[%s] verdicts[%s]\n",
+        $deferredLog .= "\n? [VPS-EVAL] Inquiry bertahap:\n";
+        $deferredLog .= sprintf("   - n=%d: rtt[%s] srvArrival[%s] verdicts[%s]\n",
             count($inquiryStats), $rttStr, $srvStr, $verdictStr);
-        echo sprintf(
+        $deferredLog .= sprintf(
             "   - presisi fire: drift min=%+.3fms med=%+.3fms max=%+.3fms\n",
             min($fireDrifts),
             percentile($fireDrifts, 0.5),
             max($fireDrifts)
         );
-        echo sprintf(
+        $deferredLog .= sprintf(
             "   - anti-tumpuk: minGap=%dms guard=%d/%d maxShift=%.3fms"
             . " pumpCrossed=%d\n",
             MIN_DISPATCH_GAP_MS,
@@ -1434,7 +1499,7 @@ function runStaggeredInquiry(
             $pumpCrossedCount
         );
         if (!empty($dispatchWindowValues)) {
-            echo sprintf(
+            $deferredLog .= sprintf(
                 "   - dispatch window: add med=%.3fms | exec med=%.3fms"
                 . " | total p95=%.3fms max=%.3fms\n",
                 percentile($addValues, 0.5),
@@ -1458,7 +1523,7 @@ function runStaggeredInquiry(
             $knownConnects,
             static fn($value) => $value === 0
         ));
-        echo sprintf(
+        $deferredLog .= sprintf(
             "   - curl median: dns=%.1fms tcp=%.1fms tls=%.1fms ttfb=%s | reused=%s\n",
             percentile($dnsValues, 0.5),
             percentile($tcpValues, 0.5),
@@ -1479,14 +1544,14 @@ function runStaggeredInquiry(
                 $firstStop = $s;
             }
         }
-        echo "\n? [VPS-EVAL] srvEst (diagnostik, bukan dasar tuning lead):\n";
+        $deferredLog .= "\n? [VPS-EVAL] srvEst (diagnostik, bukan dasar tuning lead):\n";
         if ($firstSuccess) {
-            echo sprintf("   - First SUCCESS srvEst: %+dms\n", (int) $firstSuccess['srv_arrival']);
+            $deferredLog .= sprintf("   - First SUCCESS srvEst: %+dms\n", (int) $firstSuccess['srv_arrival']);
         } else {
-            echo "   - First SUCCESS: tidak ada (zonk run)\n";
+            $deferredLog .= "   - First SUCCESS: tidak ada (zonk run)\n";
         }
         if ($firstStop) {
-            echo sprintf("   - First OUT-OF-STOCK srvEst: %+dms\n", (int) $firstStop['srv_arrival']);
+            $deferredLog .= sprintf("   - First OUT-OF-STOCK srvEst: %+dms\n", (int) $firstStop['srv_arrival']);
         }
 
         // Vps verdict
@@ -1496,21 +1561,197 @@ function runStaggeredInquiry(
         elseif ($successCount === 2) $tier = '? GOOD (2 voucher)';
         elseif ($successCount === 1) $tier = '? OK (1 voucher)';
 
-        echo "\n? [VPS-EVAL] Verdict: $tier";
-        if ($phaseElapsed > 1000) echo " | ⚠️  PHASE > 1s (TTFB/antrean backend tinggi)";
-        echo "\n";
+        $deferredLog .= "\n? [VPS-EVAL] Verdict: $tier";
+        if ($phaseElapsed > 1000) $deferredLog .= " | ⚠️  PHASE > 1s (TTFB/antrean backend tinggi)";
+        $deferredLog .= "\n";
 
         // RTT war didominasi TTFB origin. Kualitas VPS dinilai dari clock,
         // connection reuse, TCP dan TLS; bukan angka RTT ini saja.
         if (!empty($inquiryStats)) {
             $salvo1MedianRtt = percentile(array_column($inquiryStats, 'rtt'), 0.5);
-            echo "? [VPS-EVAL] Inquiry median RTT/TTFB: {$salvo1MedianRtt}ms"
+            $deferredLog .= "? [VPS-EVAL] Inquiry median RTT/TTFB: {$salvo1MedianRtt}ms"
                . " (observasi backend; bukan alasan tunggal mengganti VPS)\n";
         }
     }
-    echo "\n";
+    $deferredLog .= "\n";
 
-    return array_values($successMap);
+    return [array_values($successMap), array_values($retryCandidates), $deferredLog];
+}
+
+// ----------------------------------------------------------------------
+// RETRY INQUIRY ROTASI
+// Retry hingga 100x jika response HTTP 406 (error captcha) atau HTTP 429
+// (Transaction is suspicous).
+// Jeda: ACAK 4s, 5s, atau 6s di setiap percobaan (random, bukan rotasi).
+// Rotasi body: setiap retry mengambil ulang token captcha dari body berikutnya di pool.
+// ----------------------------------------------------------------------
+function runInquiryRetryLoop(array $retryCandidates, array $poolBodies, int &$totalPaid): array {
+    $delays = INQUIRY_RETRY_DELAYS_SEC;
+    $maxRetries = INQUIRY_RETRY_MAX_ATTEMPTS;
+    $totalBodies = count($poolBodies);
+    $allSuccess = [];
+
+    $pendingOrders = [];
+    foreach ($retryCandidates as $candidate) {
+        $userKey = $candidate['order']['userId'] . '|' . $candidate['order']['serverId'];
+        $pendingOrders[$userKey] = [
+            'order'      => $candidate['order'],
+            'body_index' => $candidate['body_index'] ?? 0,
+            'userKey'    => $userKey,
+        ];
+    }
+
+    echo "\n=== MEMULAI RETRY INQUIRY ROTASI (Maks {$maxRetries}x, jeda acak 4s/5s/6s) ===\n";
+    echo "Pending order untuk retry: " . count($pendingOrders) . " order | Stok body pool: {$totalBodies} body\n\n";
+
+    for ($attempt = 1; $attempt <= $maxRetries && !empty($pendingOrders); $attempt++) {
+        // Jeda acak 4s, 5s, atau 6s di setiap percobaan (bukan rotasi berurutan).
+        $delaySec = $delays[random_int(0, count($delays) - 1)];
+        echo "⏳ [RETRY #{$attempt}/{$maxRetries}] Jeda {$delaySec} detik sebelum retry...\n";
+        sleep($delaySec);
+
+        $nowWallTime = date('H:i:s') . '.' . sprintf('%04d', (int)((microtime(true) - floor(microtime(true))) * 10000));
+        echo "[RETRY #{$attempt}/{$maxRetries} @ {$nowWallTime}] Memproses " . count($pendingOrders) . " order...\n";
+
+        // Ambil token captcha baru untuk setiap pending order dengan rotasi body
+        $preparedRetryInquiries = [];
+        foreach ($pendingOrders as $userKey => &$item) {
+            // Rotasi ke body berikutnya di pool
+            $item['body_index'] = ($item['body_index'] + 1) % $totalBodies;
+            $bodyItem = $poolBodies[$item['body_index']];
+            $bodyId = (int) ($bodyItem['id'] ?? 0);
+
+            // Ambil token captcha
+            $token = fetchSingleCaptchaToken($bodyItem);
+            if ($token === null) {
+                // Coba fallback ke body berikutnya jika reload pertama gagal
+                $item['body_index'] = ($item['body_index'] + 1) % $totalBodies;
+                $bodyItem = $poolBodies[$item['body_index']];
+                $bodyId = (int) ($bodyItem['id'] ?? 0);
+                echo "[RETRY #{$attempt}][$userKey] Body sebelumnya gagal, coba fallback body #{$bodyId}...\n";
+                $token = fetchSingleCaptchaToken($bodyItem);
+            }
+
+            if ($token === null) {
+                echo "[RETRY #{$attempt}][$userKey] ⚠️  Gagal mendapatkan token CAPTCHA untuk body #{$bodyId}\n";
+                continue;
+            }
+
+            $headers = buildInquiryHeaders($token);
+            $inquiryBody = buildInquiryBody($item['order']);
+            $ch = createCurlSession();
+            configureCurlHandle(
+                $ch,
+                'https://gopay.co.id/games/v1/order/inquiry',
+                'POST',
+                $headers,
+                $inquiryBody,
+                ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => INQUIRY_TIMEOUT_MS]
+            );
+
+            $preparedRetryInquiries[] = [
+                'ch'         => $ch,
+                'order'      => $item['order'],
+                'userKey'    => $userKey,
+                'headers'    => $headers,
+                'body_id'    => $bodyId,
+                'body_index' => $item['body_index'],
+                'started'    => microtime(true),
+            ];
+        }
+        unset($item);
+
+        if (empty($preparedRetryInquiries)) {
+            echo "[RETRY #{$attempt}] Tidak ada handle inquiry yang siap dikirim. Lanjut ke percobaan berikutnya...\n";
+            continue;
+        }
+
+        $mh = curl_multi_init();
+        foreach ($preparedRetryInquiries as $meta) {
+            curl_multi_add_handle($mh, $meta['ch']);
+        }
+        runMultiHandles($mh);
+
+        $multiResults = [];
+        while ($multiInfo = curl_multi_info_read($mh)) {
+            if (isset($multiInfo['handle'])) {
+                $multiResults[curlHandleKey($multiInfo['handle'])] = (int) ($multiInfo['result'] ?? 0);
+            }
+        }
+
+        foreach ($preparedRetryInquiries as $meta) {
+            $ch = $meta['ch'];
+            $multiResult = $multiResults[curlHandleKey($ch)] ?? 0;
+            $resp = curl_multi_getcontent($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlErr = curl_error($ch);
+            $curlErrno = curl_errno($ch);
+            if ($curlErrno === 0 && $multiResult !== 0) {
+                $curlErrno = $multiResult;
+                if ($curlErr === '' && function_exists('curl_strerror')) {
+                    $curlErr = curl_strerror($multiResult);
+                }
+            }
+            $net = collectCurlNetworkTiming($ch);
+            $totalTimeSec = $net['total_ms'] / 1000.0;
+            if ($totalTimeSec <= 0) {
+                $totalTimeSec = microtime(true) - $meta['started'];
+            }
+            $elapsed = (int) round($totalTimeSec * 1000);
+            $responseCompletedAt = $meta['started'] + $totalTimeSec;
+            $responseWallTime = formatWallTime($responseCompletedAt, 4);
+
+            $payload = ($resp !== false && $resp !== null) ? decodeResponseBody((string) $resp) : null;
+            $errText = $payload ? extractApiErrorMessage($payload) : ($curlErrno ? "cURL[$curlErrno] $curlErr" : '');
+            $verdict = classifyInquiryResponse($code, $errText, $payload);
+
+            $userKey = $meta['userKey'];
+            $tag = "[$responseWallTime][RETRY #{$attempt}/{$maxRetries}][jeda {$delaySec}s][$userKey][body#{$meta['body_id']}][rtt {$elapsed}ms][HTTP $code]";
+
+            if ($verdict['status'] === 'success') {
+                echo "$tag ✅ OrderID: {$verdict['orderId']}\n";
+                $successItem = [
+                    'order'   => $meta['order'],
+                    'orderId' => $verdict['orderId'],
+                    'headers' => $meta['headers'],
+                ];
+                $allSuccess[] = $successItem;
+                unset($pendingOrders[$userKey]);
+
+                // Eksekusi pembayaran langsung untuk order yang berhasil
+                echo "[PAYMENT] Menjalankan parallel payment untuk {$userKey} (OrderID: {$verdict['orderId']})...\n";
+                $paid = runParallelPayment([$successItem]);
+                $totalPaid += $paid;
+            } elseif ($verdict['status'] === 'stop') {
+                $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
+                echo "$tag ❌ {$verdict['status']}: $shortErr (voucher habis, hentikan retry untuk user ini)\n";
+                unset($pendingOrders[$userKey]);
+            } elseif (in_array($verdict['status'], ['user_invalid', 'skip_user', 'region_block'], true)) {
+                $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
+                echo "$tag ❌ {$verdict['status']}: $shortErr (hentikan retry untuk user ini)\n";
+                unset($pendingOrders[$userKey]);
+            } else {
+                // Masih error (HTTP 406 error captcha / HTTP 429 transaction is suspicous / retry)
+                $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
+                echo "$tag ⚠️  {$verdict['status']}: $shortErr\n";
+            }
+
+            curl_multi_remove_handle($mh, $ch);
+            @curl_close($ch);
+        }
+        curl_multi_close($mh);
+
+        if (empty($pendingOrders)) {
+            echo "\n✅ Semua order telah selesai (berhasil atau dihentikan) pada retry #{$attempt}!\n";
+            break;
+        }
+    }
+
+    if (!empty($pendingOrders) && $attempt > $maxRetries) {
+        echo "\n⚠️  Mencapai batas maksimal {$maxRetries}x retry. Sisa order yang belum berhasil: " . count($pendingOrders) . "\n";
+    }
+
+    return $allSuccess;
 }
 
 // ----------------------------------------------------------------------
@@ -2200,7 +2441,8 @@ function gpyPay(): void {
                 $preparedInquiries[] = prepareInquiry(
                     $order,
                     $captchaToken,
-                    (int) ($poolBodies[$orderIndex]['id'] ?? 0)
+                    (int) ($poolBodies[$orderIndex]['id'] ?? 0),
+                    $orderIndex
                 );
             }
             return count($preparedInquiries);
@@ -2213,12 +2455,32 @@ function gpyPay(): void {
     );
 
     // ===================== SINGLE INQUIRY BERTAHAP =====================
-    $inquirySuccess = runStaggeredInquiry($preparedInquiries, $offsetMs);
+    // Detail burst ([NET] + ringkasan + VPS-EVAL) TIDAK langsung tampil:
+    // ditahan di $burstDetailLog dan baru dicetak setelah retry selesai,
+    // supaya log saat war tetap bersih (hasil inquiry -> langsung retry).
+    [$inquirySuccess, $retryCandidates, $burstDetailLog] = runStaggeredInquiry($preparedInquiries, $offsetMs);
 
-    // ===================== PARALLEL PAYMENT =====================
-    $success = runParallelPayment($inquirySuccess);
+    // ===================== PARALLEL PAYMENT (BURST AWAL) =====================
+    $totalPaid = 0;
+    if (!empty($inquirySuccess)) {
+        echo "Memulai Parallel Payment (burst awal)...\n";
+        $totalPaid += runParallelPayment($inquirySuccess);
+    }
 
-    echo "\n? FULL FLOW SELESAI! Berhasil: $success / " . count($orders) . "\n";
+    // ===================== RETRY INQUIRY ROTASI =====================
+    if (!empty($retryCandidates)) {
+        runInquiryRetryLoop($retryCandidates, $poolBodies, $totalPaid);
+    }
+
+    // Detail burst ([NET] + ringkasan + VPS-EVAL) baru ditampilkan setelah
+    // semua proses selesai.
+    echo $burstDetailLog;
+
+    echo "\n? FULL FLOW SELESAI! Berhasil: $totalPaid / " . count($orders) . "\n";
+}
+
+if (defined('SKIP_WAR_EXEC') && SKIP_WAR_EXEC) {
+    return;
 }
 
 if ($TIMING_SELF_TEST_MODE) {
