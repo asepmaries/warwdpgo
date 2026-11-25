@@ -1,0 +1,2539 @@
+<?php
+// ======================================================================
+// GOPAY MLBB WDP - WAR EDITION (Pool Bodies + Staggered Inquiry)
+//
+// Strategi:
+//  - Stok body CAPTCHA diklaim SEKALI dari pool Cloudflare (claim_bodies.php)
+//    dan disimpan di bodies.json (maks 10 body). Satu order memakai SATU body.
+//  - Token captcha TIDAK dibuat di awal (token hanya berlaku ~120 detik).
+//    Token dibuat per order, masing-masing dari body-nya sendiri, secara
+//    paralel saat sisa waktu war <= 60 detik. Token hanya di memori, tidak
+//    pernah ditulis ke file.
+//  - Lead time fix dibaca dari lead.txt (per VPS), bukan auto-tune.
+//    Konvensi: positif = fire SETELAH war | negatif = fire SEBELUM war.
+//    Contoh: lead.txt isi -25 → fire 25ms sebelum 17:00:00 (T-25ms).
+//  - Maksimal 10 user unik ditembak bertahap dari lead dengan jeda tetap 20ms.
+//  - Warm-up tunggal T-2.5s (10 paralel) untuk warm TLS pool sebelum burst.
+//  - Salvo burst inquiry pertama bertahap sesuai target waktu.
+//  - Jika response gagal HTTP 406 (error captcha) atau HTTP 429 (transaction suspicous),
+//    lakukan retry dengan jeda ACAK 4s, 5s, atau 6s hingga maks 100x retry.
+//  - Setiap retry merotasi body dari stok pool dan mengambil ulang token captcha.
+//  - Identitas perangkat BUKAN acak lagi: dibaca dari bodies.json (hasil klaim
+//    claim_bodies-v2.php dari pool D1 — satu perangkat + header identitas
+//    aslinya per VPS) dan dipakai SAMA untuk reload Google dan inquiry
+//    GoPay. Warm-up tetap SM-X700. Klaim lama tanpa perangkat jatuh ke
+//    fallback SM-X700 (getFixedDeviceUserAgent).
+//  - Target server-arrival adalah 0ms (T=0).
+//  - Pool TIDAK dihubungi saat war (tidak butuh kunci API di VPS). Renew
+//    lease + pantau kesehatan body adalah tugas controller.
+// ======================================================================
+if (php_sapi_name() !== 'cli') {
+    die("Script ini hanya boleh dijalankan via CLI\n");
+}
+$CLI_ARGS = $_SERVER['argv'] ?? [];
+$TIMING_SELF_TEST_MODE =
+    in_array('--timing-self-test', $CLI_ARGS, true)
+    || in_array('--self-test-timing', $CLI_ARGS, true);
+date_default_timezone_set('Asia/Jakarta');
+set_time_limit(0);
+ignore_user_abort(true);
+// PHP 8.5+ deprecates curl_close() (no-op since 8.0). Sembunyikan supaya log bersih.
+error_reporting(E_ALL & ~E_DEPRECATED);
+
+// ----------------------------------------------------------------------
+// AUTO-LOG: tulis semua output ke STDOUT dan file loghasil.txt secara simultan.
+// File loghasil.txt akan di-truncate setiap script start (fresh log per run).
+// ----------------------------------------------------------------------
+$LOG_FILE = __DIR__ . '/loghasil.txt';
+$LOG_FH   = $TIMING_SELF_TEST_MODE ? null : fopen($LOG_FILE, 'w');
+if ($LOG_FH === false) {
+    fwrite(STDERR, "[WARN] Tidak bisa buka loghasil.txt untuk tulis. Lanjut tanpa logging file.\n");
+    $LOG_FH = null;
+}
+if ($LOG_FH !== null) {
+    // Tulis header marker
+    fwrite($LOG_FH, "=== WAR LOG START @ " . date('Y-m-d H:i:s') . " === host=" . php_uname('n') . "\n\n");
+    fflush($LOG_FH);
+}
+
+// Output buffering: tee ke STDOUT + file
+ob_start(function ($buffer) use (&$LOG_FH) {
+    if ($LOG_FH !== null && $buffer !== '') {
+        fwrite($LOG_FH, $buffer);
+        fflush($LOG_FH);
+    }
+    return $buffer; // tetap kirim ke stdout
+}, 1); // chunk size 1 byte → flush setiap echo langsung tampil
+ob_implicit_flush(true);
+
+// Pastikan buffer di-flush dan file ditutup saat script selesai (normal/error/fatal)
+register_shutdown_function(function () use (&$LOG_FH) {
+    @ob_end_flush();
+    if ($LOG_FH !== null) {
+        fwrite($LOG_FH, "\n=== WAR LOG END @ " . date('Y-m-d H:i:s') . " ===\n");
+        fclose($LOG_FH);
+    }
+});
+
+// ----------------------------------------------------------------------
+// KONFIGURASI WAR
+// ----------------------------------------------------------------------
+// Lead time dibaca dari lead.txt (per-VPS). Format: 1 angka dalam ms.
+// Konvensi: NEGATIF = fire SEBELUM war start (duluan).
+//           POSITIF = fire SETELAH war start (telat).
+// Contoh isi lead.txt: -25 → fire T-25ms | 25 → fire T+25ms | 0 → tepat war.
+const BURST_LEAD_MS_DEFAULT  = 0;            // Fallback kalau lead.txt tidak ada.
+const INQUIRY_STAGGER_MS     = 20;           // 10 slot mencakup 252ms; tidak memakai akhir_lead.txt.
+const SCHEDULER_ARM_LEAD_MS  = 100;          // Scheduler mengambil alih 100ms sebelum slot pertama.
+const MIN_DISPATCH_GAP_MS    = 8;            // Hindari request menumpuk bila host sempat stall.
+const MINI_PROBE2_LEAD_MS    = 2500;         // Beri provider lambat waktu cukup untuk mengisi TLS pool.
+const MINI_PROBE2_PARALLEL   = 10;           // Satu koneksi hangat untuk setiap slot inquiry.
+const MIN_USERS              = 1;            // Batas minimal user unik per VPS/proses.
+const MAX_USERS              = 10;           // Batas keras user per VPS/proses.
+const CAPTCHA_MAX_ATTEMPTS   = 3;
+const CAPTCHA_RETRY_BASE_MS  = 600;
+const CAPTCHA_FETCH_LEAD_MS  = 60000;        // Token dibuat saat sisa waktu war <= 60 detik (token hanya berlaku ~120 detik).
+const POOL_BODIES_FILE       = 'bodies.json'; // Stok body pool (klaim sekali via claim_bodies.php).
+const RECAPTCHA_RELOAD_URL   = 'https://www.google.com/recaptcha/api2/reload?k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o';
+const INQUIRY_CONNECT_TO_MS  = 2200;
+const INQUIRY_TIMEOUT_MS    = 5200;
+const PAYMENT_CONNECT_TO_MS = 2200;
+const PAYMENT_TIMEOUT_MS    = 5200;
+const TARGET_SRV_MS_DEFAULT = 0.0;           // Target arrival server tepat T=0.
+
+const INQUIRY_RETRY_MAX_ATTEMPTS = 100;
+const INQUIRY_RETRY_DELAYS_SEC  = [4, 5, 6]; // Jeda retry diacak per percobaan: 4s, 5s, atau 6s.
+
+// Pola pesan error dari endpoint inquiry
+const STOP_PATTERNS = [
+    'out of stock', 'sold out', 'kuota habis', 'voucher habis',
+    'stok habis', 'sudah habis',
+];
+const INVALID_USER_PATTERNS = [
+    'role_null', 'role null', 'error_role_null',
+    'invalid user', 'user not found', 'user_not_found',
+    'error_invalidzoneid', 'invalid zone',
+];
+const SKIP_USER_PATTERNS = [
+    'reached the redeem limit', 'already redeemed', 'sudah pernah',
+    'act_subscrip_no_config', 'subscrip_no_config',
+];
+const REGION_BLOCK_PATTERNS = [
+    'regional restrictions', 'region restriction', 'outside region',
+    'outside regional', 'di luar region', 'diluar region', 'luar region',
+    'luar zona promo', 'zona promo',
+];
+const RETRY_PATTERNS = [
+    'not available', 'not yet', 'belum dimulai', 'belum tersedia',
+    'tidak tersedia', 'try again', 'temporarily', 'service unavailable',
+    'error captcha', 'oops, error captcha', 'transaction is suspicous',
+    'transaction is suspicious', 'suspicous', 'suspicious',
+];
+
+// ----------------------------------------------------------------------
+// TIMING DARI waktu.txt
+// ----------------------------------------------------------------------
+function readOffsetMs(string $path, int $defaultMs, string $label): array {
+    if (!file_exists($path)) {
+        return [$defaultMs, false];
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    $raw = trim((string) ($lines[0] ?? ''));
+    if (!preg_match('/^[+-]?\d+$/', $raw)) {
+        die("❌ Nilai {$label} tidak valid. Baris pertama harus berupa angka milidetik.\n");
+    }
+    return [(int) $raw, true];
+}
+
+function isPhpFunctionEnabled(string $name): bool {
+    if (!function_exists($name)) return false;
+    $disabled = array_filter(array_map(
+        'trim',
+        explode(',', (string) ini_get('disable_functions'))
+    ));
+    return !in_array($name, $disabled, true);
+}
+
+function trackingField(string $output, string $label): ?string {
+    $pattern = '/^' . preg_quote($label, '/') . '\s*:\s*(.+)$/mi';
+    if (!preg_match($pattern, $output, $match)) return null;
+    return preg_replace('/\s+/', ' ', trim($match[1]));
+}
+
+function logClockSyncStatus(): void {
+    $now = new DateTimeImmutable('now');
+    $base = "[CLOCK] local=" . $now->format('Y-m-d H:i:s.uP')
+          . " timezone=" . date_default_timezone_get();
+
+    // PHP memakai clock OS. Chrony, bila aktif, mendisiplinkan clock OS ini.
+    // Query dibatasi 2 detik dan dilakukan jauh sebelum fase war.
+    if (!isPhpFunctionEnabled('shell_exec')) {
+        echo $base . " chrony=not_checked(shell_exec_disabled)\n";
+        return;
+    }
+
+    $tracking = @shell_exec('LC_ALL=C timeout 2s chronyc -n tracking 2>&1');
+    if (is_string($tracking) && trackingField($tracking, 'Stratum') !== null) {
+        $fields = [
+            'stratum'         => trackingField($tracking, 'Stratum'),
+            'system_time'     => trackingField($tracking, 'System time'),
+            'last_offset'     => trackingField($tracking, 'Last offset'),
+            'rms_offset'      => trackingField($tracking, 'RMS offset'),
+            'root_delay'      => trackingField($tracking, 'Root delay'),
+            'root_dispersion' => trackingField($tracking, 'Root dispersion'),
+            'leap'            => trackingField($tracking, 'Leap status'),
+        ];
+        $parts = [];
+        foreach ($fields as $key => $value) {
+            if ($value !== null && $value !== '') {
+                $parts[] = $key . '="' . str_replace('"', '', $value) . '"';
+            }
+        }
+        echo $base . " source=chrony " . implode(' ', $parts) . "\n";
+        return;
+    }
+
+    $timedatectl = @shell_exec(
+        'LC_ALL=C timeout 2s timedatectl show -p NTP -p NTPSynchronized --no-pager 2>&1'
+    );
+    $timedatectl = is_string($timedatectl)
+        ? preg_replace('/\s+/', ' ', trim($timedatectl))
+        : '';
+    if ($timedatectl !== '' && stripos($timedatectl, 'not found') === false) {
+        echo $base . ' source=timedatectl status="'
+           . str_replace('"', '', $timedatectl) . "\"\n";
+        return;
+    }
+
+    echo $base . " source=os chrony=unavailable\n";
+}
+
+function waitForExactBurstTime(
+    int $leadMs,
+    ?callable $beforeBurst = null,
+    ?callable $prepareBurst = null,
+    ?callable $fetchTokens = null
+): bool {
+    global $WAR_START_WALL_US;
+    $file = 'waktu.txt';
+    if (!file_exists($file)) die("❌ File 'waktu.txt' tidak ditemukan!\n");
+    $content = trim(file_get_contents($file));
+    if (!preg_match('/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/', $content, $m)) {
+        die("❌ Format waktu.txt salah! Gunakan HH:MM atau HH:MM:SS\n");
+    }
+    $hour = (int)$m[1]; $minute = (int)$m[2]; $second = isset($m[3]) ? (int)$m[3] : 0;
+    $target = new DateTime('now');
+    $target->setTime($hour, $minute, $second, 0);
+    if ($target < new DateTime('now')) $target->modify('+1 day');
+    // Simpan war start absolut (T=0) sebelum dimodify untuk lead
+    $WAR_START_WALL_US = $target->getTimestamp() * 1_000_000 + ((int) $target->format('v')) * 1000;
+    $target->modify($leadMs >= 0 ? "-{$leadMs} milliseconds" : "+" . abs($leadMs) . " milliseconds");
+    $leadDescription = $leadMs >= 0
+        ? "T-" . $leadMs . "ms (sebelum war)"
+        : "T+" . abs($leadMs) . "ms (setelah war start)";
+    echo "⏰ Target burst dari waktu.txt: {$content}.000 WIB\n";
+    echo "🎯 Target server-arrival     : " . sprintf('%.0fms (T=0)', TARGET_SRV_MS_DEFAULT) . "\n";
+    echo "⚡ Lead time eksekusi       : {$leadDescription}\n";
+    echo "⚡ Burst dieksekusi pada    : " . $target->format('Y-m-d H:i:s') . sprintf('.%03d', (int) $target->format('v')) . " WIB\n";
+    echo "Menunggu waktu tepat...\n\n";
+    $targetTimestamp = $target->getTimestamp();
+    $targetWallMicro = $targetTimestamp * 1_000_000;
+    // FIX: getTimestamp() ter-floor ke detik. Tambahkan komponen milidetik via format('v').
+    $targetWallMicro += ((int) $target->format('v')) * 1000;
+    $diff = $targetTimestamp - time();
+    if ($diff > 15) {
+        sleep($diff - 12);
+        echo "Masuk fase fine tuning (last 12 detik)...\n";
+    } elseif ($diff > 6) {
+        sleep($diff - 6);
+        echo "Masuk fase fine tuning...\n";
+    }
+    $remainingNs = max(0, (int) round(($targetWallMicro - (microtime(true) * 1_000_000)) * 1000));
+    $targetMono = hrtime(true) + $remainingNs;
+    $preBurstTriggered = false;
+    $tokensFetched = false;
+    while (true) {
+        $remaining = $targetMono - hrtime(true);
+        if ($remaining <= 0) {
+            // Start sangat mepet: ambil token dulu (walaupun burst sudah telat,
+            // fire dengan token valid lebih baik daripada mati tanpa token).
+            if (!$tokensFetched && $fetchTokens !== null) {
+                $tokensFetched = true;
+                $fetchTokens();
+            }
+            if (!$preBurstTriggered && $prepareBurst !== null) {
+                $prepareStart = hrtime(true);
+                $prepareBurst();
+                echo "[SCHED] Prepare terlambat selesai dalam "
+                   . sprintf('%.3fms', (hrtime(true) - $prepareStart) / 1_000_000)
+                   . "\n";
+            }
+            echo "[SCHED] MISSED_ARM: kontrol kembali "
+               . sprintf('%.3fms', abs($remaining) / 1_000_000)
+               . " setelah target slot pertama.\n";
+            return true;
+        }
+        $remainingUs = intdiv($remaining, 1000);
+        // Token dibuat di sini (sisa waktu <= 60 detik), BUKAN di awal script:
+        // token hanya berlaku ~120 detik, jadi fetch di T-60s membuat umur
+        // token saat fire ~60 detik. Dijalankan sebelum warm-up/prepare.
+        if (!$tokensFetched && $fetchTokens !== null && $remainingUs <= CAPTCHA_FETCH_LEAD_MS * 1000) {
+            $tokensFetched = true;
+            $fetchStart = hrtime(true);
+            $fetchTokens();
+            echo "[CAPTCHA] Token fetch selesai dalam "
+               . sprintf('%.3fms', (hrtime(true) - $fetchStart) / 1_000_000)
+               . "\n";
+        }
+        if (!$preBurstTriggered && $remainingUs <= MINI_PROBE2_LEAD_MS * 1000) {
+            $preBurstTriggered = true;
+            // CRITICAL: warm-up tidak boleh menunda burst. Hitung budget = sisa waktu ke
+            // burst dikurangi safety margin 200ms. Warm-up curl di-cut kalau lewat budget,
+            // supaya VPS dengan koneksi cold/lambat tetap fire burst ON-TIME.
+            // (Bukti war 30 Mei: warm-up 2000ms → burst telat 500ms → zonk total.)
+            $budgetMs = intdiv($remainingUs, 1000) - 200;
+            if ($beforeBurst !== null && $budgetMs >= 150) {
+                $warmStart = hrtime(true);
+                $beforeBurst($budgetMs);
+                echo "[SCHED] Warm-up duration="
+                   . sprintf('%.3fms', (hrtime(true) - $warmStart) / 1_000_000)
+                   . "\n";
+            } elseif ($beforeBurst !== null) {
+                echo "[WARM-UP] Skip — sisa waktu ke burst < 350ms (jaga burst tetap on-time)\n";
+            }
+            // Siapkan seluruh handle setelah warm-up agar slot pertama hanya perlu
+            // add + curl_multi_exec, tanpa biaya membangun header/body/cURL.
+            if ($prepareBurst !== null) {
+                $prepareStart = hrtime(true);
+                $countPrepared = $prepareBurst();
+                $countStr = is_numeric($countPrepared) ? " {$countPrepared}" : "";
+                echo "[SCHED] Prepare{$countStr} handle duration="
+                   . sprintf('%.3fms', (hrtime(true) - $prepareStart) / 1_000_000)
+                   . "\n";
+            }
+            continue;
+        }
+        if ($remainingUs <= SCHEDULER_ARM_LEAD_MS * 1000) {
+            echo "[SCHED] Armed dengan sisa="
+               . sprintf('%.3fms', $remainingUs / 1000)
+               . "; final wait memakai monotonic clock.\n";
+            return true;
+        }
+        if ($remainingUs > 50000) usleep(12000);
+        elseif ($remainingUs > 25000) usleep(4000);
+        else continue;
+    }
+}
+
+// ----------------------------------------------------------------------
+// FUNGSI PEMBANTU
+// ----------------------------------------------------------------------
+// getRandomUserAgent() DIHAPUS di v2 device-headers: identitas acak diganti
+// header perangkat nyata dari D1 (bodies.json -> 'device'). Identitas acak
+// bisa tidak cocok dengan body (fingerprint mismatch) — itulah yang
+// coba dihindari desain ini. Fallback untuk klaim lama: getFixedDeviceUserAgent().
+
+// Identitas perangkat tetap SM-X700 — dipakai sebagai fallback kalau
+// bodies.json tidak membawa perangkat (klaim v1 lama), dan untuk warm-up.
+// Header lengkap perangkat: user-agent, sec-ch-ua, sec-ch-ua-mobile,
+// sec-ch-ua-platform, accept-language, x-client-data (reload saja),
+// x-requested-with (hanya kalau perangkat itu memang mengirimnya:
+// SM-X700 ya, Sony G8342 tidak).
+function getFixedDeviceUserAgent(): array {
+    return [
+        'user-agent' => 'Mozilla/5.0 (Linux; Android 13; SM-X700 Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.8103.50 Mobile Safari/537.36',
+        'sec-ch-ua' => '"Not-A.Brand";v="99", "Android WebView";v="157", "Chromium";v="157"',
+        // x-requested-with mark.via.gp tercatat di inquiry tablet SM-X700;
+        // Sony G8342 tidak mengirimnya, jadi kunci ini hanya ada di fallback ini.
+        'x-requested-with' => 'mark.via.gp',
+    ];
+}
+
+function generateSentryTrace(): array {
+    $traceId = bin2hex(random_bytes(16));
+    $parentId = bin2hex(random_bytes(8));
+    return [
+        'sentry-trace' => "$traceId-$parentId-1",
+        'baggage' => "sentry-environment=production,sentry-release=vQMo5GDY05ylXAQzFup_V,sentry-public_key=3f2904ecef7bc7859d6299eaf817040c,sentry-trace_id=$traceId,sentry-sample_rate=1,sentry-sampled=true"
+    ];
+}
+
+function formatMicrotimeNow(): string {
+    $now = microtime(true);
+    $sec = floor($now);
+    $micros = (int)(($now - $sec) * 1_000_000);
+    return date('H:i:s', (int)$sec) . '.' . str_pad((string)$micros, 6, '0', STR_PAD_LEFT);
+}
+
+function formatWallTime(float $timestamp, int $fractionDigits = 4): string {
+    $scale = 10 ** $fractionDigits;
+    $ticks = (int) round($timestamp * $scale);
+    $seconds = intdiv($ticks, $scale);
+    $fraction = $ticks % $scale;
+    return date('H:i:s', $seconds)
+        . '.'
+        . str_pad((string) $fraction, $fractionDigits, '0', STR_PAD_LEFT);
+}
+
+function decodeResponseBody(string $resp): array {
+    $decoded = json_decode($resp, true);
+    if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+        return $decoded;
+    }
+    return ['raw_response' => trim($resp)];
+}
+
+function extractApiErrorMessage($payload): string {
+    if (!is_array($payload)) {
+        return trim((string) $payload);
+    }
+    $message = $payload['errors'][0]['message']
+        ?? $payload['errors'][0]['message_title']
+        ?? $payload['data']['errors'][0]['message']
+        ?? $payload['data']['errors'][0]['message_title']
+        ?? $payload['message']
+        ?? $payload['error']
+        ?? $payload['data']['message']
+        ?? $payload['data']['error']
+        ?? $payload['raw_response']
+        ?? $payload['data']['raw_response']
+        ?? '';
+    if ($message !== '') {
+        return trim((string) $message);
+    }
+    $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    return $json === false ? '' : $json;
+}
+
+function buildHeaderLines(array $headers, bool $withCompression = true): array {
+    $headerLines = [];
+    foreach ($headers as $key => $value) {
+        if ($value === null || $value === '') {
+            continue;
+        }
+        if ($withCompression && strtolower($key) === 'accept-encoding') {
+            continue;
+        }
+        $headerLines[] = "$key: $value";
+    }
+    if ($withCompression) {
+        $headerLines[] = 'Accept-Encoding: gzip, deflate';
+    }
+    return $headerLines;
+}
+
+function createCurlSession() {
+    $ch = curl_init();
+    $baseOptions = [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_ENCODING => 'gzip,deflate',
+        CURLOPT_HEADER => false,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_NOSIGNAL => true,
+        CURLOPT_FORBID_REUSE => false,
+        CURLOPT_FRESH_CONNECT => false,
+        CURLOPT_TCP_KEEPALIVE => 1,
+        CURLOPT_DNS_CACHE_TIMEOUT => 300,
+    ];
+    if (defined('CURLOPT_TCP_FASTOPEN')) {
+        $baseOptions[CURLOPT_TCP_FASTOPEN] = 1;
+    }
+    if (defined('CURLOPT_HTTP_VERSION') && defined('CURL_HTTP_VERSION_2TLS')) {
+        $baseOptions[CURLOPT_HTTP_VERSION] = CURL_HTTP_VERSION_2TLS;
+    }
+    curl_setopt_array($ch, $baseOptions);
+    attachShareToHandle($ch);
+    return $ch;
+}
+
+function getSharedCurlHandle() {
+    static $share = null;
+    if ($share !== null) return $share;
+    if (!function_exists('curl_share_init')) return null;
+    $share = curl_share_init();
+    if (defined('CURL_LOCK_DATA_DNS')) {
+        curl_share_setopt($share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+    }
+    if (defined('CURL_LOCK_DATA_SSL_SESSION')) {
+        curl_share_setopt($share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    }
+    if (defined('CURL_LOCK_DATA_CONNECT')) {
+        curl_share_setopt($share, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+    }
+    return $share;
+}
+
+function attachShareToHandle($ch): void {
+    $share = getSharedCurlHandle();
+    if ($share !== null && defined('CURLOPT_SHARE')) {
+        @curl_setopt($ch, CURLOPT_SHARE, $share);
+    }
+}
+
+function configureCurlHandle($ch, string $url, string $method, array $headers, $body = null, array $options = []): void {
+    $method = strtoupper($method);
+    $headerLines = buildHeaderLines($headers, true);
+    if ($body !== null && !array_key_exists('content-type', array_change_key_case($headers, CASE_LOWER))) {
+        $headerLines[] = 'Content-Type: application/json';
+    }
+    $connectTimeoutMs = (int)($options['connect_timeout_ms'] ?? 2500);
+    $timeoutMs = (int)($options['timeout_ms'] ?? 7000);
+    $curlOptions = [
+        CURLOPT_URL => $url,
+        CURLOPT_HTTPHEADER => $headerLines,
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_CONNECTTIMEOUT_MS => $connectTimeoutMs,
+        CURLOPT_TIMEOUT_MS => $timeoutMs,
+    ];
+    if ($body !== null) {
+        $curlOptions[CURLOPT_POSTFIELDS] = is_array($body) ? json_encode($body) : $body;
+    } else {
+        $curlOptions[CURLOPT_POSTFIELDS] = null;
+    }
+    if ($method === 'GET') {
+        // Pastikan handle yang pernah dipakai POST benar-benar kembali menjadi
+        // GET tanpa request body.
+        $curlOptions[CURLOPT_HTTPGET] = true;
+    }
+    curl_setopt_array($ch, $curlOptions);
+}
+
+function curlHttpVersionLabel(int $version): string {
+    $known = [
+        'CURL_HTTP_VERSION_1_0' => '1.0',
+        'CURL_HTTP_VERSION_1_1' => '1.1',
+        'CURL_HTTP_VERSION_2_0' => '2',
+        'CURL_HTTP_VERSION_2TLS' => '2',
+        'CURL_HTTP_VERSION_3' => '3',
+    ];
+    foreach ($known as $constantName => $label) {
+        if (defined($constantName) && $version === constant($constantName)) {
+            return $label;
+        }
+    }
+    return $version > 0 ? (string) $version : '?';
+}
+
+function collectCurlNetworkTiming($ch): array {
+    $info = curl_getinfo($ch);
+    $toMs = static fn($value): float => max(0.0, (float) $value * 1000.0);
+    $numConnects = isset($info['num_connects']) ? (int) $info['num_connects'] : null;
+    if (defined('CURLINFO_NUM_CONNECTS')) {
+        $reportedConnects = @curl_getinfo($ch, constant('CURLINFO_NUM_CONNECTS'));
+        if ($reportedConnects !== false) {
+            $numConnects = (int) $reportedConnects;
+        }
+    }
+
+    // Nilai *_time adalah timestamp kumulatif sejak curl dimulai.
+    $dnsAt      = $toMs($info['namelookup_time'] ?? 0);
+    $connectAt  = $toMs($info['connect_time'] ?? 0);
+    $tlsAt      = $toMs($info['appconnect_time'] ?? 0);
+    $readyAt    = $toMs($info['pretransfer_time'] ?? 0);
+    $firstByteAt = $toMs($info['starttransfer_time'] ?? 0);
+    $totalAt    = $toMs($info['total_time'] ?? 0);
+
+    $tcpMs = $connectAt > 0 ? max(0.0, $connectAt - $dnsAt) : 0.0;
+    $tlsMs = $tlsAt > 0 ? max(0.0, $tlsAt - $connectAt) : 0.0;
+    $requestReadyAt = max($dnsAt, $connectAt, $tlsAt, $readyAt);
+    $ttfbMs = $firstByteAt > 0
+        ? max(0.0, $firstByteAt - $requestReadyAt)
+        : null;
+    $bodyMs = $firstByteAt > 0 && $totalAt >= $firstByteAt
+        ? $totalAt - $firstByteAt
+        : null;
+
+    return [
+        'dns_ms'       => $dnsAt,
+        'tcp_ms'       => $tcpMs,
+        'tls_ms'       => $tlsMs,
+        'ttfb_ms'      => $ttfbMs,
+        'body_ms'      => $bodyMs,
+        'total_ms'     => $totalAt,
+        'num_connects' => $numConnects,
+        'http_version' => curlHttpVersionLabel((int) ($info['http_version'] ?? 0)),
+        'remote_ip'    => (string) ($info['primary_ip'] ?? '?'),
+        'remote_port'  => (int) ($info['primary_port'] ?? 0),
+        'local_ip'     => (string) ($info['local_ip'] ?? '?'),
+        'local_port'   => (int) ($info['local_port'] ?? 0),
+    ];
+}
+
+function formatOptionalMs(?float $value): string {
+    return $value === null ? '?' : sprintf('%.1fms', $value);
+}
+
+function formatCurlNetworkLog(
+    string $userKey,
+    float $plannedOffsetMs,
+    float $firedOffsetMs,
+    array $net,
+    int $curlErrno
+): string {
+    $connects = $net['num_connects'] === null ? '?' : (string) $net['num_connects'];
+    $reused = $net['num_connects'] === null
+        ? '?'
+        : ($net['num_connects'] === 0 ? 'yes' : 'no');
+    return "[NET][$userKey]"
+         . "[plan" . sprintf('%+.1f', $plannedOffsetMs) . "ms]"
+         . "[fire" . sprintf('%+.1f', $firedOffsetMs) . "ms]"
+         . "[dns" . formatOptionalMs($net['dns_ms']) . "]"
+         . "[tcp" . formatOptionalMs($net['tcp_ms']) . "]"
+         . "[tls" . formatOptionalMs($net['tls_ms']) . "]"
+         . "[ttfb" . formatOptionalMs($net['ttfb_ms']) . "]"
+         . "[body" . formatOptionalMs($net['body_ms']) . "]"
+         . "[total" . formatOptionalMs($net['total_ms']) . "]"
+         . "[connects=$connects reused=$reused http={$net['http_version']}]"
+         . "[remote={$net['remote_ip']}:{$net['remote_port']}]"
+         . "[local={$net['local_ip']}:{$net['local_port']}]"
+         . "[errno=$curlErrno]";
+}
+
+function runMultiHandles($mh): void {
+    do {
+        do {
+            $status = curl_multi_exec($mh, $running);
+        } while ($status === CURLM_CALL_MULTI_PERFORM);
+
+        if ($running > 0) {
+            $selected = curl_multi_select($mh, 0.05);
+            if ($selected === -1) {
+                usleep(1000);
+            }
+        }
+    } while ($running > 0 && $status === CURLM_OK);
+}
+
+function warmUpBurstSession(array $baseHeaders): void {
+    // Deprecated stub: kept for backwards compat with any external caller.
+}
+
+/**
+ * Warm-up T-MINI_PROBE2_LEAD_MS sebelum burst (default 2.5s): HEAD ke root
+ * host yang sama, memakai MINI_PROBE2_PARALLEL koneksi paralel supaya
+ * TCP/TLS pool hangat tanpa menyentuh endpoint/order quota.
+ * RTT yang dilaporkan hanya untuk informasi di log, tidak dipakai untuk
+ * re-tune lead.
+ *
+ * $maxMs: budget timeout. Warm-up call di-cut kalau melebihi budget supaya
+ *         TIDAK menunda burst (VPS koneksi cold/lambat tetap fire on-time).
+ */
+function miniProbe2ReWarm(int $maxMs = 1200): array {
+    $maxMs = max(150, $maxMs);
+    $connectTo = min(INQUIRY_CONNECT_TO_MS, $maxMs);
+    $mh = curl_multi_init();
+    $handles = [];
+    for ($i = 0; $i < MINI_PROBE2_PARALLEL; $i++) {
+        $ua = getFixedDeviceUserAgent();
+        $headers = [
+            'user-agent' => $ua['user-agent'],
+            'sec-ch-ua' => $ua['sec-ch-ua'],
+            'sec-ch-ua-platform' => '"Android"',
+            'sec-ch-ua-mobile' => '?1',
+            'accept' => '*/*',
+            'origin' => 'https://gopay.co.id',
+            'referer' => 'https://gopay.co.id/games/mobile-legends-bang-bang',
+            'sec-fetch-site' => 'same-origin',
+            'sec-fetch-mode' => 'cors',
+            'sec-fetch-dest' => 'empty',
+            'accept-language' => 'en-US,en;q=0.9',
+        ];
+        $ch = createCurlSession();
+        configureCurlHandle(
+            $ch,
+            'https://gopay.co.id/',
+            'HEAD',
+            $headers,
+            null,
+            ['connect_timeout_ms' => $connectTo, 'timeout_ms' => $maxMs]
+        );
+        curl_setopt($ch, CURLOPT_NOBODY, true);
+        curl_multi_add_handle($mh, $ch);
+        $handles[] = $ch;
+    }
+    // Hard deadline: jangan loop lebih lama dari budget (curl timeout sudah set,
+    // tapi ini pengaman tambahan supaya loop multi tidak overshoot).
+    $deadline = microtime(true) + ($maxMs / 1000);
+    $running = null;
+    do {
+        do { $st = curl_multi_exec($mh, $running); } while ($st === CURLM_CALL_MULTI_PERFORM);
+        if ($running > 0) {
+            $sel = curl_multi_select($mh, 0.05);
+            if ($sel === -1) usleep(1000);
+        }
+    } while ($running > 0 && $st === CURLM_OK && microtime(true) < $deadline);
+
+    $multiResults = [];
+    while ($multiInfo = curl_multi_info_read($mh)) {
+        if (isset($multiInfo['handle'])) {
+            $multiResults[curlHandleKey($multiInfo['handle'])] =
+                (int) ($multiInfo['result'] ?? -1);
+        }
+    }
+    $rttMs = [];
+    foreach ($handles as $ch) {
+        $errno = curl_errno($ch);
+        $info  = curl_getinfo($ch);
+        $multiResult = $multiResults[curlHandleKey($ch)] ?? null;
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+        if (
+            $errno !== 0
+            || $multiResult !== CURLE_OK
+            || (int) ($info['http_code'] ?? 0) <= 0
+        ) {
+            continue;
+        }
+        $totalSec = (float) ($info['total_time'] ?? 0);
+        if ($totalSec > 0) $rttMs[] = $totalSec * 1000;
+    }
+    curl_multi_close($mh);
+    return $rttMs;
+}
+
+// ----------------------------------------------------------------------
+// UTILITAS: percentile (dipakai di ringkasan inquiry)
+// ----------------------------------------------------------------------
+function percentile(array $values, float $p): float {
+    if (empty($values)) return 0.0;
+    sort($values);
+    $idx = (int) ceil($p * count($values)) - 1;
+    $idx = max(0, min(count($values) - 1, $idx));
+    return $values[$idx];
+}
+
+// ----------------------------------------------------------------------
+// CAPTCHA: body dari stok pool, token per order di T-60 detik
+// ----------------------------------------------------------------------
+// Stok body diklaim SEKALI via claim_bodies.php -> bodies.json (maks 10).
+// Satu order memakai SATU body (body index ke-i untuk order ke-i).
+// Token TIDAK dibuat di awal: token hanya berlaku ~120 detik, jadi token
+// dibuat paralel saat sisa waktu war <= 60 detik (callback di
+// waitForExactBurstTime) dan hanya disimpan di memori — tidak pernah
+// ditulis ke file (tidak ada lagi reload.txt / captcha_token.txt).
+// Pool TIDAK dihubungi saat war; renew lease adalah tugas controller.
+
+// $device: header identitas perangkat dari D1 (bodies.json -> 'device').
+// Kalau null (klaim v1 lama), pakai fallback SM-X700. x-requested-with
+// hanya dikirim kalau perangkat itu memang mengirimnya di HAR (SM-X700:
+// mark.via.gp; Sony G8342: tidak ada — HAR session-live 2026-11-25).
+// x-client-data hanya ada di reload, tidak di inquiry.
+function captchaReloadHeaders(?array $device = null): array {
+    $device = $device ?? getFixedDeviceUserAgent();
+    $headers = [
+        'sec-ch-ua-platform' => $device['sec-ch-ua-platform'] ?? '"Android"',
+        'user-agent' => $device['user-agent'],
+        'sec-ch-ua' => $device['sec-ch-ua'],
+        'content-type' => 'application/x-protobuffer',
+        'sec-ch-ua-mobile' => $device['sec-ch-ua-mobile'] ?? '?1',
+        'accept' => '*/*',
+        'origin' => 'https://www.google.com',
+        'sec-fetch-site' => 'same-origin',
+        'sec-fetch-mode' => 'cors',
+        'sec-fetch-dest' => 'empty',
+        'referer' => 'https://www.google.com/recaptcha/api2/anchor?ar=1&k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o&co=aHR0cHM6Ly9nb3BheS5jby5pZDo0NDM.&hl=en&v=4i3aN5wAweL7i3ADI7BSX4B-&size=invisible&anchor-ms=20000&execute-ms=30000&ovv=CADq00gF&cb=4wgtvvffxogz',
+        'accept-language' => $device['accept-language'] ?? 'en-US,en;q=0.9',
+        'cookie' => '_GRECAPTCHA=09AKhCRwig412Sinsks-swNMr3esXkLlnNjxA421fPn7UuqRB9ligadmBfSqi3AcgGO1bFgLp-oRgNIOIbGU1z9Dw; NID=Cp8CCAES0QEBM9Agl5f5KPhyJJl_9q1q-kmQnU8DE5w-ar-n5pEnpZ4eSUoTRY480PWuwlNzNJeDRXQ8A66236sPxxkXN_B_KHxqKMTRHX-506Y3fRb6w7NF99N6u_xk6WQ394XUr9jD6-0tmtexUxSVPLST0wDmxWoLvLakpL_os09LlukbfnKqiaFkRJF-j9iIHCbOlw5lknTrLEhbyn-jQ7r4i271foXMmzPCFbZUWzU07LlU10IQ7yI05O_jYnhtEQchXeRDlOyMQNSI02aZoDWDpoOQ6igBMkUBcEpCz0GeXDlrG9r96kWzKSq5O56WtEc70yBcA6Z5MVk7IEq-gs1nxjavSyZ0FbCw6bGuNClUmTLhSywSfjreC4_KOQ0',
+    ];
+    if (!empty($device['x-requested-with'])) {
+        $headers['x-requested-with'] = $device['x-requested-with'];
+    }
+    if (!empty($device['x-client-data'])) {
+        $headers['x-client-data'] = $device['x-client-data'];
+    }
+    return $headers;
+}
+
+// Perangkat dari bodies.json (klaim v2): ['model'=>..., 'headers'=>[...]].
+// Return null kalau file klaim lama (v1) tanpa perangkat — pemanggil
+// memakai fallback SM-X700.
+function loadPoolDevice(string $path): ?array {
+    $data = json_decode((string) file_get_contents($path), true);
+    if (!is_array($data) || !is_array($data['device'] ?? null)) return null;
+    $device = $data['device'];
+    if (empty($device['headers']['user-agent'] ?? '') || empty($device['headers']['sec-ch-ua'] ?? '')) return null;
+    return $device;
+}
+
+function loadPoolBodies(string $path, int $orderCount): array {
+    if (!is_file($path)) {
+        throw new RuntimeException(
+            "bodies.json tidak ditemukan di {$path}. Klaim stok body dulu "
+            . "(claim_bodies.php) — satu VPS klaim 10 body sekali dari pool."
+        );
+    }
+    $data = json_decode((string) file_get_contents($path), true);
+    if (!is_array($data) || empty($data['items']) || !is_array($data['items'])) {
+        throw new RuntimeException("bodies.json tidak valid (bukan JSON / tidak ada items).");
+    }
+    $bodies = [];
+    $seen = [];
+    foreach ($data['items'] as $item) {
+        $id = (int) ($item['id'] ?? 0);
+        $bin = base64_decode((string) ($item['body_b64'] ?? ''), true);
+        if ($id <= 0 || $bin === false || strlen($bin) < 1000) {
+            throw new RuntimeException(
+                "bodies.json berisi body tidak valid (id={$id}). Klaim ulang stok body."
+            );
+        }
+        if (isset($seen[$id])) {
+            throw new RuntimeException(
+                "bodies.json berisi body duplikat (id={$id}). Klaim ulang stok body."
+            );
+        }
+        $seen[$id] = true;
+        $bodies[] = ['id' => $id, 'body' => $bin];
+    }
+    if (count($bodies) < $orderCount) {
+        throw new RuntimeException(
+            "Stok body (" . count($bodies) . ") kurang dari jumlah order ({$orderCount}). "
+            . "Klaim tambahan dari pool."
+        );
+    }
+    return $bodies;
+}
+
+/**
+ * Satu body -> satu token, diambil paralel via curl_multi. Order yang
+ * gagal di-retry (maks CAPTCHA_MAX_ATTEMPTS). Return per order
+ * ['token' => ..., 'ua' => ...] (index sama dengan urutan order):
+ * SATU identitas perangkat (dari D1, sama untuk semua order di VPS ini),
+ * dipakai di reload DAN inquiry (harus sama). Token hanya di memori.
+ * $deviceHeaders: ['headers'=>[...]] dari loadPoolDevice(), atau null
+ * untuk fallback SM-X700.
+ */
+function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount, ?array $deviceHeaders = null): array {
+    $tokens = array_fill(0, $orderCount, null);
+    $pending = range(0, $orderCount - 1);
+    // Satu identitas perangkat untuk semua order — dari D1, bukan acak.
+    $device = $deviceHeaders['headers'] ?? $deviceHeaders ?? getFixedDeviceUserAgent();
+    $uas = [];
+    for ($i = 0; $i < $orderCount; $i++) {
+        $uas[$i] = $device;
+    }
+
+    for ($attempt = 1; $attempt <= CAPTCHA_MAX_ATTEMPTS && !empty($pending); $attempt++) {
+        if ($attempt > 1) {
+            $delayMs = (CAPTCHA_RETRY_BASE_MS * ($attempt - 1)) + random_int(0, 250);
+            echo "[CAPTCHA] Retry " . count($pending) . " order dalam {$delayMs}ms...\n";
+            usleep($delayMs * 1000);
+        }
+        echo "[CAPTCHA] Ambil " . count($pending) . " token paralel"
+           . " (percobaan {$attempt}/" . CAPTCHA_MAX_ATTEMPTS . ")...\n";
+        $mh = curl_multi_init();
+        $handles = [];
+        foreach ($pending as $idx) {
+            $ch = createCurlSession();
+            configureCurlHandle(
+                $ch,
+                RECAPTCHA_RELOAD_URL,
+                'POST',
+                captchaReloadHeaders($uas[$idx]),
+                $poolBodies[$idx]['body'],
+                ['connect_timeout_ms' => 4000, 'timeout_ms' => 10000]
+            );
+            curl_multi_add_handle($mh, $ch);
+            $handles[$idx] = $ch;
+        }
+        runMultiHandles($mh);
+
+        $nextPending = [];
+        foreach ($handles as $idx => $ch) {
+            $resp = curl_multi_getcontent($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $errno = curl_errno($ch);
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+            $token = null;
+            if ($errno === 0 && $code === 200 && is_string($resp)
+                && preg_match('/"rresp","([^"]+)"/', $resp, $m)) {
+                $token = $m[1];
+            }
+            if ($token !== null) {
+                $tokens[$idx] = ['token' => $token, 'ua' => $uas[$idx]];
+                echo "[CAPTCHA] Order " . ($idx + 1) . " token OK"
+                   . " (body #{$poolBodies[$idx]['id']}, " . strlen($token) . " karakter)\n";
+            } else {
+                $nextPending[] = $idx;
+                echo "[CAPTCHA] Order " . ($idx + 1) . " gagal"
+                   . " (HTTP {$code}, errno {$errno})\n";
+            }
+        }
+        curl_multi_close($mh);
+        $pending = $nextPending;
+    }
+
+    if (!empty($pending)) {
+        throw new RuntimeException(
+            "Gagal mengambil token CAPTCHA untuk order: "
+            . implode(',', array_map(static fn($i) => $i + 1, $pending))
+            . " setelah " . CAPTCHA_MAX_ATTEMPTS . " percobaan"
+        );
+    }
+    return $tokens;
+}
+
+/**
+ * Ambil satu token CAPTCHA dari Google reCAPTCHA reload menggunakan satu item body binary.
+ * $ua di sini adalah header identitas perangkat (array dari D1), bukan UA acak.
+ */
+function fetchSingleCaptchaToken(array $bodyItem, int $timeoutMs = 5000, ?array $ua = null): ?string {
+    $headers = captchaReloadHeaders($ua);
+    $ch = createCurlSession();
+    configureCurlHandle(
+        $ch,
+        RECAPTCHA_RELOAD_URL,
+        'POST',
+        $headers,
+        $bodyItem['body'],
+        ['connect_timeout_ms' => 3000, 'timeout_ms' => $timeoutMs]
+    );
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errno = curl_errno($ch);
+    curl_close($ch);
+
+    if ($errno === 0 && $code === 200 && is_string($resp) && preg_match('/"rresp","([^"]+)"/', $resp, $m)) {
+        $token = $m[1];
+        if (strlen($token) >= 50) {
+            return $token;
+        }
+    }
+    return null;
+}
+
+/**
+ * Cek apakah respons inquiry merupakan kandidat retry:
+ * HANYA HTTP 406 (Oops, error captcha) dan HTTP 429 (Transaction is suspicous).
+ * Status lain (stok habis, user invalid, sudah redeem, region block, HTTP lain,
+ * timeout) TIDAK di-retry.
+ */
+function shouldRetryInquiry(int $code, string $errText, string $status): bool {
+    if (in_array($status, ['stop', 'user_invalid', 'skip_user', 'region_block'], true)) {
+        return false;
+    }
+    if ($code === 406 || $code === 429) {
+        return true;
+    }
+    return false;
+}
+
+// ----------------------------------------------------------------------
+// CLASSIFY RESPONSE INQUIRY
+// Return: ['status' => 'success'|'stop'|'user_invalid'|'skip_user'|'region_block'|'retry'|'unknown', 'orderId' => ?string]
+// ----------------------------------------------------------------------
+function classifyInquiryResponse(int $code, ?string $errorText, ?array $payload): array {
+    if (($code === 200 || $code === 201) && is_array($payload)) {
+        $orderId = $payload['data']['orderId'] ?? $payload['orderId'] ?? null;
+        if (is_string($orderId) && $orderId !== '') {
+            return ['status' => 'success', 'orderId' => $orderId];
+        }
+    }
+
+    // Cocokkan pola terhadap seluruh response body, bukan hanya pesan error
+    // yang berhasil diekstrak.
+    $payloadText = is_array($payload)
+        ? json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+        : '';
+    $msg = strtolower(trim((string) $errorText . ' ' . ($payloadText !== false ? $payloadText : '')));
+
+    foreach (STOP_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'stop', 'orderId' => null];
+        }
+    }
+    foreach (INVALID_USER_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'user_invalid', 'orderId' => null];
+        }
+    }
+    foreach (SKIP_USER_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'skip_user', 'orderId' => null];
+        }
+    }
+    foreach (REGION_BLOCK_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'region_block', 'orderId' => null];
+        }
+    }
+    foreach (RETRY_PATTERNS as $p) {
+        if ($msg !== '' && strpos($msg, $p) !== false) {
+            return ['status' => 'retry', 'orderId' => null];
+        }
+    }
+    if ($code === 0 || ($code >= 400 && $code < 600)) {
+        return ['status' => 'retry', 'orderId' => null];
+    }
+
+    return ['status' => 'unknown', 'orderId' => null];
+}
+
+// ----------------------------------------------------------------------
+// REQUEST WRAPPER & POLLING
+// ----------------------------------------------------------------------
+function request(string $url, string $method = 'POST', array $headers = [], $body = null, $ch = null, array $options = []) {
+    $ownHandle = false;
+    if ($ch === null) {
+        $ch = createCurlSession();
+        $ownHandle = true;
+    }
+    configureCurlHandle($ch, $url, $method, $headers, $body, $options);
+    $responseBody = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errno = curl_errno($ch);
+    $errorMsg = curl_error($ch);
+    if ($ownHandle) {
+        curl_close($ch);
+    }
+    if ($errno) throw new RuntimeException("cURL error [$errno]: $errorMsg");
+    if ($httpCode >= 400) {
+        throw new RuntimeException("HTTP $httpCode - $responseBody");
+    }
+    $decoded = json_decode($responseBody, true);
+    return json_last_error() === JSON_ERROR_NONE ? $decoded : ['raw_response' => $responseBody];
+}
+
+function getTransactionUntilReady(string $txnId, array $headers, $ch = null, array $delaysMs = [90, 120, 160, 220, 300, 420, 560, 750, 950]): ?array {
+    $url = "https://gopay.co.id/games/v1/transaction/$txnId";
+    foreach ($delaysMs as $index => $delayMs) {
+        try {
+            $data = request($url, 'GET', $headers, null, $ch, [
+                'connect_timeout_ms' => 1500,
+                'timeout_ms' => 3500,
+            ]);
+            if (!empty($data['actionPayment']['paymentDirect']) || !empty($data['actionPayment']['deeplinkRedirect'])) {
+                return $data;
+            }
+        } catch (Exception $e) {}
+        if ($index !== array_key_last($delaysMs)) {
+            usleep($delayMs * 1000);
+        }
+    }
+    return null;
+}
+
+// ----------------------------------------------------------------------
+// BUILD INQUIRY HEADERS (per-attempt: refresh sentry + x-timestamp)
+// ----------------------------------------------------------------------
+function buildInquiryHeaders(string $captchaToken, ?array $ua = null): array {
+    // $ua: header identitas perangkat yang dipakai saat reload token ini
+    // (dari D1). Kalau null, pakai fallback SM-X700. x-requested-with
+    // hanya dikirim kalau perangkat itu memang mengirimnya (Sony: tidak).
+    $ua = $ua ?? getFixedDeviceUserAgent();
+    $sentry = generateSentryTrace();
+    $headers = [
+        'sec-ch-ua-platform' => $ua['sec-ch-ua-platform'] ?? '"Android"',
+        'authorization' => 'Bearer undefined',
+        'sec-ch-ua' => $ua['sec-ch-ua'],
+        'sec-ch-ua-mobile' => $ua['sec-ch-ua-mobile'] ?? '?1',
+        'baggage' => $sentry['baggage'],
+        'sentry-trace' => $sentry['sentry-trace'],
+        'user-agent' => $ua['user-agent'],
+        'x-captcha-token' => $captchaToken,
+        'content-type' => 'application/json',
+        'x-client' => 'mobile',
+        'accept' => '*/*',
+        'origin' => 'https://gopay.co.id',
+        'sec-fetch-site' => 'same-origin',
+        'sec-fetch-mode' => 'cors',
+        'sec-fetch-dest' => 'empty',
+        'referer' => 'https://gopay.co.id/games/mobile-legends-bang-bang',
+        'accept-language' => $ua['accept-language'] ?? 'en-US,en;q=0.9',
+        'x-timestamp' => (string) round(microtime(true) * 1000),
+        'cookie' => 'acw_tc=9581d31c17748587792257129e0deb0a34ec18f05b8a68459d00a474893677; slug=mobile-legends-bang-bang',
+    ];
+    if (!empty($ua['x-requested-with'])) {
+        $headers['x-requested-with'] = $ua['x-requested-with'];
+    }
+    return $headers;
+}
+
+function buildInquiryBody(array $order): array {
+    return [
+        'productId' => 19,
+        'productItemId' => 366,
+        'data' => ['userId' => $order['userId'], 'zoneId' => $order['serverId']],
+        'paymentChannelId' => 73,
+        'phoneNumber' => '628783219212',
+        'voucher' => 'WARWDPGG',
+        'quantity' => 1,
+    ];
+}
+
+// ----------------------------------------------------------------------
+// PREPARE INQUIRY (satu handle per user, belum dikirim)
+// ----------------------------------------------------------------------
+function prepareInquiry(array $order, string $captchaToken, int $bodyId = 0, int $bodyIndex = 0, ?array $ua = null): array {
+    $headers = buildInquiryHeaders($captchaToken, $ua);
+    $body    = buildInquiryBody($order);
+    $ch = createCurlSession();
+    configureCurlHandle(
+        $ch,
+        'https://gopay.co.id/games/v1/order/inquiry',
+        'POST',
+        $headers,
+        $body,
+        ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => INQUIRY_TIMEOUT_MS]
+    );
+    // Easy handle baru dimasukkan ke satu shared multi-handle tepat pada
+    // slotnya. Ini menghindari overhead memompa 10 multi-handle terpisah.
+    return [
+        'ch'         => $ch,
+        'order'      => $order,
+        'headers'    => $headers,
+        'started'    => null,
+        'body_id'    => $bodyId,
+        'body_index' => $bodyIndex,
+    ];
+}
+
+// ----------------------------------------------------------------------
+// SINGLE INQUIRY BERTAHAP
+// ----------------------------------------------------------------------
+function pumpCurlMultiNonBlocking($multi, int &$running): int {
+    do {
+        $status = curl_multi_exec($multi, $running);
+    } while ($status === CURLM_CALL_MULTI_PERFORM);
+    return $status;
+}
+
+function schedulerSpinGuardUs(): int {
+    // PHP/Windows pada host lama dapat membulatkan usleep pendek menjadi
+    // 15-30ms. Linux VPS punya sleep resolusi tinggi; guard 2ms memberi hasil
+    // terbaik pada A/B VPS 1-core sekaligus hemat CPU/steal time.
+    return PHP_OS_FAMILY === 'Windows' ? 25000 : 2000;
+}
+
+/**
+ * Tunggu slot monotonic dengan sleep bertahap lalu spin pada guard terakhir.
+ * Pump hanya boleh berjalan di luar guard; durasinya tetap dicatat agar log
+ * dapat membedakan jitter host dari curl_multi yang melintasi target.
+ */
+function waitForMonotonicSlot(
+    int $targetMonoNs,
+    ?callable $pump = null,
+    ?array &$telemetry = null
+): int {
+    $spinGuardUs = schedulerSpinGuardUs();
+    $telemetry = [
+        'spin_guard_us'       => $spinGuardUs,
+        'pump_calls'          => 0,
+        'pump_max_ms'         => 0.0,
+        'pump_crossed_target' => false,
+    ];
+
+    while (true) {
+        $nowMonoNs = hrtime(true);
+        $remainingNs = $targetMonoNs - $nowMonoNs;
+        if ($remainingNs <= 0) {
+            return $nowMonoNs;
+        }
+
+        $remainingUs = intdiv($remainingNs, 1000);
+        if ($remainingUs <= $spinGuardUs) {
+            do {
+                $releasedMonoNs = hrtime(true);
+            } while ($releasedMonoNs < $targetMonoNs);
+            return $releasedMonoNs;
+        }
+
+        if ($pump !== null) {
+            $pumpStartMonoNs = hrtime(true);
+            $pump();
+            $pumpEndMonoNs = hrtime(true);
+            $pumpDurationMs = ($pumpEndMonoNs - $pumpStartMonoNs) / 1_000_000;
+            $telemetry['pump_calls']++;
+            $telemetry['pump_max_ms'] = max(
+                $telemetry['pump_max_ms'],
+                $pumpDurationMs
+            );
+            if (
+                $pumpStartMonoNs < $targetMonoNs
+                && $pumpEndMonoNs >= $targetMonoNs
+            ) {
+                $telemetry['pump_crossed_target'] = true;
+            }
+
+            // Pump dapat menghabiskan sebagian/seluruh budget. Hitung ulang
+            // sebelum sleep agar tidak tidur melewati target.
+            $nowMonoNs = hrtime(true);
+            $remainingNs = $targetMonoNs - $nowMonoNs;
+            if ($remainingNs <= 0) {
+                return $nowMonoNs;
+            }
+            $remainingUs = intdiv($remainingNs, 1000);
+            if ($remainingUs <= $spinGuardUs) {
+                do {
+                    $releasedMonoNs = hrtime(true);
+                } while ($releasedMonoNs < $targetMonoNs);
+                return $releasedMonoNs;
+            }
+        }
+
+        $sleepBudgetUs = $remainingUs - $spinGuardUs;
+        $sleepFloorUs = PHP_OS_FAMILY === 'Windows' ? 16000 : 500;
+        if ($sleepBudgetUs <= $sleepFloorUs) {
+            do {
+                $releasedMonoNs = hrtime(true);
+            } while ($releasedMonoNs < $targetMonoNs);
+            return $releasedMonoNs;
+        }
+        $sleepUs = min(
+            $sleepBudgetUs,
+            12000,
+            max($sleepFloorUs, intdiv($sleepBudgetUs, 2))
+        );
+        usleep($sleepUs);
+    }
+}
+
+function curlHandleKey($handle): string {
+    return is_object($handle)
+        ? 'o' . spl_object_id($handle)
+        : 'r' . (int) $handle;
+}
+
+function guardedDispatchTargetMonoNs(
+    int $nominalTargetMonoNs,
+    ?int $lastDispatchMonoNs
+): int {
+    if ($lastDispatchMonoNs === null) {
+        return $nominalTargetMonoNs;
+    }
+    return max(
+        $nominalTargetMonoNs,
+        $lastDispatchMonoNs + (MIN_DISPATCH_GAP_MS * 1_000_000)
+    );
+}
+
+function runStaggeredInquiry(
+    array $preparedInquiries,
+    int $leadOffsetMs
+): array {
+    global $WAR_START_WALL_US;
+
+    $totalUsers = count($preparedInquiries);
+    if ($totalUsers === 0) return [[], [], ''];
+
+    // Slot pertama tepat di lead. Sembilan slot berikutnya maju 28ms.
+    // Contoh lead -426ms: -426, -398, ... hingga -174ms.
+    $intervalMs = (float) INQUIRY_STAGGER_MS;
+    $distanceMs = $totalUsers > 1
+        ? INQUIRY_STAGGER_MS * ($totalUsers - 1)
+        : 0;
+    $endLeadOffsetMs = $leadOffsetMs + $distanceMs;
+
+    $successMap = [];      // userId|serverId -> ['order','orderId','headers']
+    $retryCandidates = []; // userId|serverId -> ['order','body_index','last_code','last_err']
+    $deferredLog = ''; // [NET] + ringkasan + VPS-EVAL burst: ditahan, dicetak setelah retry selesai.
+
+    // Petakan T=0 wall-clock ke monotonic clock satu kali. Semua slot dihitung
+    // dari anchor yang sama agar tidak terkena drift akibat usleep/RTT.
+    $clockSampleMonoBeforeNs = hrtime(true);
+    $clockSampleWallUs = microtime(true) * 1_000_000;
+    $clockSampleMonoAfterNs = hrtime(true);
+    $clockSampleMonoNs = intdiv(
+        $clockSampleMonoBeforeNs + $clockSampleMonoAfterNs,
+        2
+    );
+    $clockSampleWindowUs = (
+        $clockSampleMonoAfterNs - $clockSampleMonoBeforeNs
+    ) / 1000;
+    $warStartMonoNs = $clockSampleMonoNs
+        + (int) round(($WAR_START_WALL_US - $clockSampleWallUs) * 1000);
+    $phaseStart = microtime(true);
+    $inquiryStats = []; // [{user, rtt, srvArrival, http, verdict}]
+    $sharedMulti = curl_multi_init();
+    if ($sharedMulti === false) {
+        throw new RuntimeException('Gagal membuat shared curl_multi untuk inquiry');
+    }
+    $running = 0;
+    $multiStatus = CURLM_OK;
+    $lastDispatchMonoNs = null;
+    echo "[SCHED] platform=" . PHP_OS_FAMILY
+       . " spinGuard=" . sprintf('%.3fms', schedulerSpinGuardUs() / 1000)
+       . " arm=" . SCHEDULER_ARM_LEAD_MS . "ms"
+       . " minGap=" . MIN_DISPATCH_GAP_MS . "ms"
+       . " clockMapWindow=" . sprintf('%.3fus', $clockSampleWindowUs) . "\n";
+
+    foreach ($preparedInquiries as $index => $meta) {
+        $plannedOffsetMs = $leadOffsetMs + ($intervalMs * $index);
+        $nominalTargetMonoNs = $warStartMonoNs
+            + (int) round($plannedOffsetMs * 1_000_000);
+        $guardedTargetMonoNs = guardedDispatchTargetMonoNs(
+            $nominalTargetMonoNs,
+            $lastDispatchMonoNs
+        );
+        $guardDelayMs = max(
+            0.0,
+            ($guardedTargetMonoNs - $nominalTargetMonoNs) / 1_000_000
+        );
+        $waitTelemetry = null;
+
+        waitForMonotonicSlot(
+            $guardedTargetMonoNs,
+            static function () use ($sharedMulti, &$running, &$multiStatus): void {
+                $multiStatus = pumpCurlMultiNonBlocking($sharedMulti, $running);
+            },
+            $waitTelemetry
+        );
+
+        $preparedInquiries[$index]['planned_offset_ms'] = $plannedOffsetMs;
+        $preparedInquiries[$index]['guarded_offset_ms'] = (
+            $guardedTargetMonoNs - $warStartMonoNs
+        ) / 1_000_000;
+        $preparedInquiries[$index]['guard_delay_ms'] = $guardDelayMs;
+        $preparedInquiries[$index]['wait_pump_max_ms'] =
+            $waitTelemetry['pump_max_ms'] ?? 0.0;
+        $preparedInquiries[$index]['wait_pump_crossed_target'] =
+            (bool) ($waitTelemetry['pump_crossed_target'] ?? false);
+        $addStartMonoNs = hrtime(true);
+        $addStatus = curl_multi_add_handle(
+            $sharedMulti,
+            $preparedInquiries[$index]['ch']
+        );
+        $preparedInquiries[$index]['add_duration_ms'] = (
+            hrtime(true) - $addStartMonoNs
+        ) / 1_000_000;
+        if ($addStatus !== CURLM_OK) {
+            throw new RuntimeException(
+                "Gagal memasang inquiry slot " . ($index + 1)
+                . " ke shared multi: CURLM {$addStatus}"
+            );
+        }
+
+        // add_handle belum mengirim request. Timestamp fire diambil tepat
+        // sebelum curl_multi_exec yang mengaktifkan transfer.
+        $preparedInquiries[$index]['started'] = microtime(true);
+        $dispatchStartMonoNs = hrtime(true);
+        $lastDispatchMonoNs = $dispatchStartMonoNs;
+        $preparedInquiries[$index]['fired_offset_ms'] = (
+            $dispatchStartMonoNs - $warStartMonoNs
+        ) / 1_000_000;
+        $multiStatus = pumpCurlMultiNonBlocking($sharedMulti, $running);
+        $preparedInquiries[$index]['dispatch_duration_ms'] = (
+            hrtime(true) - $dispatchStartMonoNs
+        ) / 1_000_000;
+        if ($multiStatus !== CURLM_OK) {
+            throw new RuntimeException(
+                "Scheduler inquiry gagal pada slot " . ($index + 1)
+                . ": CURLM {$multiStatus}"
+            );
+        }
+    }
+
+    $scheduleSummary = sprintf(
+        "? INQUIRY BERTAHAP: %d user | lead=%+dms | akhir=%+dms | jarak=%dms | jeda=%.3fms\n",
+        $totalUsers,
+        $leadOffsetMs,
+        $endLeadOffsetMs,
+        $distanceMs,
+        $intervalMs
+    );
+
+    // Semua request sudah ditembak. Lanjutkan satu event loop bersama sampai
+    // seluruh response selesai.
+    do {
+        $multiStatus = pumpCurlMultiNonBlocking($sharedMulti, $running);
+        if ($multiStatus !== CURLM_OK) {
+            throw new RuntimeException("Event loop inquiry gagal: CURLM {$multiStatus}");
+        }
+        if ($running > 0) {
+            $selected = curl_multi_select($sharedMulti, 0.01);
+            if ($selected === -1) {
+                usleep(500);
+            }
+        }
+    } while ($running > 0);
+
+    $multiResults = [];
+    while ($multiInfo = curl_multi_info_read($sharedMulti)) {
+        if (isset($multiInfo['handle'])) {
+            $multiResults[curlHandleKey($multiInfo['handle'])] =
+                (int) ($multiInfo['result'] ?? 0);
+        }
+    }
+
+    // Panen response setelah seluruh handle selesai, tanpa mengirim ulang.
+    foreach ($preparedInquiries as $meta) {
+        $ch = $meta['ch'];
+        $multiResult = $multiResults[curlHandleKey($ch)] ?? 0;
+        $resp = curl_multi_getcontent($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr = curl_error($ch);
+        $curlErrno = curl_errno($ch);
+        // Error transfer per-handle berada di queue curl_multi_info_read().
+        // Tanpa ini timeout multi pernah tercatat menyesatkan sebagai errno=0.
+        if ($curlErrno === 0 && $multiResult !== 0) {
+            $curlErrno = $multiResult;
+            if ($curlErr === '' && function_exists('curl_strerror')) {
+                $curlErr = curl_strerror($multiResult);
+            }
+        }
+        $net = collectCurlNetworkTiming($ch);
+
+        $userKey = $meta['order']['userId'] . '|' . $meta['order']['serverId'];
+        // Pakai total_time milik cURL, bukan waktu panen response. Response
+        // user awal bisa sudah selesai saat scheduler masih menunggu slot lain.
+        $totalTimeSec = $net['total_ms'] / 1000.0;
+        if ($totalTimeSec <= 0) {
+            $totalTimeSec = microtime(true) - $meta['started'];
+        }
+        $elapsed = (int) round($totalTimeSec * 1000);
+        $responseCompletedAt = $meta['started'] + $totalTimeSec;
+        $responseWallTime = formatWallTime($responseCompletedAt, 4);
+        $tRel = ($responseCompletedAt - $phaseStart) * 1000;
+
+        // Estimasi waktu request sampai di server (relatif ke WAR_START / T=0).
+        // Asumsi RTT simetris: server-arrival = fire_wall + (rtt/2)
+        $serverArrivalMs = null;
+        if (!empty($WAR_START_WALL_US)) {
+            $fireWallUs = $meta['started'] * 1_000_000;
+            $serverArrivalUs = $fireWallUs + ($elapsed * 1000 / 2);
+            $serverArrivalMs = ($serverArrivalUs - $WAR_START_WALL_US) / 1000;
+        }
+        $sArr = $serverArrivalMs !== null
+            ? sprintf('srv%+.0fms', $serverArrivalMs)
+            : 'srv?';
+
+        $payload = $resp !== false && $resp !== null
+            ? decodeResponseBody((string) $resp)
+            : null;
+        $errText = $payload
+            ? extractApiErrorMessage($payload)
+            : ($curlErrno ? "cURL[$curlErrno] $curlErr" : '');
+        $verdict = classifyInquiryResponse((int) $code, $errText, $payload);
+
+        $inquiryStats[] = [
+            'user'         => $userKey,
+            'rtt'          => $elapsed,
+            'srv_arrival'  => $serverArrivalMs,
+            'http'         => (int) $code,
+            'verdict'      => $verdict['status'],
+            'planned_fire' => $meta['planned_offset_ms'],
+            'guarded_fire' => $meta['guarded_offset_ms'],
+            'guard_delay'  => $meta['guard_delay_ms'],
+            'actual_fire'  => $meta['fired_offset_ms'],
+            'add_ms'       => $meta['add_duration_ms'] ?? null,
+            'exec_ms'      => $meta['dispatch_duration_ms'] ?? null,
+            'pump_max_ms'  => $meta['wait_pump_max_ms'] ?? null,
+            'pump_crossed' => $meta['wait_pump_crossed_target'] ?? false,
+            'dns_ms'       => $net['dns_ms'],
+            'tcp_ms'       => $net['tcp_ms'],
+            'tls_ms'       => $net['tls_ms'],
+            'ttfb_ms'      => $net['ttfb_ms'],
+            'num_connects' => $net['num_connects'],
+        ];
+
+        $tag = "[$responseWallTime][+" . sprintf('%6.1f', $tRel) . "ms][$userKey]"
+             . "[body#" . ($meta['body_id'] ?? 0) . "]"
+             . "[plan" . sprintf('%+.1f', $meta['planned_offset_ms']) . "ms]"
+             . "[fire" . sprintf('%+.1f', $meta['fired_offset_ms']) . "ms]"
+             . "[single guard" . sprintf('%+.1f', $meta['guard_delay_ms']) . "ms]"
+             . "[rtt {$elapsed}ms][$sArr][HTTP $code]";
+
+        if ($verdict['status'] === 'success') {
+            echo "$tag ✅ OrderID: {$verdict['orderId']}\n";
+            $successMap[$userKey] = [
+                'order'   => $meta['order'],
+                'orderId' => $verdict['orderId'],
+                'headers' => $meta['headers'],
+            ];
+        } else {
+            $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
+            echo "$tag ⚠️  {$verdict['status']}: $shortErr\n";
+            if (shouldRetryInquiry((int) $code, $errText, $verdict['status'])) {
+                $retryCandidates[$userKey] = [
+                    'order'       => $meta['order'],
+                    'body_index'  => $meta['body_index'] ?? 0,
+                    'last_code'   => (int) $code,
+                    'last_err'    => $errText,
+                    'last_status' => $verdict['status'],
+                ];
+            }
+        }
+
+        $deferredLog .= formatCurlNetworkLog(
+            $userKey,
+            (float) $meta['planned_offset_ms'],
+            (float) $meta['fired_offset_ms'],
+            $net,
+            $curlErrno
+        ) . "\n";
+
+        curl_multi_remove_handle($sharedMulti, $ch);
+        @curl_close($ch);
+    }
+    curl_multi_close($sharedMulti);
+
+    $phaseElapsed = (microtime(true) - $phaseStart) * 1000;
+
+    $deferredLog .= "\n" . $scheduleSummary;
+    $deferredLog .= "? Inquiry summary:\n";
+    $deferredLog .= "   - success           : " . count($successMap) . "/" . $totalUsers . "\n";
+    if (!empty($retryCandidates)) {
+        $deferredLog .= "   - retry candidates  : " . count($retryCandidates) . "/" . $totalUsers . "\n";
+    }
+    $deferredLog .= "   - total inquiry call: " . $totalUsers . "\n";
+    $deferredLog .= "   - phase duration    : " . sprintf('%.1f ms', $phaseElapsed) . "\n";
+
+    // ===== AUTO-SUMMARY untuk evaluasi VPS =====
+    if (!empty($inquiryStats)) {
+        $fireDrifts = array_map(
+            fn($s) => $s['actual_fire'] - $s['planned_fire'],
+            $inquiryStats
+        );
+        $addValues = array_values(array_filter(
+            array_column($inquiryStats, 'add_ms'),
+            static fn($value) => $value !== null
+        ));
+        $execValues = array_values(array_filter(
+            array_column($inquiryStats, 'exec_ms'),
+            static fn($value) => $value !== null
+        ));
+        $dispatchWindowValues = [];
+        foreach ($inquiryStats as $stat) {
+            if ($stat['add_ms'] !== null && $stat['exec_ms'] !== null) {
+                $dispatchWindowValues[] = $stat['add_ms'] + $stat['exec_ms'];
+            }
+        }
+        $guardValues = array_column($inquiryStats, 'guard_delay');
+        $guardCount = count(array_filter(
+            $guardValues,
+            static fn($value) => $value > 0.001
+        ));
+        $pumpCrossedCount = count(array_filter(
+            array_column($inquiryStats, 'pump_crossed')
+        ));
+        $rtts        = array_column($inquiryStats, 'rtt');
+        $srvArr      = array_filter(array_column($inquiryStats, 'srv_arrival'), fn($v) => $v !== null);
+        $verdicts    = array_count_values(array_column($inquiryStats, 'verdict'));
+        $verdictStr  = implode(', ', array_map(fn($k, $v) => "$k=$v", array_keys($verdicts), $verdicts));
+        $rttStr      = empty($rtts) ? '-' : sprintf('min=%dms med=%dms max=%dms', min($rtts), percentile($rtts, 0.5), max($rtts));
+        $srvStr      = empty($srvArr) ? '-' : sprintf('min=%+dms med=%+dms max=%+dms', (int) min($srvArr), (int) percentile($srvArr, 0.5), (int) max($srvArr));
+
+        $deferredLog .= "\n? [VPS-EVAL] Inquiry bertahap:\n";
+        $deferredLog .= sprintf("   - n=%d: rtt[%s] srvArrival[%s] verdicts[%s]\n",
+            count($inquiryStats), $rttStr, $srvStr, $verdictStr);
+        $deferredLog .= sprintf(
+            "   - presisi fire: drift min=%+.3fms med=%+.3fms max=%+.3fms\n",
+            min($fireDrifts),
+            percentile($fireDrifts, 0.5),
+            max($fireDrifts)
+        );
+        $deferredLog .= sprintf(
+            "   - anti-tumpuk: minGap=%dms guard=%d/%d maxShift=%.3fms"
+            . " pumpCrossed=%d\n",
+            MIN_DISPATCH_GAP_MS,
+            $guardCount,
+            count($inquiryStats),
+            empty($guardValues) ? 0.0 : max($guardValues),
+            $pumpCrossedCount
+        );
+        if (!empty($dispatchWindowValues)) {
+            $deferredLog .= sprintf(
+                "   - dispatch window: add med=%.3fms | exec med=%.3fms"
+                . " | total p95=%.3fms max=%.3fms\n",
+                percentile($addValues, 0.5),
+                percentile($execValues, 0.5),
+                percentile($dispatchWindowValues, 0.95),
+                max($dispatchWindowValues)
+            );
+        }
+        $dnsValues = array_column($inquiryStats, 'dns_ms');
+        $tcpValues = array_column($inquiryStats, 'tcp_ms');
+        $tlsValues = array_column($inquiryStats, 'tls_ms');
+        $ttfbValues = array_values(array_filter(
+            array_column($inquiryStats, 'ttfb_ms'),
+            static fn($value) => $value !== null
+        ));
+        $knownConnects = array_values(array_filter(
+            array_column($inquiryStats, 'num_connects'),
+            static fn($value) => $value !== null
+        ));
+        $reusedCount = count(array_filter(
+            $knownConnects,
+            static fn($value) => $value === 0
+        ));
+        $deferredLog .= sprintf(
+            "   - curl median: dns=%.1fms tcp=%.1fms tls=%.1fms ttfb=%s | reused=%s\n",
+            percentile($dnsValues, 0.5),
+            percentile($tcpValues, 0.5),
+            percentile($tlsValues, 0.5),
+            empty($ttfbValues) ? '?' : sprintf('%.1fms', percentile($ttfbValues, 0.5)),
+            empty($knownConnects) ? '?' : "{$reusedCount}/" . count($knownConnects)
+        );
+
+        // Estimasi fire + RTT/2 disimpan hanya sebagai diagnostik.
+        // TTFB mengandung antrean/backend, jadi ini bukan arrival origin.
+        $firstSuccess = null;
+        $firstStop    = null;
+        foreach ($inquiryStats as $s) {
+            if ($firstSuccess === null && $s['verdict'] === 'success' && $s['srv_arrival'] !== null) {
+                $firstSuccess = $s;
+            }
+            if ($firstStop === null && $s['verdict'] === 'stop' && $s['srv_arrival'] !== null) {
+                $firstStop = $s;
+            }
+        }
+        $deferredLog .= "\n? [VPS-EVAL] srvEst (diagnostik, bukan dasar tuning lead):\n";
+        if ($firstSuccess) {
+            $deferredLog .= sprintf("   - First SUCCESS srvEst: %+dms\n", (int) $firstSuccess['srv_arrival']);
+        } else {
+            $deferredLog .= "   - First SUCCESS: tidak ada (zonk run)\n";
+        }
+        if ($firstStop) {
+            $deferredLog .= sprintf("   - First OUT-OF-STOCK srvEst: %+dms\n", (int) $firstStop['srv_arrival']);
+        }
+
+        // Vps verdict
+        $successCount = count($successMap);
+        $tier = '⚠️  POOR (zonk)';
+        if ($successCount >= 3) $tier = '✅ EXCELLENT (3+ voucher)';
+        elseif ($successCount === 2) $tier = '? GOOD (2 voucher)';
+        elseif ($successCount === 1) $tier = '? OK (1 voucher)';
+
+        $deferredLog .= "\n? [VPS-EVAL] Verdict: $tier";
+        if ($phaseElapsed > 1000) $deferredLog .= " | ⚠️  PHASE > 1s (TTFB/antrean backend tinggi)";
+        $deferredLog .= "\n";
+
+        // RTT war didominasi TTFB origin. Kualitas VPS dinilai dari clock,
+        // connection reuse, TCP dan TLS; bukan angka RTT ini saja.
+        if (!empty($inquiryStats)) {
+            $salvo1MedianRtt = percentile(array_column($inquiryStats, 'rtt'), 0.5);
+            $deferredLog .= "? [VPS-EVAL] Inquiry median RTT/TTFB: {$salvo1MedianRtt}ms"
+               . " (observasi backend; bukan alasan tunggal mengganti VPS)\n";
+        }
+    }
+    $deferredLog .= "\n";
+
+    return [array_values($successMap), array_values($retryCandidates), $deferredLog];
+}
+
+// ----------------------------------------------------------------------
+// RETRY INQUIRY ROTASI
+// Retry hingga 100x jika response HTTP 406 (error captcha) atau HTTP 429
+// (Transaction is suspicous).
+// Jeda: ACAK 4s, 5s, atau 6s di setiap percobaan (random, bukan rotasi).
+// Rotasi body: setiap retry mengambil ulang token captcha dari body berikutnya di pool.
+// ----------------------------------------------------------------------
+function runInquiryRetryLoop(array $retryCandidates, array $poolBodies, int &$totalPaid, ?array $deviceHeaders = null): array {
+    $delays = INQUIRY_RETRY_DELAYS_SEC;
+    $maxRetries = INQUIRY_RETRY_MAX_ATTEMPTS;
+    $totalBodies = count($poolBodies);
+    $allSuccess = [];
+
+    $pendingOrders = [];
+    foreach ($retryCandidates as $candidate) {
+        $userKey = $candidate['order']['userId'] . '|' . $candidate['order']['serverId'];
+        $pendingOrders[$userKey] = [
+            'order'      => $candidate['order'],
+            'body_index' => $candidate['body_index'] ?? 0,
+            'userKey'    => $userKey,
+        ];
+    }
+
+    echo "\n=== MEMULAI RETRY INQUIRY ROTASI (Maks {$maxRetries}x, jeda acak 4s/5s/6s) ===\n";
+    echo "Pending order untuk retry: " . count($pendingOrders) . " order | Stok body pool: {$totalBodies} body\n\n";
+
+    for ($attempt = 1; $attempt <= $maxRetries && !empty($pendingOrders); $attempt++) {
+        // Jeda acak 4s, 5s, atau 6s di setiap percobaan (bukan rotasi berurutan).
+        $delaySec = $delays[random_int(0, count($delays) - 1)];
+        echo "⏳ [RETRY #{$attempt}/{$maxRetries}] Jeda {$delaySec} detik sebelum retry...\n";
+        sleep($delaySec);
+
+        $nowWallTime = date('H:i:s') . '.' . sprintf('%04d', (int)((microtime(true) - floor(microtime(true))) * 10000));
+        echo "[RETRY #{$attempt}/{$maxRetries} @ {$nowWallTime}] Memproses " . count($pendingOrders) . " order...\n";
+
+        // Ambil token captcha baru untuk setiap pending order dengan rotasi body
+        $preparedRetryInquiries = [];
+        foreach ($pendingOrders as $userKey => &$item) {
+            // Rotasi ke body berikutnya di pool
+            $item['body_index'] = ($item['body_index'] + 1) % $totalBodies;
+            $bodyItem = $poolBodies[$item['body_index']];
+            $bodyId = (int) ($bodyItem['id'] ?? 0);
+
+            // Identitas perangkat yang sama (dari D1) - dipakai di reload DAN inquiry.
+            $ua = $deviceHeaders['headers'] ?? $deviceHeaders ?? getFixedDeviceUserAgent();
+            // Ambil token captcha
+            $token = fetchSingleCaptchaToken($bodyItem, 5000, $ua);
+            if ($token === null) {
+                // Coba fallback ke body berikutnya jika reload pertama gagal
+                $item['body_index'] = ($item['body_index'] + 1) % $totalBodies;
+                $bodyItem = $poolBodies[$item['body_index']];
+                $bodyId = (int) ($bodyItem['id'] ?? 0);
+                echo "[RETRY #{$attempt}][$userKey] Body sebelumnya gagal, coba fallback body #{$bodyId}...\n";
+                $token = fetchSingleCaptchaToken($bodyItem, 5000, $ua);
+            }
+
+            if ($token === null) {
+                echo "[RETRY #{$attempt}][$userKey] ⚠️  Gagal mendapatkan token CAPTCHA untuk body #{$bodyId}\n";
+                continue;
+            }
+
+            $headers = buildInquiryHeaders($token, $ua);
+            $inquiryBody = buildInquiryBody($item['order']);
+            $ch = createCurlSession();
+            configureCurlHandle(
+                $ch,
+                'https://gopay.co.id/games/v1/order/inquiry',
+                'POST',
+                $headers,
+                $inquiryBody,
+                ['connect_timeout_ms' => INQUIRY_CONNECT_TO_MS, 'timeout_ms' => INQUIRY_TIMEOUT_MS]
+            );
+
+            $preparedRetryInquiries[] = [
+                'ch'         => $ch,
+                'order'      => $item['order'],
+                'userKey'    => $userKey,
+                'headers'    => $headers,
+                'body_id'    => $bodyId,
+                'body_index' => $item['body_index'],
+                'started'    => microtime(true),
+            ];
+        }
+        unset($item);
+
+        if (empty($preparedRetryInquiries)) {
+            echo "[RETRY #{$attempt}] Tidak ada handle inquiry yang siap dikirim. Lanjut ke percobaan berikutnya...\n";
+            continue;
+        }
+
+        $mh = curl_multi_init();
+        foreach ($preparedRetryInquiries as $meta) {
+            curl_multi_add_handle($mh, $meta['ch']);
+        }
+        runMultiHandles($mh);
+
+        $multiResults = [];
+        while ($multiInfo = curl_multi_info_read($mh)) {
+            if (isset($multiInfo['handle'])) {
+                $multiResults[curlHandleKey($multiInfo['handle'])] = (int) ($multiInfo['result'] ?? 0);
+            }
+        }
+
+        foreach ($preparedRetryInquiries as $meta) {
+            $ch = $meta['ch'];
+            $multiResult = $multiResults[curlHandleKey($ch)] ?? 0;
+            $resp = curl_multi_getcontent($ch);
+            $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curlErr = curl_error($ch);
+            $curlErrno = curl_errno($ch);
+            if ($curlErrno === 0 && $multiResult !== 0) {
+                $curlErrno = $multiResult;
+                if ($curlErr === '' && function_exists('curl_strerror')) {
+                    $curlErr = curl_strerror($multiResult);
+                }
+            }
+            $net = collectCurlNetworkTiming($ch);
+            $totalTimeSec = $net['total_ms'] / 1000.0;
+            if ($totalTimeSec <= 0) {
+                $totalTimeSec = microtime(true) - $meta['started'];
+            }
+            $elapsed = (int) round($totalTimeSec * 1000);
+            $responseCompletedAt = $meta['started'] + $totalTimeSec;
+            $responseWallTime = formatWallTime($responseCompletedAt, 4);
+
+            $payload = ($resp !== false && $resp !== null) ? decodeResponseBody((string) $resp) : null;
+            $errText = $payload ? extractApiErrorMessage($payload) : ($curlErrno ? "cURL[$curlErrno] $curlErr" : '');
+            $verdict = classifyInquiryResponse($code, $errText, $payload);
+
+            $userKey = $meta['userKey'];
+            $tag = "[$responseWallTime][RETRY #{$attempt}/{$maxRetries}][jeda {$delaySec}s][$userKey][body#{$meta['body_id']}][rtt {$elapsed}ms][HTTP $code]";
+
+            if ($verdict['status'] === 'success') {
+                echo "$tag ✅ OrderID: {$verdict['orderId']}\n";
+                $successItem = [
+                    'order'   => $meta['order'],
+                    'orderId' => $verdict['orderId'],
+                    'headers' => $meta['headers'],
+                ];
+                $allSuccess[] = $successItem;
+                unset($pendingOrders[$userKey]);
+
+                // Eksekusi pembayaran langsung untuk order yang berhasil
+                echo "[PAYMENT] Menjalankan parallel payment untuk {$userKey} (OrderID: {$verdict['orderId']})...\n";
+                $paid = runParallelPayment([$successItem]);
+                $totalPaid += $paid;
+            } elseif ($verdict['status'] === 'stop') {
+                $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
+                echo "$tag ❌ {$verdict['status']}: $shortErr (voucher habis, hentikan retry untuk user ini)\n";
+                unset($pendingOrders[$userKey]);
+            } elseif (in_array($verdict['status'], ['user_invalid', 'skip_user', 'region_block'], true)) {
+                $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
+                echo "$tag ❌ {$verdict['status']}: $shortErr (hentikan retry untuk user ini)\n";
+                unset($pendingOrders[$userKey]);
+            } else {
+                // Masih error (HTTP 406 error captcha / HTTP 429 transaction is suspicous / retry)
+                $shortErr = $errText !== '' ? substr($errText, 0, 80) : '(no message)';
+                echo "$tag ⚠️  {$verdict['status']}: $shortErr\n";
+            }
+
+            curl_multi_remove_handle($mh, $ch);
+            @curl_close($ch);
+        }
+        curl_multi_close($mh);
+
+        if (empty($pendingOrders)) {
+            echo "\n✅ Semua order telah selesai (berhasil atau dihentikan) pada retry #{$attempt}!\n";
+            break;
+        }
+    }
+
+    if (!empty($pendingOrders) && $attempt > $maxRetries) {
+        echo "\n⚠️  Mencapai batas maksimal {$maxRetries}x retry. Sisa order yang belum berhasil: " . count($pendingOrders) . "\n";
+    }
+
+    return $allSuccess;
+}
+
+// ----------------------------------------------------------------------
+// PARALLEL PAYMENT (sama seperti versi lama, tetap pakai inquirySuccess)
+// ----------------------------------------------------------------------
+function runParallelPayment(array $inquirySuccess): int {
+    if (empty($inquirySuccess)) return 0;
+
+    echo "Memulai Parallel Payment...\n";
+    $paymentMulti = curl_multi_init();
+    $paymentChannels = [];
+
+    foreach ($inquirySuccess as $entry) {
+        $orderId = $entry['orderId'];
+
+        $paymentBody = [
+            'orderId' => $orderId,
+            'paymentChannelId' => 73,
+            'phoneNumber' => '628783219212',
+            'paymentPhoneNumber' => '',
+            'quantity' => 1,
+            'invoiceUrl' => 'https://gopay.co.id/games/payment/',
+        ];
+
+        $payHeaders = $entry['headers'];
+        $payHeaders['x-timestamp'] = (string) round(microtime(true) * 1000);
+        $ref = substr(hash('sha256', $orderId), 0, 32);
+        $payHeaders['x-request-reference'] = $ref;
+        $payHeaders['x-request-id']        = $ref;
+        $payHeaders['idempotency-key']     = $ref;
+
+        $ch = createCurlSession();
+        configureCurlHandle(
+            $ch,
+            'https://gopay.co.id/games/v1/order/payment',
+            'POST',
+            $payHeaders,
+            $paymentBody,
+            ['connect_timeout_ms' => PAYMENT_CONNECT_TO_MS, 'timeout_ms' => PAYMENT_TIMEOUT_MS]
+        );
+        $paymentChannels[] = [
+            'ch'       => $ch,
+            'order'    => $entry['order'],
+            'orderId'  => $orderId,
+            'headers'  => $payHeaders,
+            'body'     => $paymentBody,
+            'ref'      => $ref,
+        ];
+        curl_multi_add_handle($paymentMulti, $ch);
+    }
+
+    runMultiHandles($paymentMulti);
+
+    $success = 0;
+    $bufferedWrites = [];
+    foreach ($paymentChannels as $item) {
+        $paymentHandle = $item['ch'];
+        $paymentHeaders = $item['headers'];
+        $resp = curl_multi_getcontent($paymentHandle);
+        $code = curl_getinfo($paymentHandle, CURLINFO_HTTP_CODE);
+        curl_multi_remove_handle($paymentMulti, $paymentHandle);
+
+        $uid = $item['order']['userId'];
+        $sid = $item['order']['serverId'];
+        $orderId = $item['orderId'];
+
+        echo "[$uid | $sid] Payment → ";
+
+        // Inquiry/order sudah berhasil. Untuk kegagalan transport tanpa HTTP
+        // response atau origin 5xx, retry sekali memakai idempotency key sama.
+        if ($code === 0 || $code >= 500) {
+            echo "HTTP $code; retry idempotent 1x → ";
+            curl_close($paymentHandle);
+
+            $paymentHeaders['x-timestamp'] = (string) round(microtime(true) * 1000);
+            $paymentHandle = createCurlSession();
+            configureCurlHandle(
+                $paymentHandle,
+                'https://gopay.co.id/games/v1/order/payment',
+                'POST',
+                $paymentHeaders,
+                $item['body'],
+                ['connect_timeout_ms' => PAYMENT_CONNECT_TO_MS, 'timeout_ms' => PAYMENT_TIMEOUT_MS]
+            );
+            $resp = curl_exec($paymentHandle);
+            $code = curl_getinfo($paymentHandle, CURLINFO_HTTP_CODE);
+        }
+
+        if ($code !== 200 && $code !== 201) {
+            $errorPayload = decodeResponseBody((string) $resp);
+            $errorText = extractApiErrorMessage($errorPayload);
+            echo "HTTP $code";
+            if ($errorText !== '') echo " - $errorText";
+            echo "\n";
+            curl_close($paymentHandle);
+            continue;
+        }
+
+        $payRes = decodeResponseBody((string) $resp);
+        $txnId = $payRes['data'] ?? null;
+        if (!$txnId) {
+            echo "tidak ada txnId\n";
+            curl_close($paymentHandle);
+            continue;
+        }
+
+        echo "TxnID: $txnId → ";
+        $txnData = getTransactionUntilReady($txnId, $paymentHeaders, $paymentHandle);
+        curl_close($paymentHandle);
+        if ($txnData) {
+            $payUrl = $txnData['actionPayment']['paymentDirect'] ?? $txnData['actionPayment']['deeplinkRedirect'] ?? '(tidak tersedia)';
+            $txnUrl = "https://gopay.co.id/games/payment/$txnId";
+            $bufferedWrites[] = ['transaksi_url.txt', "$uid|$sid|$txnUrl\n"];
+            $bufferedWrites[] = ['deeplinks.txt', "$payUrl\n"];
+            $bufferedWrites[] = ['order_ids.txt', "$uid|$sid|$orderId|$payUrl\n"];
+            echo "✅ SUCCESS | Pay URL tersedia\n";
+            $success++;
+        } else {
+            echo "Poll selesai tapi tidak ada payment link\n";
+        }
+    }
+
+    curl_multi_close($paymentMulti);
+    foreach ($bufferedWrites as [$file, $line]) {
+        file_put_contents($file, $line, FILE_APPEND);
+    }
+    return $success;
+}
+
+// ----------------------------------------------------------------------
+// OFFLINE TIMING SELF-TEST
+// ----------------------------------------------------------------------
+function timingSelfTestIterations(array $args, int $default = 20): int {
+    foreach ($args as $arg) {
+        if (preg_match('/^--iterations=(\d+)$/', (string) $arg, $match)) {
+            return max(1, min(200, (int) $match[1]));
+        }
+    }
+    return $default;
+}
+
+function runTimingSelfTest(int $iterations = 20): int {
+    $shots = MAX_USERS;
+    $intervalMs = (float) INQUIRY_STAGGER_MS;
+    $intervalNs = (int) round($intervalMs * 1_000_000);
+    $expectedSpanMs = $intervalMs * max(0, $shots - 1);
+
+    $latenessMs = [];
+    $intervalErrorAbsMs = [];
+    $spanErrorAbsMs = [];
+    $perShotWorstMs = array_fill(0, $shots, 0.0);
+    $lateOver1 = 0;
+    $lateOver5 = 0;
+    $lateOver10 = 0;
+    $lateAtLeastInterval = 0;
+    $dispatchOver1 = 0;
+    $dispatchOver5 = 0;
+    $dispatchOver10 = 0;
+    $dispatchAtLeastInterval = 0;
+    $badRounds = 0;
+    $missedIntervalRounds = 0;
+    $guardApplications = 0;
+    $pumpCrossedTarget = 0;
+    $pumpMaxMs = 0.0;
+    $addDurationMs = [];
+    $dispatchDurationMs = [];
+    $dispatchEndLatenessMs = [];
+    $dispatchEndOver1 = 0;
+    $dispatchEndOver5 = 0;
+    $dispatchEndOver10 = 0;
+    $dispatchEndAtLeastInterval = 0;
+    $fileTransfersValidated = 0;
+    $worstRound = 0;
+    $worstShot = 0;
+    $worstLateMs = -INF;
+
+    echo "[TIMING-TEST] OFFLINE: tidak menghubungi Google/GoPay"
+       . " dan tidak menyentuh loghasil.txt\n";
+    echo "[TIMING-TEST] iterations={$iterations} shots={$shots}"
+       . " interval=" . sprintf('%.3fms', $intervalMs)
+       . " span=" . sprintf('%.3fms', $expectedSpanMs) . "\n";
+    echo "[TIMING-TEST] platform=" . PHP_OS_FAMILY
+       . " spin_guard=" . sprintf('%.3fms', schedulerSpinGuardUs() / 1000)
+       . " arm=" . SCHEDULER_ARM_LEAD_MS . "ms"
+       . " min_dispatch_gap=" . MIN_DISPATCH_GAP_MS . "ms\n";
+
+    // Boundary unit-check anti-tumpuk.
+    $unitPreviousNominalNs = 1_000_000_000;
+    $unitNextNominalNs = $unitPreviousNominalNs + $intervalNs;
+    $antiStackCases = [
+        ['name' => 'first', 'late_ms' => null],
+        ['name' => 'on_time', 'late_ms' => 0.0],
+        ['name' => 'late_within_gap', 'late_ms' => max(0.0, $intervalMs - MIN_DISPATCH_GAP_MS)],
+        ['name' => 'late_shift1', 'late_ms' => max(0.0, $intervalMs - MIN_DISPATCH_GAP_MS + 1.0)],
+        ['name' => 'late_shift7', 'late_ms' => max(0.0, $intervalMs - MIN_DISPATCH_GAP_MS + 7.0)],
+    ];
+    $shiftsStr = [];
+    foreach ($antiStackCases as $case) {
+        $lastDispatchNs = $case['late_ms'] === null
+            ? null
+            : $unitPreviousNominalNs
+                + (int) round($case['late_ms'] * 1_000_000);
+        $unitGuardedNs = guardedDispatchTargetMonoNs(
+            $unitNextNominalNs,
+            $lastDispatchNs
+        );
+        $unitGuardShiftMs = (
+            $unitGuardedNs - $unitNextNominalNs
+        ) / 1_000_000;
+        $expectedShiftMs = $case['late_ms'] === null
+            ? 0.0
+            : max(0.0, ($case['late_ms'] + MIN_DISPATCH_GAP_MS) - $intervalMs);
+        $gapValid = $lastDispatchNs === null
+            || $unitGuardedNs - $lastDispatchNs
+                >= MIN_DISPATCH_GAP_MS * 1_000_000;
+        if (
+            abs($unitGuardShiftMs - $expectedShiftMs) > 0.000001
+            || $unitGuardedNs < $unitNextNominalNs
+            || !$gapValid
+        ) {
+            throw new RuntimeException(
+                "Unit-check anti-tumpuk {$case['name']} gagal:"
+                . " shift={$unitGuardShiftMs}ms (expected={$expectedShiftMs}ms)"
+            );
+        }
+        $shiftsStr[] = sprintf('%.0f', $unitGuardShiftMs);
+    }
+    echo "[TIMING-TEST] anti_stack_unit=PASS cases="
+       . count($antiStackCases) . " shifts=" . implode(',', $shiftsStr) . "ms\n";
+
+    $selfTestPath = str_replace('\\', '/', __FILE__);
+    $selfTestFileUrl = (PHP_OS_FAMILY === 'Windows' ? 'file:///' : 'file://')
+        . str_replace(' ', '%20', $selfTestPath);
+
+    for ($round = 0; $round < $iterations; $round++) {
+        // Easy handle disiapkan sebelum arm, sama seperti inquiry produksi.
+        $testHandles = [];
+        for ($shot = 0; $shot < $shots; $shot++) {
+            $testHandle = curl_init($selfTestFileUrl);
+            if ($testHandle === false) {
+                throw new RuntimeException('Gagal membuat local cURL self-test');
+            }
+            curl_setopt_array($testHandle, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_NOBODY => true,
+                CURLOPT_NOSIGNAL => true,
+            ]);
+            $testHandles[] = $testHandle;
+        }
+
+        // Anchor ditentukan sebelum setup multi agar budget arm 100ms ikut diuji.
+        $anchorMonoNs = hrtime(true)
+            + (SCHEDULER_ARM_LEAD_MS * 1_000_000);
+        // Shared multi memakai file:// lokal: add_handle + exec ikut diuji tanpa
+        // mengirim trafik jaringan.
+        $testMulti = curl_multi_init();
+        if ($testMulti === false) {
+            throw new RuntimeException('Gagal membuat curl_multi untuk timing self-test');
+        }
+        $running = 0;
+        $multiStatus = CURLM_OK;
+        $released = [];
+        $lastReleaseMonoNs = null;
+        $roundWorstDispatchEndLateMs = 0.0;
+
+        for ($shot = 0; $shot < $shots; $shot++) {
+            $nominalTargetMonoNs = $anchorMonoNs + ($shot * $intervalNs);
+            $guardedTargetMonoNs = guardedDispatchTargetMonoNs(
+                $nominalTargetMonoNs,
+                $lastReleaseMonoNs
+            );
+            if ($guardedTargetMonoNs > $nominalTargetMonoNs) {
+                $guardApplications++;
+            }
+
+            $waitTelemetry = null;
+            waitForMonotonicSlot(
+                $guardedTargetMonoNs,
+                static function () use ($testMulti, &$running, &$multiStatus): void {
+                    $multiStatus = pumpCurlMultiNonBlocking($testMulti, $running);
+                },
+                $waitTelemetry
+            );
+            if ($multiStatus !== CURLM_OK) {
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "curl_multi self-test gagal: CURLM {$multiStatus}"
+                );
+            }
+
+            $addStartMonoNs = hrtime(true);
+            $addStatus = curl_multi_add_handle(
+                $testMulti,
+                $testHandles[$shot]
+            );
+            $addMs = (hrtime(true) - $addStartMonoNs) / 1_000_000;
+            $addDurationMs[] = $addMs;
+            if ($addStatus !== CURLM_OK) {
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "add_handle self-test gagal: CURLM {$addStatus}"
+                );
+            }
+            // Ini titik fire yang sama dengan produksi: tepat sebelum exec.
+            $actualMonoNs = hrtime(true);
+            $multiStatus = pumpCurlMultiNonBlocking($testMulti, $running);
+            $dispatchMs = (
+                hrtime(true) - $actualMonoNs
+            ) / 1_000_000;
+            $dispatchDurationMs[] = $dispatchMs;
+            if ($dispatchMs > 1.0) $dispatchOver1++;
+            if ($dispatchMs > 5.0) $dispatchOver5++;
+            if ($dispatchMs > 10.0) $dispatchOver10++;
+            if ($dispatchMs >= $intervalMs) $dispatchAtLeastInterval++;
+            if ($multiStatus !== CURLM_OK) {
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "dispatch self-test gagal: CURLM {$multiStatus}"
+                );
+            }
+
+            $lastReleaseMonoNs = $actualMonoNs;
+            $pumpMaxMs = max(
+                $pumpMaxMs,
+                (float) ($waitTelemetry['pump_max_ms'] ?? 0.0)
+            );
+            if (!empty($waitTelemetry['pump_crossed_target'])) {
+                $pumpCrossedTarget++;
+            }
+
+            $released[] = $actualMonoNs;
+            // Tetap ukur terhadap target nominal. Shift anti-tumpuk tidak
+            // di-clamp agar host stall tetap terlihat apa adanya.
+            $late = ($actualMonoNs - $nominalTargetMonoNs) / 1_000_000;
+            $latenessMs[] = $late;
+            $perShotWorstMs[$shot] = max($perShotWorstMs[$shot], $late);
+            if ($late > 1.0) $lateOver1++;
+            if ($late > 5.0) $lateOver5++;
+            if ($late > 10.0) $lateOver10++;
+            if ($late >= $intervalMs) $lateAtLeastInterval++;
+            $dispatchEndLateMs = $late + $dispatchMs;
+            $dispatchEndLatenessMs[] = $dispatchEndLateMs;
+            $roundWorstDispatchEndLateMs = max(
+                $roundWorstDispatchEndLateMs,
+                $dispatchEndLateMs
+            );
+            if ($dispatchEndLateMs > 1.0) $dispatchEndOver1++;
+            if ($dispatchEndLateMs > 5.0) $dispatchEndOver5++;
+            if ($dispatchEndLateMs > 10.0) $dispatchEndOver10++;
+            if ($dispatchEndLateMs >= $intervalMs) {
+                $dispatchEndAtLeastInterval++;
+            }
+            if ($late > $worstLateMs) {
+                $worstLateMs = $late;
+                $worstRound = $round + 1;
+                $worstShot = $shot + 1;
+            }
+
+            if ($shot > 0) {
+                $actualIntervalMs = (
+                    $actualMonoNs - $released[$shot - 1]
+                ) / 1_000_000;
+                $intervalErrorAbsMs[] = abs($actualIntervalMs - $intervalMs);
+            }
+        }
+
+        $actualSpanMs = (
+            $released[$shots - 1] - $released[0]
+        ) / 1_000_000;
+        $spanErrorAbsMs[] = abs($actualSpanMs - $expectedSpanMs);
+        if ($roundWorstDispatchEndLateMs > 5.0) {
+            $badRounds++;
+        }
+        if ($roundWorstDispatchEndLateMs >= $intervalMs) {
+            $missedIntervalRounds++;
+        }
+
+        do {
+            $multiStatus = pumpCurlMultiNonBlocking($testMulti, $running);
+        } while ($multiStatus === CURLM_OK && $running > 0);
+        if ($multiStatus !== CURLM_OK) {
+            curl_multi_close($testMulti);
+            throw new RuntimeException(
+                "finalize self-test gagal: CURLM {$multiStatus}"
+            );
+        }
+        $testResults = [];
+        while ($multiInfo = curl_multi_info_read($testMulti)) {
+            if (isset($multiInfo['handle'])) {
+                $testResults[curlHandleKey($multiInfo['handle'])] =
+                    (int) ($multiInfo['result'] ?? -1);
+            }
+        }
+        foreach ($testHandles as $testHandle) {
+            $testResult = $testResults[curlHandleKey($testHandle)] ?? null;
+            if ($testResult !== CURLE_OK || curl_errno($testHandle) !== 0) {
+                curl_multi_remove_handle($testMulti, $testHandle);
+                curl_close($testHandle);
+                curl_multi_close($testMulti);
+                throw new RuntimeException(
+                    "Transfer file:// self-test gagal; result="
+                    . var_export($testResult, true)
+                );
+            }
+            $fileTransfersValidated++;
+            curl_multi_remove_handle($testMulti, $testHandle);
+            curl_close($testHandle);
+        }
+        curl_multi_close($testMulti);
+    }
+
+    $medianLate = percentile($latenessMs, 0.5);
+    $p95Late = percentile($latenessMs, 0.95);
+    $p99Late = percentile($latenessMs, 0.99);
+    $maxLate = max($latenessMs);
+    $p95Interval = percentile($intervalErrorAbsMs, 0.95);
+    $maxInterval = max($intervalErrorAbsMs);
+    $p95Span = percentile($spanErrorAbsMs, 0.95);
+    $maxSpan = max($spanErrorAbsMs);
+    $localDispatchWindowMs = [];
+    foreach ($addDurationMs as $index => $addMs) {
+        $localDispatchWindowMs[] = $addMs + $dispatchDurationMs[$index];
+    }
+    $p95Add = percentile($addDurationMs, 0.95);
+    $p95Exec = percentile($dispatchDurationMs, 0.95);
+    $p95LocalWindow = percentile($localDispatchWindowMs, 0.95);
+    $maxLocalWindow = max($localDispatchWindowMs);
+    $p95DispatchEndLate = percentile($dispatchEndLatenessMs, 0.95);
+    $maxDispatchEndLate = max($dispatchEndLatenessMs);
+
+    echo sprintf(
+        "[TIMING-TEST] lateness  min=%.3fms med=%.3fms"
+        . " p95=%.3fms p99=%.3fms max=%.3fms\n",
+        min($latenessMs),
+        $medianLate,
+        $p95Late,
+        $p99Late,
+        $maxLate
+    );
+    echo sprintf(
+        "[TIMING-TEST] interval |error| p95=%.3fms max=%.3fms\n",
+        $p95Interval,
+        $maxInterval
+    );
+    echo sprintf(
+        "[TIMING-TEST] span %.0fms |error| p95=%.3fms max=%.3fms\n",
+        $expectedSpanMs,
+        $p95Span,
+        $maxSpan
+    );
+    echo "[TIMING-TEST] worst/shot: "
+       . implode(', ', array_map(
+           static fn($index, $value) => sprintf(
+               'T%d=%.3fms',
+               $index + 1,
+               $value
+           ),
+           array_keys($perShotWorstMs),
+           $perShotWorstMs
+       ))
+       . "\n";
+
+    $badRoundRate = ($badRounds / $iterations) * 100;
+    echo sprintf(
+        "[TIMING-TEST] fire outliers >1ms=%d >5ms=%d >10ms=%d >=%.0fms=%d\n",
+        $lateOver1,
+        $lateOver5,
+        $lateOver10,
+        $intervalMs,
+        $lateAtLeastInterval
+    );
+    echo sprintf(
+        "[TIMING-TEST] dispatch-end lateness p95=%.3fms max=%.3fms"
+        . " | >1ms=%d >5ms=%d >10ms=%d >=%.0fms=%d"
+        . " | bad_rounds=%d/%d (%.1f%%)\n",
+        $p95DispatchEndLate,
+        $maxDispatchEndLate,
+        $dispatchEndOver1,
+        $dispatchEndOver5,
+        $dispatchEndOver10,
+        $intervalMs,
+        $dispatchEndAtLeastInterval,
+        $badRounds,
+        $iterations,
+        $badRoundRate
+    );
+    echo sprintf(
+        "[TIMING-TEST] guard_applied=%d pump_crossed_target=%d"
+        . " pump_max=%.3fms | worst=round%d/T%d %.3fms\n",
+        $guardApplications,
+        $pumpCrossedTarget,
+        $pumpMaxMs,
+        $worstRound,
+        $worstShot,
+        $worstLateMs
+    );
+    echo sprintf(
+        "[TIMING-TEST] LOCAL_CURL_DISPATCH_SYNTHETIC"
+        . " add[p95=%.3fms] exec[p95=%.3fms]"
+        . " total[med=%.3fms p95=%.3fms max=%.3fms]"
+        . " validated=%d/%d\n",
+        $p95Add,
+        $p95Exec,
+        percentile($localDispatchWindowMs, 0.5),
+        $p95LocalWindow,
+        $maxLocalWindow,
+        $fileTransfersValidated,
+        $iterations * $shots
+    );
+    echo sprintf(
+        "[TIMING-TEST] synthetic exec outliers >1ms=%d >5ms=%d >10ms=%d"
+        . " >=%.0fms=%d\n",
+        $dispatchOver1,
+        $dispatchOver5,
+        $dispatchOver10,
+        $intervalMs,
+        $dispatchAtLeastInterval
+    );
+
+    $corePass = $medianLate <= 0.10
+             && $p95Late <= 1.0
+             && $p95Interval <= 1.5;
+    $coreWarn = !$corePass
+             && $medianLate <= 0.25
+             && $p95Late <= 2.0
+             && $p95Interval <= 3.0;
+    $coreStatus = $corePass ? 'PASS' : ($coreWarn ? 'WARN' : 'FAIL');
+
+    $localPass = $p95LocalWindow <= 2.0
+              && $fileTransfersValidated === $iterations * $shots;
+    $localWarn = !$localPass
+              && $p95LocalWindow <= 4.0
+              && $fileTransfersValidated === $iterations * $shots;
+    $localStatus = $localPass ? 'PASS' : ($localWarn ? 'WARN' : 'FAIL');
+
+    $hostGood = $badRounds === 0
+             && $missedIntervalRounds === 0
+             && $p95Span <= 3.0;
+    $hostWarn = !$hostGood
+             && $badRoundRate <= 5.0
+             && $missedIntervalRounds === 0
+             && $p95Span <= 6.0;
+    $hostStatus = $hostGood ? 'GOOD' : ($hostWarn ? 'WARN' : 'FAIL');
+
+    if (
+        $coreStatus === 'FAIL'
+        || $localStatus === 'FAIL'
+        || $hostStatus === 'FAIL'
+    ) {
+        $result = 'FAIL';
+        $exitCode = 1;
+    } elseif (
+        $coreStatus === 'PASS'
+        && $localStatus === 'PASS'
+        && $hostStatus === 'GOOD'
+    ) {
+        $result = 'PASS';
+        $exitCode = 0;
+    } else {
+        $result = 'WARN';
+        $exitCode = 2;
+    }
+
+    echo "[TIMING-TEST] SCHEDULER_CORE={$coreStatus}"
+       . " LOCAL_CURL_DISPATCH={$localStatus}"
+       . " HOST_JITTER={$hostStatus}\n";
+    echo "[TIMING-TEST] RESULT={$result}"
+       . " (kualifikasi final: ulang >=50x di VPS Linux idle dan saat CPU load)\n";
+    return $exitCode;
+}
+
+// ----------------------------------------------------------------------
+// MAIN
+// ----------------------------------------------------------------------
+function gpyPay(): void {
+    echo "=== PHASE 1: PRE-COMPUTATION ===\n";
+    logClockSyncStatus();
+
+    $lines = file('user_server_wdp.txt', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+    $orders = [];
+    $seenOrders = [];
+    $duplicateOrders = [];
+    $invalidOrderLines = [];
+    foreach ($lines as $line) {
+        $parts = array_map('trim', explode('|', $line));
+        $userId = ltrim((string) ($parts[0] ?? ''), "\xEF\xBB\xBF");
+        $serverId = (string) ($parts[1] ?? '');
+        if (count($parts) < 2 || $userId === '' || $serverId === '') {
+            $invalidOrderLines[] = trim($line);
+            continue;
+        }
+
+        $orderKey = $userId . '|' . $serverId;
+        if (isset($seenOrders[$orderKey])) {
+            $duplicateOrders[$orderKey] = true;
+            continue;
+        }
+        $seenOrders[$orderKey] = true;
+        $orders[] = ['userId' => $userId, 'serverId' => $serverId];
+    }
+    if (!empty($invalidOrderLines)) {
+        throw new RuntimeException(
+            "user_server_wdp.txt memuat " . count($invalidOrderLines)
+            . " baris tidak valid; setiap baris minimal wajib userId|serverId"
+        );
+    }
+    if (!empty($duplicateOrders)) {
+        throw new RuntimeException(
+            "user_server_wdp.txt memuat user duplikat: "
+            . implode(', ', array_keys($duplicateOrders))
+        );
+    }
+    if (count($orders) < MIN_USERS || count($orders) > MAX_USERS) {
+        throw new RuntimeException(
+            "Diperlukan antara " . MIN_USERS . " sampai " . MAX_USERS
+            . " akun unik (userId|serverId) per VPS; ditemukan " . count($orders)
+        );
+    }
+
+    echo "✅ Loaded " . count($orders) . " order (max " . MAX_USERS . ")\n";
+    echo "[CONFIG] Akun unik tervalidasi: " . count($orders)
+       . " (min " . MIN_USERS . ", max " . MAX_USERS . ")\n";
+    echo "? Fixed lead from lead.txt"
+       . " | TARGET_SRV=" . sprintf('%.0fms', TARGET_SRV_MS_DEFAULT)
+       . " | STAGGERED_INQUIRY\n\n";
+
+    // Lead time dibaca dari lead.txt. Konvensi:
+    //   NEGATIF di lead.txt = fire SEBELUM war start (duluan).
+    //   POSITIF di lead.txt = fire SETELAH war start (telat).
+    //   0 atau file tidak ada = tepat di war start.
+    // Internal `waitForExactBurstTime` pakai konvensi terbalik (positif = sebelum war),
+    // jadi negate.
+    $leadFile = __DIR__ . '/lead.txt';
+    [$offsetMs, $leadFromFile] = readOffsetMs(
+        $leadFile,
+        BURST_LEAD_MS_DEFAULT,
+        'lead.txt'
+    );
+    $burstLeadMs = -$offsetMs;
+
+    if ($offsetMs > 0)      $desc = "+{$offsetMs}ms (setelah war)";
+    elseif ($offsetMs < 0)  $desc = "{$offsetMs}ms (sebelum war)";
+    else                    $desc = "0ms (tepat di war)";
+    $intervalMs = count($orders) > 1 ? (float) INQUIRY_STAGGER_MS : 0.0;
+    $endOffsetMs = $offsetMs + (int) round($intervalMs * max(0, count($orders) - 1));
+    echo "⚡ Lead offset : {$desc} (dari " . ($leadFromFile ? "lead.txt" : "default") . ")\n";
+    echo "⚡ Akhir lead  : " . sprintf('%+dms', $endOffsetMs)
+       . " (otomatis dari lead + jeda tetap)\n";
+    echo "⚡ Jeda tembak : " . sprintf('%.3fms', $intervalMs)
+       . " untuk " . count($orders) . " user\n\n";
+
+    // Stok body pool: diklaim sekali via claim_bodies.php -> bodies.json.
+    // Token TIDAK dibuat di awal (token hanya berlaku ~120 detik). Token
+    // dibuat per order, masing-masing dari body-nya sendiri, saat sisa
+    // waktu war <= 60 detik (callback ke-4 di waitForExactBurstTime).
+    $poolBodies = loadPoolBodies(__DIR__ . '/' . POOL_BODIES_FILE, count($orders));
+    $poolDevice = loadPoolDevice(__DIR__ . '/' . POOL_BODIES_FILE);
+    echo "✅ Stok body pool: " . count($poolBodies) . " body"
+       . " (pool id: " . implode(',', array_column($poolBodies, 'id')) . ")\n";
+    echo "📱 Perangkat: " . ($poolDevice['model'] ?? 'SM-X700 (fallback klaim lama)')
+       . " — header identitas dari D1, dipakai reload + inquiry.\n";
+    $captchaTokens = []; // diisi callback fetchTokens di bawah
+
+    // Tunggu dan fire — mini-probe2 T-2.5s untuk warm TLS pool sebelum burst.
+    // Callback menerima $budgetMs = sisa waktu aman untuk warm-up tanpa menunda burst.
+    $preparedInquiries = [];
+    waitForExactBurstTime(
+        $burstLeadMs,
+        static function (int $budgetMs = 1200): void {
+            echo "[WARM-UP] T-" . (MINI_PROBE2_LEAD_MS / 1000)
+               . "s re-warm TLS pool via HEAD root tanpa endpoint order ("
+               . MINI_PROBE2_PARALLEL . " call paralel, budget {$budgetMs}ms)...\n";
+            $rtts = miniProbe2ReWarm($budgetMs);
+            if (!empty($rtts)) {
+                $median = percentile($rtts, 0.5);
+                echo "[WARM-UP] RTT: " . implode('ms, ', array_map(fn($v) => number_format($v, 0), $rtts)) . "ms"
+                   . " | median: " . number_format($median, 0) . "ms\n";
+            } else {
+                echo "[WARM-UP] Tidak ada response dalam budget (koneksi lambat) — burst tetap on-time.\n";
+            }
+        },
+        static function () use (&$preparedInquiries, $orders, &$captchaTokens, $poolBodies): int {
+            foreach ($orders as $orderIndex => $order) {
+                $entry = $captchaTokens[$orderIndex] ?? null;
+                $captchaToken = is_array($entry) ? ($entry['token'] ?? null) : null;
+                $ua = is_array($entry) ? ($entry['ua'] ?? null) : null;
+                if (!is_string($captchaToken) || $captchaToken === '') {
+                    throw new RuntimeException(
+                        "Token CAPTCHA untuk order index {$orderIndex} tidak tersedia"
+                    );
+                }
+                $preparedInquiries[] = prepareInquiry(
+                    $order,
+                    $captchaToken,
+                    (int) ($poolBodies[$orderIndex]['id'] ?? 0),
+                    $orderIndex,
+                    $ua
+                );
+            }
+            return count($preparedInquiries);
+        },
+        static function () use ($poolBodies, $orders, &$captchaTokens): void {
+            $captchaTokens = fetchCaptchaTokensForOrders($poolBodies, count($orders), $poolDevice);
+            echo "[CAPTCHA] " . count($captchaTokens)
+               . " token siap (umur token saat fire ~60 detik).\n";
+        }
+    );
+
+    // ===================== SINGLE INQUIRY BERTAHAP =====================
+    // Detail burst ([NET] + ringkasan + VPS-EVAL) TIDAK langsung tampil:
+    // ditahan di $burstDetailLog dan baru dicetak setelah retry selesai,
+    // supaya log saat war tetap bersih (hasil inquiry -> langsung retry).
+    [$inquirySuccess, $retryCandidates, $burstDetailLog] = runStaggeredInquiry($preparedInquiries, $offsetMs);
+
+    // ===================== PARALLEL PAYMENT (BURST AWAL) =====================
+    $totalPaid = 0;
+    if (!empty($inquirySuccess)) {
+        echo "Memulai Parallel Payment (burst awal)...\n";
+        $totalPaid += runParallelPayment($inquirySuccess);
+    }
+
+    // ===================== RETRY INQUIRY ROTASI =====================
+    if (!empty($retryCandidates)) {
+        runInquiryRetryLoop($retryCandidates, $poolBodies, $totalPaid, $poolDevice);
+    }
+
+    // Detail burst ([NET] + ringkasan + VPS-EVAL) baru ditampilkan setelah
+    // semua proses selesai.
+    echo $burstDetailLog;
+
+    echo "\n? FULL FLOW SELESAI! Berhasil: $totalPaid / " . count($orders) . "\n";
+}
+
+if (defined('SKIP_WAR_EXEC') && SKIP_WAR_EXEC) {
+    return;
+}
+
+if ($TIMING_SELF_TEST_MODE) {
+    exit(runTimingSelfTest(timingSelfTestIterations($CLI_ARGS)));
+}
+
+try {
+    gpyPay();
+} catch (Throwable $e) {
+    echo "\n[FATAL] " . get_class($e) . ': ' . $e->getMessage() . "\n";
+    exit(1);
+}
