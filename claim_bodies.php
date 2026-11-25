@@ -1,8 +1,15 @@
 #!/usr/bin/env php
 <?php
 // ======================================================================
-// claim_bodies.php — Klaim stok body SEKALI dari pool Cloudflare (Worker+D1)
-// dan simpan ke bodies.json di folder ini.
+// claim_bodies.php (v2 device-headers) — Klaim stok body SEKALI dari pool Cloudflare
+// (Worker v2 + D1 device-headers) dan simpan ke bodies.json di folder ini.
+//
+// Bedanya dari v1: /lease v2 mengembalikan SATU perangkat beserta header
+// identitasnya ({device:{model, headers:{...}}}), dan bodies.json ikut
+// menyimpan perangkat itu — war.php v2 membaca header dari sini, bukan
+// dari hardcode atau identitas acak. Claim lama (v1) tanpa device tetap
+// jalan di war.php v2 lewat fallback SM-X700, tapi klaim baru wajib
+// membawa device.
 //
 // Dijalankan sekali per VPS (oleh controller), BUKAN tiap war. Setelah
 // klaim, VPS memakai bodies.json ini berulang tiap war; token dibuat per
@@ -85,9 +92,17 @@ function main(array $argv): int {
             fwrite(STDERR, "❌ bodies.json tidak valid: {$err}\n");
             return 1;
         }
+        $data = json_decode((string) file_get_contents($out), true);
+        $dev = is_array($data['device'] ?? null) ? $data['device'] : null;
         echo "✅ bodies.json valid: " . count($bodies) . " body"
            . " (pool id: " . implode(',', array_column($bodies, 'id')) . ")"
            . " | ukuran: " . implode(',', array_map(static fn($b) => strlen($b['body']), $bodies)) . " byte\n";
+        if ($dev !== null) {
+            echo "   Perangkat: " . ($dev['model'] ?? '?')
+               . " | UA: " . substr((string) ($dev['headers']['user-agent'] ?? '?'), 0, 80) . "\n";
+        } else {
+            echo "   ⚠️  Tanpa perangkat (klaim v1 lama) — war.php akan pakai fallback SM-X700.\n";
+        }
         return 0;
     }
 
@@ -129,6 +144,12 @@ function main(array $argv): int {
         fwrite(STDERR, "❌ Pool tidak memberi body: " . substr((string) $resp, 0, 200) . "\n");
         return 1;
     }
+    $device = is_array($data['device'] ?? null) ? $data['device'] : null;
+    if ($device === null || empty($device['headers']['user-agent'] ?? '')) {
+        fwrite(STDERR, "❌ Pool v2 tidak mengembalikan perangkat+header. "
+            . "Pastikan Worker v2 sudah ter-deploy (atau klaim pakai claim_bodies-v1.php).\n");
+        return 1;
+    }
     [$bodies, $verr] = validateClaimBodies($data['items']);
     if ($verr !== null) {
         fwrite(STDERR, "❌ Body dari pool tidak valid: {$verr}\n");
@@ -139,6 +160,7 @@ function main(array $argv): int {
         'vps' => $vps,
         'claimed_at' => time(),
         'pool' => rtrim($api, '/'),
+        'device' => $device,
         'items' => array_map(
             static fn($b) => ['id' => $b['id'], 'body_b64' => base64_encode($b['body'])],
             $bodies
@@ -152,6 +174,8 @@ function main(array $argv): int {
     chmod($out, 0600);
     echo "✅ Stok tersimpan: " . count($bodies) . " body -> {$out}"
        . " (pool id: " . implode(',', array_column($bodies, 'id')) . ")\n";
+    echo "   Perangkat: " . ($device['model'] ?? '?')
+       . " — header identitas tersimpan di bodies.json untuk war.php.\n";
     echo "   Pool mencatat body ini atas nama VPS '{$vps}' (lease 7 hari, perpanjang via /renew).\n";
     return 0;
 }

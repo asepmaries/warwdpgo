@@ -1214,10 +1214,22 @@ linux_prepare_clock() {
 # Pool tidak memakai API key (proyek pribadi). Klaim dilakukan sekali:
 # claim_bodies.php menyimpan bodies.json (0600) di APP_DIR, dan war.php
 # jalan dari APP_DIR itu juga.
-# Kalau bodies.json sudah ada dan valid, claim_bodies.php tidak klaim
-# lagi (idempotent), jadi --update tidak pernah menghabiskan stok pool.
+# Aturan v3: klaim WAJIB membawa perangkat + header identitas (pool v2,
+# D1 device-headers). bodies.json lama (klaim v1, tanpa perangkat) TIDAK
+# boleh dipertahankan — reinstall/update harus klaim ulang (--force)
+# supaya VPS dapat data baru (perangkat + 10 body). bodies.json yang
+# sudah punya perangkat tetap dipertahankan (idempotent), jadi --update
+# tidak pernah menghabiskan stok pool.
 # Klaim gagal = install gagal (die, tanpa WDP_INSTALL_OK) supaya
 # controller menandai VPS itu gagal; lewati pakai --no-pool.
+#
+# bodies.json punya perangkat+header (klaim v2) atau tidak (klaim v1)?
+# Return 0 kalau ada device + user-agent, 1 kalau tidak / file invalid.
+bodies_has_device() {
+  local bodies_file="$1"
+  php -r '$d=json_decode(@file_get_contents($argv[1]),true); exit(is_array($d["device"]??null)&&!empty($d["device"]["headers"]["user-agent"]) ? 0 : 1);' "$bodies_file" 2>/dev/null
+}
+
 claim_pool_bodies() {
   if [ "$POOL_CLAIM_ENABLED" -eq 0 ]; then
     ok "Klaim pool dilewati (--no-pool)"
@@ -1231,6 +1243,14 @@ claim_pool_bodies() {
   local bodies_file="$APP_DIR/bodies.json"
   [ -f "$claim_script" ] \
     || die "claim_bodies.php tidak ditemukan di $APP_DIR (paket tidak lengkap)"
+  if [ -f "$bodies_file" ] && ! bodies_has_device "$bodies_file"; then
+    log "bodies.json lama tanpa perangkat (klaim v1) — klaim ulang pakai aturan baru (device-headers)"
+    if ! php "$claim_script" --force --count "$POOL_CLAIM_COUNT" --out "$bodies_file"; then
+      die "Klaim ulang body pool gagal — install dibatalkan (tidak ada WDP_INSTALL_OK). Coba lagi nanti, atau jalankan dengan --no-pool lalu klaim manual: php $claim_script --force --count 10"
+    fi
+    printf '%s\n' "__WDP_POOL_OK__"
+    return 0
+  fi
   log "Klaim stok body dari pool Cloudflare (maks $POOL_CLAIM_COUNT body)"
   if ! php "$claim_script" --count "$POOL_CLAIM_COUNT" --out "$bodies_file"; then
     die "Klaim body pool gagal — install dibatalkan (tidak ada WDP_INSTALL_OK). Coba lagi nanti, atau jalankan dengan --no-pool lalu klaim manual: php $claim_script --count 10"
