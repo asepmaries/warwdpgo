@@ -14,6 +14,7 @@
 // percobaan (format milidetik, sama seperti yang direkam).
 // Jeda antar percobaan acak 4/5/6 detik (aturan yang sama dengan war.php).
 // CARA JALAN (di VPS):  php tes.php
+// Hasil juga tersimpan di loghasil.txt (folder yang sama dengan script).
 // Butuh: PHP + ekstensi curl. Tidak butuh file lain — semua data sudah
 // tertanam di script ini (body + header hasil record 2026-11-26).
 
@@ -21,6 +22,19 @@ $SITEKEY = '6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o';
 $RELOAD_URL = 'https://www.google.com/recaptcha/api2/reload?k=' . $SITEKEY;
 $INQUIRY_URL = 'https://gopay.co.id/games/v1/order/inquiry';
 $ATTEMPTS = 15;
+
+// Log: semua output juga disimpan ke loghasil.txt (di folder yang sama
+// dengan script ini) supaya hasil tiap VPS bisa diambil tanpa copy-paste
+// dari terminal. File ditimpa tiap kali script jalan, jadi isinya selalu
+// hasil run terakhir dari VPS itu. Kalau file tidak bisa ditulis (mis.
+// folder read-only), tes tetap jalan dan output tetap tampil di layar.
+$LOG_FILE = __DIR__ . '/loghasil.txt';
+function out(string $s): void {
+    echo $s;
+    @file_put_contents($GLOBALS['LOG_FILE'], $s, FILE_APPEND);
+}
+date_default_timezone_set('Asia/Jakarta');
+@file_put_contents($LOG_FILE, 'tes.php run ' . date('Y-m-d H:i:s') . ' | host ' . gethostname() . "\n");
 
 // 15 body /reload hasil record (base64), satu per percobaan.
 $RELOAD_BODIES = [
@@ -126,7 +140,7 @@ for ($i = 0; $i < $ATTEMPTS; $i++) {
         $token = $m[1];
     } else {
         $reloadFail++;
-        echo "#$n reload GAGAL (http {$r['code']}, errno {$r['errno']} {$r['err']}) -> SKIP inquiry\n";
+        out("#$n reload GAGAL (http {$r['code']}, errno {$r['errno']} {$r['err']}) -> SKIP inquiry\n");
         if ($i < $ATTEMPTS - 1) sleep(random_int(4, 6));
         continue;
     }
@@ -143,16 +157,16 @@ for ($i = 0; $i < $ATTEMPTS; $i++) {
     if ($q['code'] === 400 || $q['code'] === 200) { $pass++; $status = 'LOLOS'; }
     elseif ($q['code'] === 406 || $q['code'] === 429 || $q['code'] >= 500) { $reject++; $status = 'DITOLAK'; }
     else { $other++; $status = 'LAIN'; }
-    echo "#$n token " . strlen($token) . " char | inquiry {$q['code']} $status | $msg\n";
+    out("#$n token " . strlen($token) . " char | inquiry {$q['code']} $status | $msg\n");
     if ($i < $ATTEMPTS - 1) sleep(random_int(4, 6));
 }
 
-echo "\n=== RINGKASAN ===\n";
-echo "Percobaan : $ATTEMPTS\n";
-echo "Reload gagal : $reloadFail\n";
-echo "Inquiry LOLOS (400/200, token diterima) : $pass\n";
-echo "Inquiry DITOLAK (406/429/5xx) : $reject\n";
-echo "Inquiry lain : $other\n";
-echo ($reject === 0 && $reloadFail === 0)
+out("\n=== RINGKASAN ===\n");
+out("Percobaan : $ATTEMPTS\n");
+out("Reload gagal : $reloadFail\n");
+out("Inquiry LOLOS (400/200, token diterima) : $pass\n");
+out("Inquiry DITOLAK (406/429/5xx) : $reject\n");
+out("Inquiry lain : $other\n");
+out(($reject === 0 && $reloadFail === 0)
     ? "HASIL: LOLOS SEMUA ($pass/$ATTEMPTS) — sama seperti tes live di HP.\n"
-    : "HASIL: ADA YANG DITOLAK/GAGAL — lihat baris di atas.\n";
+    : "HASIL: ADA YANG DITOLAK/GAGAL — lihat baris di atas.\n");
