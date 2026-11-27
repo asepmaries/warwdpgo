@@ -18,6 +18,11 @@
 //  - Jika response gagal HTTP 406 (error captcha) atau HTTP 429 (transaction suspicous),
 //    lakukan retry dengan jeda ACAK 4s, 5s, atau 6s hingga maks 100x retry.
 //  - Setiap retry merotasi body dari stok pool dan mengambil ulang token captcha.
+//  - Identitas perangkat BUKAN acak lagi: dibaca dari bodies.json (hasil klaim
+//    claim_bodies-v2.php dari pool D1 — satu perangkat + header identitas
+//    aslinya per VPS) dan dipakai SAMA untuk reload Google dan inquiry
+//    GoPay. Warm-up tetap SM-X700. Klaim lama tanpa perangkat jatuh ke
+//    fallback SM-X700 (getFixedDeviceUserAgent).
 //  - Target server-arrival adalah 0ms (T=0).
 //  - Pool TIDAK dihubungi saat war (tidak butuh kunci API di VPS). Renew
 //    lease + pantau kesehatan body adalah tugas controller.
@@ -324,32 +329,24 @@ function waitForExactBurstTime(
 // ----------------------------------------------------------------------
 // FUNGSI PEMBANTU
 // ----------------------------------------------------------------------
-function getRandomUserAgent(): array {
-    $androidVersions = ['11', '12', '13', '14'];
-    $models = [
-        'SM-A225F', 'SM-A135F', 'SM-A205F', 'SM-A326B', 'SM-A127F',
-        'SM-A325F', 'SM-A528B', 'SM-A536B', 'SM-A546B', 'SM-A426B',
-        'SM-M136B', 'SM-M326B', 'SM-A047F', 'SM-A057F', 'SM-A235F',
-        'SM-A236B', 'SM-A256E', 'SM-A346B', 'SM-A356E', 'SM-A556E',
-        'Redmi Note 12', 'Redmi Note 13', 'Redmi 13C', 'Poco X6',
-        'RMX3395', 'RMX3780', 'RMX3686'
-    ];
-    $chromeVersions = ['135', '136', '137', '138', '139', '140'];
-    $minorVersions = ['0', '1', '2', '3', '4', '5'];
-    $androidVer = $androidVersions[array_rand($androidVersions)];
-    $model = $models[array_rand($models)];
-    $chromeVer = $chromeVersions[array_rand($chromeVersions)];
-    $minor = $minorVersions[array_rand($minorVersions)];
-    $builds = [
-        'TP1A.220624.014', 'TP1A.221005.002', 'UP1A.231005.007',
-        'UP1A.231105.003', 'AP1A.240305.019', 'BP1A.250205.002'
-    ];
-    $build = $builds[array_rand($builds)];
-    $userAgent = "Mozilla/5.0 (Linux; Android {$androidVer}; {$model} Build/{$build}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{$chromeVer}.0.{$minor}.0 Mobile Safari/537.36";
-    $secChUa = "\"Android WebView\";v=\"{$chromeVer}\", \"Chromium\";v=\"{$chromeVer}\", \"Not/A)Brand\";v=\"24\"";
+// getRandomUserAgent() DIHAPUS di v2 device-headers: identitas acak diganti
+// header perangkat nyata dari D1 (bodies.json -> 'device'). Identitas acak
+// bisa tidak cocok dengan body (fingerprint mismatch) — itulah yang
+// coba dihindari desain ini. Fallback untuk klaim lama: getFixedDeviceUserAgent().
+
+// Identitas perangkat tetap SM-X700 — dipakai sebagai fallback kalau
+// bodies.json tidak membawa perangkat (klaim v1 lama), dan untuk warm-up.
+// Header lengkap perangkat: user-agent, sec-ch-ua, sec-ch-ua-mobile,
+// sec-ch-ua-platform, accept-language, x-client-data (reload saja),
+// x-requested-with (hanya kalau perangkat itu memang mengirimnya:
+// SM-X700 ya, Sony G8342 tidak).
+function getFixedDeviceUserAgent(): array {
     return [
-        'user-agent' => $userAgent,
-        'sec-ch-ua' => $secChUa
+        'user-agent' => 'Mozilla/5.0 (Linux; Android 13; SM-X700 Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.8103.50 Mobile Safari/537.36',
+        'sec-ch-ua' => '"Not-A.Brand";v="99", "Android WebView";v="157", "Chromium";v="157"',
+        // x-requested-with mark.via.gp tercatat di inquiry tablet SM-X700;
+        // Sony G8342 tidak mengirimnya, jadi kunci ini hanya ada di fallback ini.
+        'x-requested-with' => 'mark.via.gp',
     ];
 }
 
@@ -630,7 +627,7 @@ function miniProbe2ReWarm(int $maxMs = 1200): array {
     $mh = curl_multi_init();
     $handles = [];
     for ($i = 0; $i < MINI_PROBE2_PARALLEL; $i++) {
-        $ua = getRandomUserAgent();
+        $ua = getFixedDeviceUserAgent();
         $headers = [
             'user-agent' => $ua['user-agent'],
             'sec-ch-ua' => $ua['sec-ch-ua'],
@@ -719,23 +716,46 @@ function percentile(array $values, float $p): float {
 // ditulis ke file (tidak ada lagi reload.txt / captcha_token.txt).
 // Pool TIDAK dihubungi saat war; renew lease adalah tugas controller.
 
-function captchaReloadHeaders(): array {
-    return [
-        'sec-ch-ua-platform' => '"Android"',
-        'user-agent' => 'Mozilla/5.0 (Linux; Android 13; SM-X700 Build/TP1A.220624.014) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.8103.50 Mobile Safari/537.36',
-        'sec-ch-ua' => '"Not-A.Brand";v="99", "Android WebView";v="157", "Chromium";v="157"',
+// $device: header identitas perangkat dari D1 (bodies.json -> 'device').
+// Kalau null (klaim v1 lama), pakai fallback SM-X700. x-requested-with
+// hanya dikirim kalau perangkat itu memang mengirimnya di HAR (SM-X700:
+// mark.via.gp; Sony G8342: tidak ada — HAR session-live 2026-11-25).
+// x-client-data hanya ada di reload, tidak di inquiry.
+function captchaReloadHeaders(?array $device = null): array {
+    $device = $device ?? getFixedDeviceUserAgent();
+    $headers = [
+        'sec-ch-ua-platform' => $device['sec-ch-ua-platform'] ?? '"Android"',
+        'user-agent' => $device['user-agent'],
+        'sec-ch-ua' => $device['sec-ch-ua'],
         'content-type' => 'application/x-protobuffer',
-        'sec-ch-ua-mobile' => '?1',
+        'sec-ch-ua-mobile' => $device['sec-ch-ua-mobile'] ?? '?1',
         'accept' => '*/*',
         'origin' => 'https://www.google.com',
-        'x-requested-with' => 'mark.via.gp',
         'sec-fetch-site' => 'same-origin',
         'sec-fetch-mode' => 'cors',
         'sec-fetch-dest' => 'empty',
         'referer' => 'https://www.google.com/recaptcha/api2/anchor?ar=1&k=6Le4GDcqAAAAAFTD31YUpEd1qMPgntTn1xFH7n_o&co=aHR0cHM6Ly9nb3BheS5jby5pZDo0NDM.&hl=en&v=4i3aN5wAweL7i3ADI7BSX4B-&size=invisible&anchor-ms=20000&execute-ms=30000&ovv=CADq00gF&cb=4wgtvvffxogz',
-        'accept-language' => 'en-US,en;q=0.9',
+        'accept-language' => $device['accept-language'] ?? 'en-US,en;q=0.9',
         'cookie' => '_GRECAPTCHA=09AKhCRwig412Sinsks-swNMr3esXkLlnNjxA421fPn7UuqRB9ligadmBfSqi3AcgGO1bFgLp-oRgNIOIbGU1z9Dw; NID=Cp8CCAES0QEBM9Agl5f5KPhyJJl_9q1q-kmQnU8DE5w-ar-n5pEnpZ4eSUoTRY480PWuwlNzNJeDRXQ8A66236sPxxkXN_B_KHxqKMTRHX-506Y3fRb6w7NF99N6u_xk6WQ394XUr9jD6-0tmtexUxSVPLST0wDmxWoLvLakpL_os09LlukbfnKqiaFkRJF-j9iIHCbOlw5lknTrLEhbyn-jQ7r4i271foXMmzPCFbZUWzU07LlU10IQ7yI05O_jYnhtEQchXeRDlOyMQNSI02aZoDWDpoOQ6igBMkUBcEpCz0GeXDlrG9r96kWzKSq5O56WtEc70yBcA6Z5MVk7IEq-gs1nxjavSyZ0FbCw6bGuNClUmTLhSywSfjreC4_KOQ0',
     ];
+    if (!empty($device['x-requested-with'])) {
+        $headers['x-requested-with'] = $device['x-requested-with'];
+    }
+    if (!empty($device['x-client-data'])) {
+        $headers['x-client-data'] = $device['x-client-data'];
+    }
+    return $headers;
+}
+
+// Perangkat dari bodies.json (klaim v2): ['model'=>..., 'headers'=>[...]].
+// Return null kalau file klaim lama (v1) tanpa perangkat — pemanggil
+// memakai fallback SM-X700.
+function loadPoolDevice(string $path): ?array {
+    $data = json_decode((string) file_get_contents($path), true);
+    if (!is_array($data) || !is_array($data['device'] ?? null)) return null;
+    $device = $data['device'];
+    if (empty($device['headers']['user-agent'] ?? '') || empty($device['headers']['sec-ch-ua'] ?? '')) return null;
+    return $device;
 }
 
 function loadPoolBodies(string $path, int $orderCount): array {
@@ -778,13 +798,22 @@ function loadPoolBodies(string $path, int $orderCount): array {
 
 /**
  * Satu body -> satu token, diambil paralel via curl_multi. Order yang
- * gagal di-retry (maks CAPTCHA_MAX_ATTEMPTS). Return token per order
- * (index sama dengan urutan order). Token hanya di memori.
+ * gagal di-retry (maks CAPTCHA_MAX_ATTEMPTS). Return per order
+ * ['token' => ..., 'ua' => ...] (index sama dengan urutan order):
+ * SATU identitas perangkat (dari D1, sama untuk semua order di VPS ini),
+ * dipakai di reload DAN inquiry (harus sama). Token hanya di memori.
+ * $deviceHeaders: ['headers'=>[...]] dari loadPoolDevice(), atau null
+ * untuk fallback SM-X700.
  */
-function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount): array {
+function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount, ?array $deviceHeaders = null): array {
     $tokens = array_fill(0, $orderCount, null);
     $pending = range(0, $orderCount - 1);
-    $headers = captchaReloadHeaders();
+    // Satu identitas perangkat untuk semua order — dari D1, bukan acak.
+    $device = $deviceHeaders['headers'] ?? $deviceHeaders ?? getFixedDeviceUserAgent();
+    $uas = [];
+    for ($i = 0; $i < $orderCount; $i++) {
+        $uas[$i] = $device;
+    }
 
     for ($attempt = 1; $attempt <= CAPTCHA_MAX_ATTEMPTS && !empty($pending); $attempt++) {
         if ($attempt > 1) {
@@ -802,7 +831,7 @@ function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount): array 
                 $ch,
                 RECAPTCHA_RELOAD_URL,
                 'POST',
-                $headers,
+                captchaReloadHeaders($uas[$idx]),
                 $poolBodies[$idx]['body'],
                 ['connect_timeout_ms' => 4000, 'timeout_ms' => 10000]
             );
@@ -824,7 +853,7 @@ function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount): array 
                 $token = $m[1];
             }
             if ($token !== null) {
-                $tokens[$idx] = $token;
+                $tokens[$idx] = ['token' => $token, 'ua' => $uas[$idx]];
                 echo "[CAPTCHA] Order " . ($idx + 1) . " token OK"
                    . " (body #{$poolBodies[$idx]['id']}, " . strlen($token) . " karakter)\n";
             } else {
@@ -849,9 +878,10 @@ function fetchCaptchaTokensForOrders(array $poolBodies, int $orderCount): array 
 
 /**
  * Ambil satu token CAPTCHA dari Google reCAPTCHA reload menggunakan satu item body binary.
+ * $ua di sini adalah header identitas perangkat (array dari D1), bukan UA acak.
  */
-function fetchSingleCaptchaToken(array $bodyItem, int $timeoutMs = 5000): ?string {
-    $headers = captchaReloadHeaders();
+function fetchSingleCaptchaToken(array $bodyItem, int $timeoutMs = 5000, ?array $ua = null): ?string {
+    $headers = captchaReloadHeaders($ua);
     $ch = createCurlSession();
     configureCurlHandle(
         $ch,
@@ -989,14 +1019,17 @@ function getTransactionUntilReady(string $txnId, array $headers, $ch = null, arr
 // ----------------------------------------------------------------------
 // BUILD INQUIRY HEADERS (per-attempt: refresh sentry + x-timestamp)
 // ----------------------------------------------------------------------
-function buildInquiryHeaders(string $captchaToken): array {
-    $ua = getRandomUserAgent();
+function buildInquiryHeaders(string $captchaToken, ?array $ua = null): array {
+    // $ua: header identitas perangkat yang dipakai saat reload token ini
+    // (dari D1). Kalau null, pakai fallback SM-X700. x-requested-with
+    // hanya dikirim kalau perangkat itu memang mengirimnya (Sony: tidak).
+    $ua = $ua ?? getFixedDeviceUserAgent();
     $sentry = generateSentryTrace();
-    return [
-        'sec-ch-ua-platform' => '"Android"',
+    $headers = [
+        'sec-ch-ua-platform' => $ua['sec-ch-ua-platform'] ?? '"Android"',
         'authorization' => 'Bearer undefined',
         'sec-ch-ua' => $ua['sec-ch-ua'],
-        'sec-ch-ua-mobile' => '?1',
+        'sec-ch-ua-mobile' => $ua['sec-ch-ua-mobile'] ?? '?1',
         'baggage' => $sentry['baggage'],
         'sentry-trace' => $sentry['sentry-trace'],
         'user-agent' => $ua['user-agent'],
@@ -1005,15 +1038,18 @@ function buildInquiryHeaders(string $captchaToken): array {
         'x-client' => 'mobile',
         'accept' => '*/*',
         'origin' => 'https://gopay.co.id',
-        'x-requested-with' => 'mark.via.gp',
         'sec-fetch-site' => 'same-origin',
         'sec-fetch-mode' => 'cors',
         'sec-fetch-dest' => 'empty',
         'referer' => 'https://gopay.co.id/games/mobile-legends-bang-bang',
-        'accept-language' => 'en-US,en;q=0.9',
+        'accept-language' => $ua['accept-language'] ?? 'en-US,en;q=0.9',
         'x-timestamp' => (string) round(microtime(true) * 1000),
         'cookie' => 'acw_tc=9581d31c17748587792257129e0deb0a34ec18f05b8a68459d00a474893677; slug=mobile-legends-bang-bang',
     ];
+    if (!empty($ua['x-requested-with'])) {
+        $headers['x-requested-with'] = $ua['x-requested-with'];
+    }
+    return $headers;
 }
 
 function buildInquiryBody(array $order): array {
@@ -1031,8 +1067,8 @@ function buildInquiryBody(array $order): array {
 // ----------------------------------------------------------------------
 // PREPARE INQUIRY (satu handle per user, belum dikirim)
 // ----------------------------------------------------------------------
-function prepareInquiry(array $order, string $captchaToken, int $bodyId = 0, int $bodyIndex = 0): array {
-    $headers = buildInquiryHeaders($captchaToken);
+function prepareInquiry(array $order, string $captchaToken, int $bodyId = 0, int $bodyIndex = 0, ?array $ua = null): array {
+    $headers = buildInquiryHeaders($captchaToken, $ua);
     $body    = buildInquiryBody($order);
     $ch = createCurlSession();
     configureCurlHandle(
@@ -1585,7 +1621,7 @@ function runStaggeredInquiry(
 // Jeda: ACAK 4s, 5s, atau 6s di setiap percobaan (random, bukan rotasi).
 // Rotasi body: setiap retry mengambil ulang token captcha dari body berikutnya di pool.
 // ----------------------------------------------------------------------
-function runInquiryRetryLoop(array $retryCandidates, array $poolBodies, int &$totalPaid): array {
+function runInquiryRetryLoop(array $retryCandidates, array $poolBodies, int &$totalPaid, ?array $deviceHeaders = null): array {
     $delays = INQUIRY_RETRY_DELAYS_SEC;
     $maxRetries = INQUIRY_RETRY_MAX_ATTEMPTS;
     $totalBodies = count($poolBodies);
@@ -1621,15 +1657,17 @@ function runInquiryRetryLoop(array $retryCandidates, array $poolBodies, int &$to
             $bodyItem = $poolBodies[$item['body_index']];
             $bodyId = (int) ($bodyItem['id'] ?? 0);
 
+            // Identitas perangkat yang sama (dari D1) - dipakai di reload DAN inquiry.
+            $ua = $deviceHeaders['headers'] ?? $deviceHeaders ?? getFixedDeviceUserAgent();
             // Ambil token captcha
-            $token = fetchSingleCaptchaToken($bodyItem);
+            $token = fetchSingleCaptchaToken($bodyItem, 5000, $ua);
             if ($token === null) {
                 // Coba fallback ke body berikutnya jika reload pertama gagal
                 $item['body_index'] = ($item['body_index'] + 1) % $totalBodies;
                 $bodyItem = $poolBodies[$item['body_index']];
                 $bodyId = (int) ($bodyItem['id'] ?? 0);
                 echo "[RETRY #{$attempt}][$userKey] Body sebelumnya gagal, coba fallback body #{$bodyId}...\n";
-                $token = fetchSingleCaptchaToken($bodyItem);
+                $token = fetchSingleCaptchaToken($bodyItem, 5000, $ua);
             }
 
             if ($token === null) {
@@ -1637,7 +1675,7 @@ function runInquiryRetryLoop(array $retryCandidates, array $poolBodies, int &$to
                 continue;
             }
 
-            $headers = buildInquiryHeaders($token);
+            $headers = buildInquiryHeaders($token, $ua);
             $inquiryBody = buildInquiryBody($item['order']);
             $ch = createCurlSession();
             configureCurlHandle(
@@ -2408,8 +2446,11 @@ function gpyPay(): void {
     // dibuat per order, masing-masing dari body-nya sendiri, saat sisa
     // waktu war <= 60 detik (callback ke-4 di waitForExactBurstTime).
     $poolBodies = loadPoolBodies(__DIR__ . '/' . POOL_BODIES_FILE, count($orders));
+    $poolDevice = loadPoolDevice(__DIR__ . '/' . POOL_BODIES_FILE);
     echo "✅ Stok body pool: " . count($poolBodies) . " body"
        . " (pool id: " . implode(',', array_column($poolBodies, 'id')) . ")\n";
+    echo "📱 Perangkat: " . ($poolDevice['model'] ?? 'SM-X700 (fallback klaim lama)')
+       . " — header identitas dari D1, dipakai reload + inquiry.\n";
     $captchaTokens = []; // diisi callback fetchTokens di bawah
 
     // Tunggu dan fire — mini-probe2 T-2.5s untuk warm TLS pool sebelum burst.
@@ -2432,7 +2473,9 @@ function gpyPay(): void {
         },
         static function () use (&$preparedInquiries, $orders, &$captchaTokens, $poolBodies): int {
             foreach ($orders as $orderIndex => $order) {
-                $captchaToken = $captchaTokens[$orderIndex] ?? null;
+                $entry = $captchaTokens[$orderIndex] ?? null;
+                $captchaToken = is_array($entry) ? ($entry['token'] ?? null) : null;
+                $ua = is_array($entry) ? ($entry['ua'] ?? null) : null;
                 if (!is_string($captchaToken) || $captchaToken === '') {
                     throw new RuntimeException(
                         "Token CAPTCHA untuk order index {$orderIndex} tidak tersedia"
@@ -2442,13 +2485,14 @@ function gpyPay(): void {
                     $order,
                     $captchaToken,
                     (int) ($poolBodies[$orderIndex]['id'] ?? 0),
-                    $orderIndex
+                    $orderIndex,
+                    $ua
                 );
             }
             return count($preparedInquiries);
         },
         static function () use ($poolBodies, $orders, &$captchaTokens): void {
-            $captchaTokens = fetchCaptchaTokensForOrders($poolBodies, count($orders));
+            $captchaTokens = fetchCaptchaTokensForOrders($poolBodies, count($orders), $poolDevice);
             echo "[CAPTCHA] " . count($captchaTokens)
                . " token siap (umur token saat fire ~60 detik).\n";
         }
@@ -2469,7 +2513,7 @@ function gpyPay(): void {
 
     // ===================== RETRY INQUIRY ROTASI =====================
     if (!empty($retryCandidates)) {
-        runInquiryRetryLoop($retryCandidates, $poolBodies, $totalPaid);
+        runInquiryRetryLoop($retryCandidates, $poolBodies, $totalPaid, $poolDevice);
     }
 
     // Detail burst ([NET] + ringkasan + VPS-EVAL) baru ditampilkan setelah
